@@ -51,11 +51,16 @@ class ProxyService:
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
         model_id = model.id if model else None
 
-        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel)
+        candidates, served_as_vip, vip_logs = self._select_candidates(path, model, is_vip_channel)
         user_ip_id = 2 if served_as_vip else 1
         record = RequestRepository.create_processing(
             ip_id, model.id if model else 0, parsed.stream, user_agent, user_ip_id=user_ip_id
         )
+        for msg in vip_logs:
+            append_request_log(record.id, msg)
+        if is_vip_channel:
+            append_request_log(record.id, f"Request received on VIP port. served_as_vip={served_as_vip}")
+
         context = ServerSelectionContext(
             request_id=record.id,
             ip_id=ip_id,
@@ -94,13 +99,13 @@ class ProxyService:
             return [random.choice(candidates)] if candidates else []
         return ServerRepository.list_by_model_id(model_id, vip=vip)
 
-    def _select_candidates(self, path: str, model, is_vip_channel: bool):
+    def _select_candidates(self, path: str, model, is_vip_channel: bool) -> tuple[list[Server], bool, list[str]]:
         model_id = model.id if model else None
         if path.rstrip("/") == "models" and model_id is None:
-            return self._candidates_for_request(path, None), False
+            return self._candidates_for_request(path, None), False, []
         if is_vip_channel and self.vip_service.is_vip_eligible(model):
             return self.vip_service.select_candidates(model)
-        return self._candidates_for_request(path, model_id, vip=False), False
+        return self._candidates_for_request(path, model_id, vip=False), False, []
 
     def _after_finish(self, served_as_vip: bool, model) -> None:
         if served_as_vip and model is not None:

@@ -171,7 +171,7 @@ class TestVIPSelectCandidates:
         n2 = make_server(m.id, "http://n2.example", workload=1)
         n3 = make_server(m.id, "http://n3.example", workload=5)
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         n2.refresh_from_db()
         assert served is True
@@ -183,7 +183,7 @@ class TestVIPSelectCandidates:
         n1 = make_server(m.id, "http://n1.example")
         n2 = make_server(m.id, "http://n2.example")
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         n1.refresh_from_db()
         n2.refresh_from_db()
@@ -196,7 +196,7 @@ class TestVIPSelectCandidates:
         v1 = make_server(m.id, "http://v1.example", vip=True, vip_cooldown=timezone.now())
         v2 = make_server(m.id, "http://v2.example", vip=True, vip_cooldown=timezone.now())
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         v1.refresh_from_db()
         v2.refresh_from_db()
@@ -213,7 +213,7 @@ class TestVIPSelectCandidates:
             add_vip_processing(m.id)
         # active=[v1], projected=(3+1)/1=4 > 3 → cancel cooling
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         v2.refresh_from_db()
         assert served is True
@@ -230,7 +230,7 @@ class TestVIPSelectCandidates:
             add_vip_processing(m.id)
         # projected=(4+1)/1=5 > 3, no cooling, normals=3 > min 2 → promote n1
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         n1.refresh_from_db()
         assert served is True
@@ -245,7 +245,7 @@ class TestVIPSelectCandidates:
         for _ in range(4):
             add_vip_processing(m.id)
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         n1.refresh_from_db()
         n2.refresh_from_db()
@@ -264,7 +264,7 @@ class TestVIPSelectCandidates:
             add_vip_processing(m.id)
         # projected=(4+1)/2=2.5 ≤ 3 → no scale up
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         n1.refresh_from_db()
         assert served is True
@@ -279,7 +279,7 @@ class TestVIPSelectCandidates:
         make_server(m.id, "http://n1.example")
         make_server(m.id, "http://n2.example")
 
-        candidates, served = VIPChannelService().select_candidates(m)
+        candidates, served, _logs = VIPChannelService().select_candidates(m)
 
         v1.refresh_from_db()
         v2.refresh_from_db()
@@ -447,7 +447,7 @@ class TestProxyVIPRouting:
         normal = make_server(m.id, "http://n.example", vip=False)
         make_server(m.id, "http://v.example", vip=True)
 
-        candidates, served = ProxyService()._select_candidates("chat/completions", m, is_vip_channel=False)
+        candidates, served, _logs = ProxyService()._select_candidates("chat/completions", m, is_vip_channel=False)
 
         assert candidates == [normal]
         assert served is False
@@ -457,7 +457,7 @@ class TestProxyVIPRouting:
         normal = make_server(m.id, "http://n.example", vip=False)
         make_server(m.id, "http://v.example", vip=True)
 
-        candidates, served = ProxyService()._select_candidates("chat/completions", m, is_vip_channel=True)
+        candidates, served, _logs = ProxyService()._select_candidates("chat/completions", m, is_vip_channel=True)
 
         assert candidates == [normal]
         assert served is False
@@ -467,7 +467,7 @@ class TestProxyVIPRouting:
         v1 = make_server(m.id, "http://v.example", vip=True)
         make_server(m.id, "http://n.example", vip=False)
 
-        candidates, served = ProxyService()._select_candidates("chat/completions", m, is_vip_channel=True)
+        candidates, served, _logs = ProxyService()._select_candidates("chat/completions", m, is_vip_channel=True)
 
         assert served is True
         assert v1 in candidates
