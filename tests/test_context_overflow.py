@@ -21,7 +21,7 @@ def test_context_overflow_switches_to_flash_when_auto(monkeypatch):
     # Mock routing LLM to return other_model for 'auto'
     def fake_query_routing_llm(self, body, record, context, active_models, model_names):
         return other_model, "router_decision"
-    monkeypatch.setattr("router.services.proxy.ProxyService._query_routing_llm", fake_query_routing_llm)
+    monkeypatch.setattr("router.route_algorithm.auto.ModelResolver._query_routing_llm", fake_query_routing_llm)
     
     # Mock requests to fail with 400 and context overflow on the first attempt
     # and succeed on the second attempt (for the flash model)
