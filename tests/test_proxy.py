@@ -4,8 +4,9 @@ from unittest.mock import MagicMock
 from django.test import Client
 from django.utils import timezone
 
-from router.models import Model, RequestRecord, Server
+from router.models import Model, RequestRecord, ROUTER_RESULT_MAX_LENGTH, Server
 from router.route_algorithm.base import ServerSelectionContext
+from router.services.parser import RequestParser
 from router.services.proxy import ProxyService
 
 
@@ -82,6 +83,48 @@ class _PrefixCacheChooser(_RoutingChooser):
 
     def get_all_model_prefix_ratios(self, body, model_names):
         return {name: self.ratios.get(name, 0.0) for name in model_names}
+
+
+class _CapturingPrefixCacheChooser(_PrefixCacheChooser):
+    def __init__(self, ratios):
+        super().__init__(ratios)
+        self.prefix_body = None
+
+    def get_all_model_prefix_ratios(self, body, model_names):
+        self.prefix_body = body
+        return super().get_all_model_prefix_ratios(body, model_names)
+
+
+def _large_tool_body(model_name="user-model"):
+    return json.dumps({
+        "model": model_name,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "expensive_tool",
+                            "arguments": "x" * 20000,
+                        },
+                    },
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "expensive_tool",
+                    "description": "d" * 20000,
+                },
+            },
+        ],
+    }).encode("utf-8")
 
 
 def test_auto_route_request_disables_thinking(monkeypatch):
@@ -199,6 +242,116 @@ def test_auto_route_payload_only_forwards_user_role_messages(monkeypatch):
     assert "secret_tool" not in payload_text
 
 
+def test_auto_selection_prefix_cache_uses_only_user_prompt():
+    target_model = Model.objects.create(model_name="target-model")
+    chooser = _CapturingPrefixCacheChooser({"target-model": 0.95})
+
+    request_body = {
+        "model": "auto",
+        "messages": [
+            {"role": "system", "content": "user system prompt"},
+            {"role": "developer", "content": "developer skill instructions"},
+            {"role": "user", "content": "first user request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "secret_tool", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "content": "mcp tool result", "tool_call_id": "call_1"},
+            {"role": "user", "content": [{"type": "text", "text": "second user request"}]},
+        ],
+        "tools": [{"type": "function", "function": {"name": "secret_tool"}}],
+    }
+
+    model, router_result = ProxyService(chooser=chooser)._get_auto_route_model(
+        json.dumps(request_body).encode("utf-8"),
+        MagicMock(id=123),
+        MagicMock(),
+    )
+
+    assert model == target_model
+    assert router_result == "cache_hit"
+    assert json.loads(chooser.prefix_body.decode("utf-8")) == {
+        "messages": [
+            {"role": "user", "content": "first user request"},
+            {"role": "user", "content": [{"type": "text", "text": "second user request"}]},
+        ],
+    }
+    prefix_text = chooser.prefix_body.decode("utf-8")
+    assert "user system prompt" not in prefix_text
+    assert "developer skill instructions" not in prefix_text
+    assert "secret_tool" not in prefix_text
+    assert "mcp tool result" not in prefix_text
+
+
+def test_auto_route_without_user_prompt_can_use_prefix_cache(monkeypatch):
+    target_model = Model.objects.create(model_name="target-model")
+    Model.objects.create(model_name="DeepSeek-V4-Flash")
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("cache hit should not call routing LLM")
+
+    monkeypatch.setattr("router.services.proxy.requests.post", fail_if_called)
+    chooser = _CapturingPrefixCacheChooser({"target-model": 0.95})
+    body = json.dumps({
+        "model": "auto",
+        "messages": [
+            {"role": "system", "content": "system prompt"},
+            {"role": "assistant", "content": "assistant response"},
+            {"role": "tool", "content": "tool result"},
+        ],
+    }).encode("utf-8")
+
+    model, router_result = ProxyService(chooser=chooser)._get_auto_route_model(
+        body,
+        MagicMock(id=123),
+        MagicMock(),
+    )
+
+    assert model == target_model
+    assert router_result == "cache_hit"
+    assert chooser.prefix_body == body
+
+
+def test_auto_route_without_user_prompt_uses_default_model_after_cache_miss(monkeypatch):
+    fallback_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
+    Model.objects.create(model_name="target-model")
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("auto request without user prompt should not call routing LLM")
+
+    monkeypatch.setattr("router.services.proxy.requests.post", fail_if_called)
+    chooser = _CapturingPrefixCacheChooser({})
+    body = json.dumps({
+        "model": "auto",
+        "messages": [
+            {"role": "system", "content": "system prompt"},
+            {"role": "assistant", "content": "assistant response"},
+            {"role": "tool", "content": "tool result"},
+        ],
+    }).encode("utf-8")
+
+    model, router_result = ProxyService(chooser=chooser)._get_auto_route_model(
+        body,
+        MagicMock(id=123),
+        MagicMock(),
+    )
+
+    assert model == fallback_model
+    assert router_result == "routing_failed:missing_user_prompt:no user prompt for auto request"
+    assert chooser.prefix_body == body
+
+
 def test_auto_route_without_active_target_model_records_router_result():
     service = ProxyService(chooser=_RoutingChooser())
     model, router_result = service._get_auto_route_model(
@@ -263,7 +416,7 @@ def test_auto_route_can_use_routing_model_as_final_processing_model(monkeypatch)
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=_large_tool_body(model_name="auto"),
         content_type="application/json",
     )
 
@@ -301,7 +454,7 @@ def test_auto_route_without_routing_model_uses_fallback_and_records_router_resul
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=_large_tool_body(model_name="auto"),
         content_type="application/json",
     )
 
@@ -348,7 +501,7 @@ def test_auto_route_invalid_routing_result_uses_fallback_and_records_router_resu
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=_large_tool_body(model_name="auto"),
         content_type="application/json",
     )
 
@@ -374,6 +527,56 @@ def test_update_body_model_can_disable_thinking():
     assert data["model"] == "target-model"
     assert data["stream"] is True
     assert data["chat_template_kwargs"] == {"tokenize": False, "enable_thinking": False}
+
+
+def test_router_result_formatter_keeps_extended_detail():
+    detail = "x" * (ROUTER_RESULT_MAX_LENGTH + 50)
+
+    router_result = ProxyService._format_router_result("routing_failed", 502, detail)
+
+    assert len(router_result) == ROUTER_RESULT_MAX_LENGTH
+    assert len(router_result) > 100
+
+
+def test_small_request_threshold_uses_full_json_body():
+    parsed = RequestParser().parse(_large_tool_body())
+
+    assert parsed.estimated_input_tokens > ProxyService.SMALL_REQUEST_ROUTING_TOKEN_LIMIT
+    assert ProxyService(chooser=_RoutingChooser())._should_route_small_request(parsed) is False
+
+
+def test_request_record_estimate_tokens_uses_full_json_body(monkeypatch):
+    user_model = Model.objects.create(model_name="user-model")
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=user_model.id, base_url="http://user.example", is_online=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+
+    def fake_request(self_inner, method, url, **kwargs):
+        assert url == "http://user.example/chat/completions"
+        data = json.loads(kwargs["data"].decode("utf-8"))
+        assert data["model"] == "user-model"
+        upstream = MagicMock()
+        upstream.status_code = 200
+        upstream.reason = "OK"
+        upstream.content = b'{"usage": {"prompt_tokens": 1, "completion_tokens": 2}}'
+        upstream.headers = {}
+        return upstream
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fake_request,
+    )
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=_large_tool_body(),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 200
+    record = RequestRecord.objects.get()
+    assert record.model_id == user_model.id
+    assert record.estimate_tokens > ProxyService.SMALL_REQUEST_ROUTING_TOKEN_LIMIT
 
 
 def test_small_non_auto_request_uses_routing_server_and_disables_thinking(monkeypatch):
@@ -471,25 +674,20 @@ def test_three_thousand_token_non_auto_request_keeps_user_model(monkeypatch):
     assert response.status_code == 200
 
 
-def test_small_auto_request_is_not_forced_to_routing_server(monkeypatch):
+def test_small_auto_request_uses_routing_server_before_auto_route(monkeypatch):
     target_model = Model.objects.create(model_name="target-model")
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fake_post(url, json, headers, timeout):
-        assert url == "http://router.example/chat/completions"
-        assert json["chat_template_kwargs"] == {"enable_thinking": False}
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": "target-model"}}]}
-        return response
+    def fail_auto_route(*args, **kwargs):
+        raise AssertionError("small auto request should not call the routing LLM")
 
     def fake_request(self_inner, method, url, **kwargs):
-        assert url == "http://target.example/chat/completions"
+        assert url == "http://router.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
-        assert data["model"] == "target-model"
-        assert "chat_template_kwargs" not in data
+        assert data["model"] == "router-model"
+        assert data["chat_template_kwargs"] == {"enable_thinking": False}
         upstream = MagicMock()
         upstream.status_code = 200
         upstream.reason = "OK"
@@ -497,7 +695,7 @@ def test_small_auto_request_is_not_forced_to_routing_server(monkeypatch):
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.services.proxy.requests.post", fake_post)
+    monkeypatch.setattr("router.services.proxy.requests.post", fail_auto_route)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -528,6 +726,8 @@ def test_small_auto_request_is_not_forced_to_routing_server(monkeypatch):
 
     assert response.status_code == 200
     record = RequestRecord.objects.get()
+    assert record.model_id == routing_model.id
+    assert record.router_result == "small_request_routing"
     assert record.model_choosing_latency == 125
 
 
@@ -565,7 +765,7 @@ def test_auto_route_failed_routing_uses_deepseek_fallback_and_records_router_res
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=_large_tool_body(model_name="auto"),
         content_type="application/json",
     )
 
@@ -604,7 +804,7 @@ def test_auto_route_without_routing_server_uses_fallback_and_records_router_resu
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=_large_tool_body(model_name="auto"),
         content_type="application/json",
     )
 
@@ -634,7 +834,7 @@ def test_auto_route_failed_routing_without_fallback_server_finishes_same_record(
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=_large_tool_body(model_name="auto"),
         content_type="application/json",
     )
 

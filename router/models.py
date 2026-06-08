@@ -2,6 +2,9 @@ from django.db import models
 from django.db.models import Q
 
 
+ROUTER_RESULT_MAX_LENGTH = 500
+
+
 class TimestampedSoftDeleteModel(models.Model):
     created_at = models.DateTimeField(blank=True, null=True)
     updated_at = models.DateTimeField(blank=True, null=True)
@@ -104,7 +107,7 @@ class RequestRecord(TimestampedSoftDeleteModel):
     prefix_cache = models.FloatField(default=0.0)
     final_prefix_cache = models.IntegerField(default=0)
     last_match = models.BigIntegerField(blank=True, null=True)
-    router_result = models.CharField(max_length=100, blank=True, null=True)
+    router_result = models.CharField(max_length=ROUTER_RESULT_MAX_LENGTH, blank=True, null=True)
     estimate_tokens = models.IntegerField(default=0)
     model_choosing_latency = models.BigIntegerField(blank=True, null=True)
 

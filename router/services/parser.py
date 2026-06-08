@@ -37,7 +37,14 @@ class RequestParser:
             return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=False, estimated_input_tokens=est_tokens)
 
         if not isinstance(data, dict):
-            return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=True)
+            return ParsedRequest(
+                body=body,
+                model_name=None,
+                stream=False,
+                max_tokens=None,
+                is_json=True,
+                estimated_input_tokens=fast_estimate_tokens(body_str),
+            )
 
         stream = bool(data.get("stream"))
         if stream:
@@ -52,11 +59,9 @@ class RequestParser:
 
         max_tokens = self._safe_int(data.get("max_tokens"))
         
-        # Estimate input tokens from prompt or messages
-        prompt_text = self._extract_prompt_text(data)
-        estimated_input_tokens = fast_estimate_tokens(prompt_text)
-
-        new_body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body_text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        estimated_input_tokens = fast_estimate_tokens(body_text)
+        new_body = body_text.encode("utf-8")
         return ParsedRequest(
             body=new_body,
             model_name=data.get("model") if isinstance(data.get("model"), str) else None,
@@ -65,33 +70,6 @@ class RequestParser:
             is_json=True,
             estimated_input_tokens=estimated_input_tokens,
         )
-
-    def _extract_prompt_text(self, data: dict) -> str:
-        """Extract all text content from the request data for token estimation."""
-        messages = data.get("messages")
-        if isinstance(messages, list):
-            parts = []
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                content = message.get("content")
-                if isinstance(content, str):
-                    parts.append(content)
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            parts.append(str(item.get("text", "")))
-                        elif isinstance(item, str):
-                            parts.append(item)
-            return "\n".join(parts)
-
-        prompt = data.get("prompt")
-        if isinstance(prompt, str):
-            return prompt
-        if isinstance(prompt, list):
-            return "\n".join(str(p) for p in prompt if isinstance(p, (str, int, float)))
-
-        return ""
 
     @staticmethod
     def _safe_int(value: Any) -> int | None:

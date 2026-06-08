@@ -1,4 +1,5 @@
 from router.repositories.requests import RequestRepository
+from router.models import ROUTER_RESULT_MAX_LENGTH
 
 
 def test_record_attempt_persists_prefix_cache_and_last_match():
@@ -121,6 +122,17 @@ def test_finish_persists_final_prefix_cache():
     assert record.input_token_cnt == 10
     assert record.output_token_cnt == 20
     assert record.final_prefix_cache == 1920
+
+
+def test_finish_persists_extended_router_result():
+    record = RequestRepository.create_processing(ip_id=1, model_id=7, is_stream=False, user_agent="pytest")
+    router_result = "r" * (ROUTER_RESULT_MAX_LENGTH + 50)
+
+    RequestRepository.finish(record, 200, "OK", router_result=router_result)
+
+    record.refresh_from_db()
+    assert record.router_result == router_result[:ROUTER_RESULT_MAX_LENGTH]
+    assert len(record.router_result) > 100
 
 
 def test_finish_status_handles_client_closed_request():

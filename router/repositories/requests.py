@@ -6,7 +6,7 @@ from http import HTTPStatus
 from django.db import models
 from django.utils import timezone
 
-from router.models import RequestRecord
+from router.models import RequestRecord, ROUTER_RESULT_MAX_LENGTH
 
 
 _EXTRA_STATUS_PHRASES = {
@@ -106,7 +106,7 @@ class RequestRepository:
         record.output_token_cnt = output_tokens or 0
         record.final_prefix_cache = final_prefix_cache or 0
         if router_result:
-            record.router_result = router_result[:100]
+            record.router_result = router_result[:ROUTER_RESULT_MAX_LENGTH]
         update_fields = [
             "end_time",
             "latency",
