@@ -46,6 +46,7 @@ GET /api/total_request_count
 GET /api/model_request_stats
 GET /api/all_model_request_stats
 GET /api/models
+GET /api/model_online_list
 GET /api/model_info
 GET /api/request_time_stats
 GET /api/model_request_time_stats

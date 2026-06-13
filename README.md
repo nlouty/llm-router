@@ -10,6 +10,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
 - [API Endpoints](docs/api_endpoints.md)
 - [Management Commands](docs/management_commands.md)
 - [Tests](docs/tests.md)
+- [Auto Routing Algorithm](docs/auto_routing.md)
 
 ## All Functions
 
@@ -51,7 +52,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - Permission chain: `user_ips` → `departments.is_allowed` → `whitelist.is_allowed`, with a configurable fallback when user info is missing
   - `check_max_tokens`: rejects when request exceeds model's `max_tokens` (or `unknown_model_max_tokens`)
   - `check_concurrency`: per-(IP, model) limit using `ceil(model.concurrent_limit × ip.concurrent_multiplier)`; cleans stale rows before counting
-  - Auto routing: `model: auto` is case-insensitive; concrete models with `models.auto = TRUE` also enter auto routing on the normal port. Text targets are active models with valid complexity bounds; multimodal targets are active models with `multimodal = TRUE`.
+  - Auto routing: `model: auto` is case-insensitive; concrete models with `models.auto = TRUE` also enter auto routing on the normal port. The [Auto Routing Algorithm](docs/auto_routing.md) employs a multi-step sequence (small-request fast path, multimodal bypass, prefix cache hit, LLM-based complexity classification, and context overflow fallback) to intelligently dispatch requests to active target models.
 
 - **Opencode Client Compatibility**
   - Parses `opencode/<X.Y.Z>` from `User-Agent`
@@ -70,7 +71,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - `request_time_stats`, `model_request_time_stats` (bucketed average latency)
   - `model_request_count_by_period`, `model_ip_count_by_period` (bucketed counts)
   - `model_latency_boxplot`: min/Q1/median/Q3/max + over-limit ratio, drops > 890s, trims top 1%
-  - `models`, `model_info` model catalog endpoints; automatic hour/day/month granularity selection in Asia/Shanghai
+  - `models`, `model_online_list`, `model_info` model catalog endpoints; automatic hour/day/month granularity selection in Asia/Shanghai
 
 - **Management & Admin APIs**
   - `POST /api/whitelist/update` — upsert whitelist entry by `employee_no`

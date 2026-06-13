@@ -46,6 +46,10 @@ prefix_cache:
     db: 0
     password: null
 
+router:
+  fallback_model: "DeepSeek-V4-Flash"
+  system_prompt_path: "router/assets/router_system_prompt.md"
+
 opencode:
   enabled: true
   block_max_version: "1.2.26"
