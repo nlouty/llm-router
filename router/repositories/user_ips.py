@@ -11,10 +11,6 @@ class UserIPRepository:
         return UserIP.objects.filter(ip_id=ip_id, is_valid=True, deleted_at__isnull=True).first()
 
     @staticmethod
-    def exists_by_ip_id(ip_id: int) -> bool:
-        return UserIP.objects.filter(ip_id=ip_id, deleted_at__isnull=True).exists()
-
-    @staticmethod
     def create_or_update(
         ip_id: int,
         user_name: str = "",

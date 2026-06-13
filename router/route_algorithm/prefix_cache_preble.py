@@ -292,9 +292,6 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         text = self._text_from_body(body)
         return text[: self.max_prefix_chars]
 
-    def _tokens_from_body(self, body: bytes) -> str:
-        return self._prefix_chars_from_body(body)
-
     @staticmethod
     def _text_from_body(body: bytes) -> str:
         try:

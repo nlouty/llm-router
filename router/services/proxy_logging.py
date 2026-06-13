@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from router.services.request_logger import append_error_log, append_request_log
+from router.services.request_logger import append_request_log
 
 
 def safe_append_request_log(request_id: int, message: str) -> None:
@@ -91,7 +91,7 @@ def log_error_detail(
         },
         ensure_ascii=False,
     )
-    append_error_log(request_id, log_entry)
+    append_request_log(request_id, log_entry)
 
 
 def log_chooser_response_hook_error(context, server, status_code: int, exc: Exception) -> None:

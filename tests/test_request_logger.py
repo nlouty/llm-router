@@ -34,11 +34,11 @@ def test_append_request_log_resolves_relative_path(tmp_path, monkeypatch):
     assert path.read_text(encoding="utf-8") == '{"event":"multi_server_route"}\n'
 
 
-def test_append_error_log_uses_request_log_file(tmp_path, monkeypatch):
+def test_append_request_log_appends_multiple_lines(tmp_path, monkeypatch):
     monkeypatch.setitem(request_logger.APP_CONFIG, "log_path", str(tmp_path))
 
     request_logger.append_request_log(123, '{"event":"server_attempt"}')
-    request_logger.append_error_log(123, '{"event":"upstream_error"}')
+    request_logger.append_request_log(123, '{"event":"upstream_error"}')
 
     path = tmp_path / "2026" / "06" / "08" / "12" / "34" / "123.log"
     assert path.read_text(encoding="utf-8") == (

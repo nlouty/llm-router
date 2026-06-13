@@ -56,10 +56,6 @@ def parse_json_usage(content: bytes) -> tuple[int, int, int]:
     return prompt_tokens, completion_tokens, cached_tokens
 
 
-def parse_stream_usage(chunks: list[bytes]) -> tuple[int, int, int]:
-    return parse_sse_usage(chunks)
-
-
 def extract_fail_reason(content: bytes, http_reason: str) -> str:
     try:
         data = json.loads(content.decode("utf-8"))
@@ -168,7 +164,7 @@ def finish_stream_success(
     attempts: int,
     context,
 ) -> None:
-    input_tokens, output_tokens, cached_tokens = parse_stream_usage(chunks)
+    input_tokens, output_tokens, cached_tokens = parse_sse_usage(chunks)
     final_model_id = ensure_model_after_success(model_name, status_code)
     RequestRepository.finish(
         record,

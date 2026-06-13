@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-
 from django.db.models import F
 
 from router.models import Model
@@ -34,10 +32,6 @@ class ModelRepository:
         return list(Model.objects.all().order_by("id"))
 
     @staticmethod
-    def list_active_models() -> list[Model]:
-        return list(Model.objects.filter(deprecation__isnull=True).order_by("id"))
-
-    @staticmethod
     def list_auto_selectable_models() -> list[Model]:
         return list(
             Model.objects.filter(
@@ -49,15 +43,6 @@ class ModelRepository:
                 complexity_min__lte=F("complexity_max"),
             ).order_by("id")
         )
-
-    @staticmethod
-    def get_auto_model_for_complexity(complexity: int) -> Model | None:
-        candidates = ModelRepository.list_auto_selectable_models()
-        matching = [
-            model for model in candidates
-            if model.complexity_min <= complexity <= model.complexity_max
-        ]
-        return matching[0] if len(matching) == 1 else None
 
     @staticmethod
     def get_routing_models() -> list[Model]:
@@ -73,10 +58,6 @@ class ModelRepository:
     @staticmethod
     def get_by_names(model_names: list[str]) -> dict[str, Model]:
         return {model.model_name: model for model in Model.objects.filter(model_name__in=model_names)}
-
-    @staticmethod
-    def get_by_ids(model_ids: Iterable[int]) -> dict[int, Model]:
-        return {model.id: model for model in Model.objects.filter(id__in=list(model_ids))}
 
     @staticmethod
     def list_online() -> list[Model]:
