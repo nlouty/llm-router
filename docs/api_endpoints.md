@@ -43,9 +43,12 @@ curl -i http://localhost:8001/v1/chat/completions \
 ```http
 GET /api/request_stats
 GET /api/total_request_count
+GET /api/input_token
+GET /api/output_token
 GET /api/model_request_stats
 GET /api/all_model_request_stats
 GET /api/models
+GET /api/model_online_list
 GET /api/model_info
 GET /api/request_time_stats
 GET /api/model_request_time_stats
@@ -55,6 +58,8 @@ GET /api/model_latency_boxplot
 ```
 
 Statistics endpoints use query-string parameters. Time ranges use Beijing-local `YYYY-MM-DD HH:mm:ss` values. Bucket granularity (hour/day/month) is chosen automatically from the range.
+
+`input_token` / `output_token` accept an optional `model_name` query parameter (or `total`) and sum, respectively, `final_prefix_cache + input_token_cnt` and `output_token_cnt` over successful requests. `models` lists every model row; `model_online_list` lists active models only (excludes deprecated). `model_latency_boxplot` accepts an optional comma-separated `model_names` filter.
 
 ## AI Assistant Download
 
@@ -125,3 +130,35 @@ Accepts either a single dictionary or a list of dictionaries.
 ```
 
 Note: Duplicate `base_url` within a single request is not allowed. All operations are logged to the `server_operations` table.
+
+## MR Live Review
+
+```http
+POST /api/mr_live_review
+GET  /api/mr_live_review/stats
+GET  /api/mr_live_review/stats_by_confidence
+GET  /api/mr_live_review/stats_by_date
+GET  /api/mr_live_review/list
+GET  /api/mr_live_review/list_by_confidence
+```
+
+`POST /api/mr_live_review` upserts a merge-request live review row keyed by `discussion_id`. If the row exists and `state` is unchanged it is skipped; otherwise the row is created or updated. Only fields that exist on the `mr_live_review` table are accepted.
+
+The stats endpoints aggregate reviews by target branch, confidence score, or date, reporting `valid` / `invalid` / `no_reply` counts and an `accept_rate` (`valid / (valid + invalid)`):
+
+- `stats` — `project_name` required; grouped by `target_branch`.
+- `stats_by_confidence` — `project_name` required; grouped by `confidence_score`.
+- `stats_by_date` — `project_name`, `target_branch`, and `stats` (`valid` / `invalid` / `no_reply` / `total` / `accept_rate`) required; `start_date` / `end_date` (`YYYY-MM-DD`); each row carries a cumulative `total_count` through that date.
+
+The list endpoints paginate reviews by type:
+
+- `list` — `project_name`, `target_branch`, and `type` (`valid` / `invalid` / `no_reply`) required; paginated with `page` / `page_size`.
+- `list_by_confidence` — `project_name` and `type` required; optional `confidence_score`; paginated.
+
+## Codehub Review
+
+```http
+POST /api/codehub_review
+```
+
+Creates a code-review issue row in `codehub_review`, keyed by `issue_hash`. If `issue_hash` already exists the request is skipped (`message: "skipped"`). Only fields that exist on the table are accepted; unknown fields return 400.

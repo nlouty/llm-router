@@ -34,6 +34,15 @@ load_balancer:
   mark_unhealthy_status_codes: [502, 503, 504]
   health_check_timeout_seconds: 2
   chooser_class: router.route_algorithm.prefix_cache_preble.PrefixCachePrebleServerChooser
+  circuit_breaker:
+    failure_threshold: 3
+    base_cooldown_seconds: 30
+    max_cooldown_seconds: 3000
+    success_threshold: 1
+
+router:
+  fallback_model: DeepSeek-V4-Flash
+  system_prompt_path: router/assets/router_system_prompt.md
 
 prefix_cache:
   primary_match_threshold: 0.9
@@ -104,3 +113,9 @@ export USE_SQLITE_FOR_TESTS=1
 `start_prod.sh` defaults to Redis port `6379`; `start_test.sh` defaults to Redis port `6380`. Both scripts start local Redis automatically only for local Redis hosts. Install Redis first, for example with `sudo dnf install redis`.
 
 Prefix cache blocks are measured in Python Unicode characters, not LLM tokenizer tokens. This keeps matching language-neutral for Chinese and other no-whitespace prompts. The final partial block is also stored so short prompts and exact full-prefix matches are cacheable.
+
+## Section Notes
+
+- `load_balancer.circuit_breaker`: `failure_threshold` consecutive failures flip a server to `open`; `base_cooldown_seconds` is the first cooldown, doubling on repeated failures up to `max_cooldown_seconds`; `success_threshold` is how many successful probes in `half_open` close the breaker.
+- `router.fallback_model`: the default target used when auto routing fails to classify (ambiguous/empty/missing routing model) and when an auto-routed request hits a context-overflow 400. See [Auto Routing](auto_routing.md).
+- `router.system_prompt_path`: the complexity-classifier system prompt sent to routing models.
