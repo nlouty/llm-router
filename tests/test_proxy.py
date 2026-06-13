@@ -151,6 +151,25 @@ def test_auto_route_request_disables_thinking(monkeypatch):
     assert sent["url"] == "http://router.example/chat/completions"
     assert sent["json"]["model"] == "router-model"
     assert sent["json"]["stream"] is False
+    assert sent["json"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "routing_complexity",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "complexity": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "required": ["complexity"],
+                "additionalProperties": False,
+            },
+        },
+    }
     assert sent["json"]["messages"][-1] == {
         "role": "user",
         "content": "Here is the user's 1st message:\n```\nhello\n```\n",
@@ -1230,10 +1249,30 @@ def test_auto_route_invalid_complexity_uses_fallback(monkeypatch):
 
 
 def test_routing_complexity_extracts_numbers_from_imperfect_responses():
+    assert AutoRouteAlgorithm._routing_complexity({"complexity": 5}) == 5
+    assert AutoRouteAlgorithm._routing_complexity({"complexity": "7"}) == 7
     assert AutoRouteAlgorithm._routing_complexity('```json\n{"complexity":8}\n```') == 8
     assert AutoRouteAlgorithm._routing_complexity('The request complexity is 6.') == 6
     assert AutoRouteAlgorithm._routing_complexity('{"complexity": 9,}') == 9
     assert AutoRouteAlgorithm._routing_complexity('{"complexity":7.5}') is None
+
+
+def test_routing_result_reads_structured_output_response():
+    response_json = {
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "parsed": {"complexity": 6},
+                }
+            }
+        ]
+    }
+
+    result = AutoRouteAlgorithm._routing_result_from_response(response_json)
+
+    assert result == {"complexity": 6}
+    assert AutoRouteAlgorithm._routing_complexity(result) == 6
 
 
 def test_small_auto_request_uses_routing_model_before_complexity(monkeypatch):

@@ -32,6 +32,25 @@ class AutoRouteAlgorithm:
     SMALL_REQUEST_ROUTING_TOKEN_LIMIT = 3000
     PREFIX_CACHE_AUTO_HIT_THRESHOLD = 0.7
     ROUTING_USER_PROMPT_CHAR_LIMIT = 500
+    ROUTING_RESPONSE_FORMAT: dict[str, Any] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "routing_complexity",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "complexity": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "required": ["complexity"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
     def __init__(self, chooser=None):
         self.chooser = chooser
@@ -366,13 +385,7 @@ class AutoRouteAlgorithm:
 
             try:
                 self._finish_routing_response_record(choosing_record, resp, server)
-                result = (
-                    resp.json()
-                    .get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
+                result = self._routing_result_from_response(resp.json())
             except Exception as exc:
                 router_result = self._routing_exception_result(
                     exc,
@@ -500,18 +513,27 @@ class AutoRouteAlgorithm:
         return f"complexity:{complexity}"
 
     @classmethod
-    def _routing_complexity(cls, result: str) -> int | None:
+    def _routing_complexity(cls, result: Any) -> int | None:
+        complexity = cls._complexity_from_routing_value(result)
+        if complexity is not None:
+            return complexity
+
         text = str(result or "")
         try:
             parsed = json.loads(cls._strip_json_fence(text))
         except (TypeError, json.JSONDecodeError):
             return cls._extract_complexity_number(text)
 
-        value = parsed.get("complexity") if isinstance(parsed, dict) else parsed
-        complexity = cls._complexity_from_value(value)
+        complexity = cls._complexity_from_routing_value(parsed)
         if complexity is not None:
             return complexity
         return cls._extract_complexity_number(text)
+
+    @classmethod
+    def _complexity_from_routing_value(cls, value: Any) -> int | None:
+        if isinstance(value, dict):
+            return cls._complexity_from_value(value.get("complexity"))
+        return cls._complexity_from_value(value)
 
     @staticmethod
     def _complexity_from_value(value: Any) -> int | None:
@@ -530,6 +552,46 @@ class AutoRouteAlgorithm:
         for match in re.finditer(r"(?<![\d.])(10|[1-9])(?!\.\d)(?!\d)", str(text or "")):
             return int(match.group(1))
         return None
+
+    @staticmethod
+    def _routing_result_from_response(response_json: Any) -> Any:
+        if not isinstance(response_json, dict):
+            return ""
+
+        choices = response_json.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return ""
+
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            return ""
+
+        parsed = message.get("parsed")
+        if parsed is not None:
+            return parsed
+
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return AutoRouteAlgorithm._text_from_content_parts(content)
+        if isinstance(content, str):
+            return content.strip()
+        return content
+
+    @staticmethod
+    def _text_from_content_parts(content: list[Any]) -> str:
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+            elif isinstance(part, str):
+                text_parts.append(part)
+        return "".join(text_parts).strip()
 
     @staticmethod
     def _models_for_complexity(models: list[Any], complexity: int) -> list[Any]:
@@ -590,6 +652,7 @@ class AutoRouteAlgorithm:
             "model": model_name,
             "messages": self._routing_messages_from_body(body),
             "stream": False,
+            "response_format": self.ROUTING_RESPONSE_FORMAT,
         }
         self.disable_thinking(payload)
         return payload

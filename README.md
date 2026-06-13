@@ -51,7 +51,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - Permission chain: `user_ips` → `departments.is_allowed` → `whitelist.is_allowed`, with a configurable fallback when user info is missing
   - `check_max_tokens`: rejects when request exceeds model's `max_tokens` (or `unknown_model_max_tokens`)
   - `check_concurrency`: per-(IP, model) limit using `ceil(model.concurrent_limit × ip.concurrent_multiplier)`; cleans stale rows before counting
-  - Auto routing: `model: auto` is case-insensitive; concrete models with `models.auto = TRUE` also enter auto routing on the normal port. Text targets are active models with valid complexity bounds; multimodal targets are active models with `multimodal = TRUE`.
+  - Auto routing: `model: auto` is case-insensitive; concrete models with `models.auto = TRUE` also enter auto routing on the normal port. Text targets are active models with valid complexity bounds; multimodal targets are active models with `multimodal = TRUE`. Text complexity classifier calls request strict JSON Schema output shaped as `{"complexity":<1-10>}`.
 
 - **Opencode Client Compatibility**
   - Parses `opencode/<X.Y.Z>` from `User-Agent`
