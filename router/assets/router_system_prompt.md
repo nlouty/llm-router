@@ -9,5 +9,6 @@ Scale:
 - 7-8: difficult coding or architecture work, advanced math or logic, high-precision analysis, complex debugging, or multi-file planning.
 - 9-10: expert-level reasoning, very complex system design, research-grade analysis, hard proofs, or tasks where mistakes are especially costly.
 
-Return only compact JSON with this exact shape:
-{"complexity":<integer from 1 to 10>}
+Your output MUST be a valid JSON object matching this schema:
+{"complexity": <integer from 1 to 10>}
+Do NOT include any other text, explanation, or markdown formatting in your response.

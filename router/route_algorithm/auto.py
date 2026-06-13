@@ -581,8 +581,9 @@ class AutoRouteAlgorithm:
         except Exception:
             self._router_system_prompt = (
                 "You are an LLM request complexity classifier. "
-                'Return only compact JSON like {"complexity":5}, '
-                "where complexity is an integer from 1 to 10."
+                "Your output MUST be a valid JSON object matching this schema: "
+                '{"complexity": <integer from 1 to 10>}. '
+                "Do NOT include any other text."
             )
 
     def _build_routing_payload(self, model_name: str, body: bytes) -> dict[str, Any]:
@@ -590,6 +591,26 @@ class AutoRouteAlgorithm:
             "model": model_name,
             "messages": self._routing_messages_from_body(body),
             "stream": False,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "complexity_classifier",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "complexity": {
+                                "type": "integer",
+                                "description": "The complexity score from 1 to 10.",
+                                "minimum": 1,
+                                "maximum": 10,
+                            }
+                        },
+                        "required": ["complexity"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
         }
         self.disable_thinking(payload)
         return payload

@@ -156,6 +156,26 @@ def test_auto_route_request_disables_thinking(monkeypatch):
         "content": "Here is the user's 1st message:\n```\nhello\n```\n",
     }
     assert sent["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert sent["json"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "complexity_classifier",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "complexity": {
+                        "type": "integer",
+                        "description": "The complexity score from 1 to 10.",
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "required": ["complexity"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def test_auto_route_records_llm_choosing_request_row(monkeypatch):
