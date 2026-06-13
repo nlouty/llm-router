@@ -22,7 +22,7 @@ from router.api.stats import (
     latency_boxplot,
     parse_time_range,
 )
-from router.models import Model, Server, ServerOperation
+from router.models import CodehubReview, Model, Server, ServerOperation
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
 
@@ -168,7 +168,7 @@ def model_online_list(request):
     return JsonResponse(
         {
             "code": 200,
-            "data": [model.model_name for model in ModelRepository.list_online()],
+            "data": [model.model_name for model in ModelRepository.list_active_models()],
         }
     )
 
@@ -776,8 +776,6 @@ def mr_live_review_stats_by_date(request):
 @require_http_methods(["POST"])
 def create_codehub_review(request):
     import json
-    from router.models import CodehubReview
-    from router.repositories.codehub_review import CodehubReviewRepository
 
     try:
         data = json.loads(request.body)
@@ -794,11 +792,11 @@ def create_codehub_review(request):
     if not issue_hash:
         return _bad_request("issue_hash is required")
 
-    if CodehubReviewRepository.exists_by_hash(issue_hash):
+    if CodehubReview.objects.filter(issue_hash=issue_hash).exists():
         return JsonResponse({"code": 200, "message": "skipped", "data": {"issue_hash": issue_hash}})
 
     try:
-        review = CodehubReviewRepository.create(data)
+        review = CodehubReview.objects.create(**data)
         return JsonResponse({"code": 200, "message": "created", "data": {"id": review.id}})
     except Exception as e:
         return JsonResponse({"code": 500, "error": str(e)}, status=500)

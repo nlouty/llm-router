@@ -16,9 +16,6 @@ class ServerHealthService:
         self.timeout = float(lb_config.get("health_check_timeout_seconds", 2))
         self.circuit_breaker = CircuitBreakerService()
 
-    def mark_failure(self, server: Server, reason: str) -> None:
-        self.circuit_breaker.record_failure(server)
-
     def check_once(self, server: Server, recover_offline: bool = False) -> bool:
         url = urljoin(server.base_url.rstrip("/") + "/", (server.health_path or "/healthy").lstrip("/"))
         try:

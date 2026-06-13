@@ -78,7 +78,14 @@ class ProxyService:
 
     def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False):
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
-        record = self._create_processing_record(ip_id, model, parsed, user_agent)
+        record = RequestRepository.create_processing(
+            ip_id,
+            model.id if model else 0,
+            parsed.stream,
+            user_agent,
+            user_ip_id=1,
+            estimate_tokens=parsed.estimated_full_body_tokens,
+        )
         append_verbose_request_log(record.id, django_request.body)
         auto_model_selection = self.auto_router.should_auto_select(
             parsed,
@@ -127,18 +134,6 @@ class ProxyService:
         return self._route_with_retry(
             django_request, path, headers, parsed.body, record, user_agent,
             candidates, context, served_as_vip, model, parsed.stream
-        )
-
-    @staticmethod
-    def _create_processing_record(ip_id: int | None, model, parsed, user_agent: str | None):
-        user_ip_id = 1
-        return RequestRepository.create_processing(
-            ip_id,
-            model.id if model else 0,
-            parsed.stream,
-            user_agent,
-            user_ip_id=user_ip_id,
-            estimate_tokens=parsed.estimated_full_body_tokens,
         )
 
     @staticmethod
@@ -289,15 +284,17 @@ class ProxyService:
         upstream_url, target_pod_ip = self._start_attempt(django_request, path, record, context, state, server)
         workload_handed_off = False
         try:
-            upstream = self._perform_request(
-                django_request,
-                server,
-                upstream_url,
-                headers,
-                body,
-                is_stream,
-                disconnect_scope.upstream_client,
-            )
+            if is_stream:
+                upstream = self._handle_stream(django_request, server, upstream_url, headers, body)
+            else:
+                upstream = self._handle_normal(
+                    django_request,
+                    server,
+                    upstream_url,
+                    headers,
+                    body,
+                    disconnect_scope.upstream_client,
+                )
             result = self._handle_upstream_response(
                 django_request,
                 upstream,
@@ -721,8 +718,3 @@ class ProxyService:
         if not server:
             return None
         return server.base_url[:500]
-
-    def _perform_request(self, django_request, server, upstream_url, headers, body, is_stream, upstream_client):
-        if is_stream:
-            return self._handle_stream(django_request, server, upstream_url, headers, body)
-        return self._handle_normal(django_request, server, upstream_url, headers, body, upstream_client)

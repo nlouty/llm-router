@@ -40,7 +40,7 @@ class VIPChannelService:
 
         if not vip_set:
             if len(normal) > self.min_normal_servers:
-                promoted = self._least_workload(normal)
+                promoted = self.workload_chooser.choose_least_loaded(normal)
                 if ServerRepository.promote_to_vip(promoted):
                     return [promoted], True
                 # Lost the race: re-list and continue.
@@ -53,7 +53,7 @@ class VIPChannelService:
 
         active = [s for s in vip_set if s.vip_cooldown is None]
         if not active:
-            target = self._least_workload(vip_set)
+            target = self.workload_chooser.choose_least_loaded(vip_set)
             ServerRepository.cancel_vip_cooldown(target)
             return [target], True
 
@@ -65,7 +65,7 @@ class VIPChannelService:
             if cooling:
                 ServerRepository.cancel_vip_cooldown(cooling[0])
             elif len(normal) > self.min_normal_servers:
-                promoted = self._least_workload(normal)
+                promoted = self.workload_chooser.choose_least_loaded(normal)
                 if ServerRepository.promote_to_vip(promoted):
                     vip_set.append(promoted)
 
@@ -102,7 +102,4 @@ class VIPChannelService:
 
         projected = len(active) - 1
         if total_load / projected < threshold:
-            ServerRepository.mark_vip_cooldown(self._least_workload(active))
-
-    def _least_workload(self, servers: list[Any]) -> Any:
-        return self.workload_chooser.choose_least_loaded(servers)
+            ServerRepository.mark_vip_cooldown(self.workload_chooser.choose_least_loaded(active))

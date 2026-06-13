@@ -60,7 +60,6 @@ def append_request_log(request_id: int, message: str) -> None:
 def append_error_log(request_id: int, message: str) -> None:
     append_request_log(request_id, message)
 
-
 def append_verbose_request_log(request_id: int, body: bytes) -> None:
     if not verbose_request_logging_enabled():
         return
@@ -78,17 +77,3 @@ def append_verbose_request_log(request_id: int, body: bytes) -> None:
         indent=2,
     )
     append_request_log(request_id, message)
-
-
-class RequestLogBuffer:
-    def __init__(self):
-        self.messages: list[str] = []
-
-    def write(self, message: str) -> None:
-        self.messages.append(message)
-
-    def flush(self, request_id: int) -> None:
-        with _request_log_file(request_id).open("a", encoding="utf-8") as handle:
-            for message in self.messages:
-                handle.write(message.rstrip() + "\n")
-        self.messages.clear()

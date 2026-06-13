@@ -326,7 +326,7 @@ class AutoRouteAlgorithm:
         if not routing_servers:
             return None, self._routing_unavailable_result()
 
-        server = self._choose_routing_server(routing_servers, context)
+        server = self.workload_chooser.choose(routing_servers, context, set())
 
         self._ensure_system_prompt(model_names)
         routing_model_name = model_id_to_name.get(server.model_id, "router")
@@ -335,7 +335,10 @@ class AutoRouteAlgorithm:
         if len(payload.get("messages", [])) <= 1:
             return None, "no_user_query"
 
-        choosing_record = self._create_routing_request_record(server)
+        choosing_record = RequestRepository.create_llm_choosing(
+            model_id=server.model_id or 0,
+            target_pod_ip=getattr(server, "base_url", None),
+        )
         url = self._build_url(server.base_url, "chat/completions", "")
         headers = {"Content-Type": "application/json"}
         csb_token = getattr(server, "csb_token", None)
@@ -388,16 +391,9 @@ class AutoRouteAlgorithm:
             if complexity is None:
                 return None, self._invalid_routing_result(result)
 
-            return complexity, self._complexity_routing_result(complexity)
+            return complexity, f"complexity:{complexity}"
         finally:
             ServerRepository.decrement_workload(server)
-
-    @staticmethod
-    def _create_routing_request_record(server) -> Any:
-        return RequestRepository.create_llm_choosing(
-            model_id=server.model_id or 0,
-            target_pod_ip=getattr(server, "base_url", None),
-        )
 
     @staticmethod
     def _finish_routing_response_record(record, response, server) -> None:
@@ -440,9 +436,6 @@ class AutoRouteAlgorithm:
             task_status=task_status,
             attempt_count=1,
         )
-
-    def _choose_routing_server(self, routing_servers: list[Any], context):
-        return self.workload_chooser.choose(routing_servers, context, set())
 
     def _routing_response_error_result(self, response) -> str:
         status_code = getattr(response, "status_code", None)
@@ -494,10 +487,6 @@ class AutoRouteAlgorithm:
             "multiple_models_for_complexity",
             f"complexity {complexity} matched multiple auto-routing target models: {model_names}",
         )
-
-    @staticmethod
-    def _complexity_routing_result(complexity: int) -> str:
-        return f"complexity:{complexity}"
 
     @classmethod
     def _routing_complexity(cls, result: str) -> int | None:
