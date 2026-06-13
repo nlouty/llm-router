@@ -9,6 +9,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
 - [Setup](docs/setup.md)
 - [API Endpoints](docs/api_endpoints.md)
 - [Management Commands](docs/management_commands.md)
+- [Auto Routing](docs/auto_routing.md)
 - [Tests](docs/tests.md)
 
 ## All Functions
@@ -51,7 +52,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - Permission chain: `user_ips` → `departments.is_allowed` → `whitelist.is_allowed`, with a configurable fallback when user info is missing
   - `check_max_tokens`: rejects when request exceeds model's `max_tokens` (or `unknown_model_max_tokens`)
   - `check_concurrency`: per-(IP, model) limit using `ceil(model.concurrent_limit × ip.concurrent_multiplier)`; cleans stale rows before counting
-  - Auto routing: `model: auto` is case-insensitive; concrete models with `models.auto = TRUE` also enter auto routing on the normal port. Text targets are active models with valid complexity bounds; multimodal targets are active models with `multimodal = TRUE`.
+  - Auto routing: `model: auto` is case-insensitive; concrete models with `models.auto = TRUE` also enter auto routing on the normal port. The chooser runs a two-stage decision — small requests (estimated `< 3000` tokens) are routed directly to a `is_routing_model` backend, otherwise it picks an auto-selectable target via multimodal bypass, prefix-cache hit, or a complexity-classification call to a routing model. Targets are active models with valid 1–10 complexity bounds; multimodal targets are active models with `multimodal = TRUE`. Full decision sequence is documented in [Auto Routing](docs/auto_routing.md).
 
 - **Opencode Client Compatibility**
   - Parses `opencode/<X.Y.Z>` from `User-Agent`
@@ -67,10 +68,18 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
 
 - **Statistics & Monitoring API**
   - `request_stats`, `total_request_count`, `model_request_stats`, `all_model_request_stats`
+  - `input_token`, `output_token`: summed input (`final_prefix_cache + input_token_cnt`) / output tokens, filterable by `model_name` (or `total`)
   - `request_time_stats`, `model_request_time_stats` (bucketed average latency)
   - `model_request_count_by_period`, `model_ip_count_by_period` (bucketed counts)
   - `model_latency_boxplot`: min/Q1/median/Q3/max + over-limit ratio, drops > 890s, trims top 1%
-  - `models`, `model_info` model catalog endpoints; automatic hour/day/month granularity selection in Asia/Shanghai
+  - `models`, `model_info`, `model_online_list` (active model catalog, excludes deprecated); automatic hour/day/month granularity selection in Asia/Shanghai
+
+- **Auto Routing** (see [Auto Routing](docs/auto_routing.md))
+  - Entry: `model: auto` (case-insensitive), or `models.auto = TRUE` concrete models on the normal port; VIP port never auto-routes by model flag
+  - Two-stage decision in `AutoRouteAlgorithm`: small requests (estimated `< 3000` tokens) go straight to a `is_routing_model` backend; otherwise multimodal bypass → prefix-cache hit (`> 0.7` ratio, unambiguous) → routing-LLM complexity classification (1–10) matched against `complexity_min`/`complexity_max`
+  - Routing call uses structured outputs (`json_schema` `{"complexity": N}`), least-workload routing-server selection, 10s timeout, recorded as a separate `ip_id = 0` `llm-choosing` request row
+  - Context-overflow fallback: a 400 mentioning the target's `max_context_window` switches an auto-routed request to `router.fallback_model` and retries
+  - Decision trail persisted in `requests.router_result` (prefixed with origin model name) and `requests.model_choosing_latency`
 
 - **Management & Admin APIs**
   - `POST /api/whitelist/update` — upsert whitelist entry by `employee_no`
@@ -84,6 +93,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - `check_server_health` — probe servers, update circuit-breaker state, optionally recover offline servers
   - `cleanup_stale_processing` — drain abandoned `processing` rows and decrement workload counters
   - `release_vip_cooldowns` — demote VIP servers whose `vip_cooldown` has expired
+  - `refresh_user_info` — refresh `user_ips` from CMDB (requires `cmdb.enabled`), supports `--dry-run`
 
 - **Configuration**
   - `config.yaml` (overridable via `LLM_ROUTER_CONFIG`) deep-merged onto built-in defaults
@@ -92,7 +102,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - WSGI entrypoint validates DB connectivity on boot; `ClientDisconnectMiddleware` registered globally
 
 - **Tests**
-  - 20 pytest files covering proxy, parser, headers, SSE, errors, server choosers, circuit breaker, cancellable upstream, disconnect tracking, request logger, requests repository, workload accounting, schema check, management API, downloads, statistics API, opencode policy, manage.py wrapper, config env overrides, and VIP channel
+  - 33 pytest files covering proxy, parser, headers, SSE, errors, server choosers, circuit breaker, cancellable upstream, disconnect tracking, request logger, requests repository, workload accounting, schema check, management API, downloads, statistics API, opencode policy, manage.py wrapper, config env overrides, VIP channel, context-overflow fallback, token filtering/estimation, the online model list endpoint, the `refresh_user_info` command, MR live review (upsert/list/stats/by-date/by-confidence), and codehub review creation
 
 ## Notes
 
