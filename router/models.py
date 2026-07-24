@@ -108,6 +108,9 @@ class Server(TimestampedSoftDeleteModel):
     vip = models.BooleanField(default=False)
     vip_cooldown = models.DateTimeField(blank=True, null=True)
     context_window = models.IntegerField(blank=True, null=True)
+    role = models.CharField(max_length=12, blank=True, default="mixed")
+    group_id = models.CharField(max_length=64, blank=True, null=True)
+    active_tokens = models.FloatField(default=0.0)
 
     class Meta:
         managed = False

@@ -46,6 +46,11 @@ prefix_cache:
     db: 0
     password: null
 
+pd:
+  recompute_max: 3
+  prefill_connect_timeout_seconds: 5
+  prefill_read_timeout_seconds: 300
+
 opencode:
   enabled: true
   block_max_version: "1.2.26"

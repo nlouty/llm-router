@@ -238,7 +238,7 @@ class ProxyService:
         if path.rstrip("/") == "models" and model_id is None:
             candidates = ServerRepository.list_all_online()
             return [random.choice(candidates)] if candidates else []
-        return ServerRepository.list_by_model_id(model_id, vip=vip, min_context_window=min_context_window)
+        return ServerRepository.list_pd_holders(model_id, vip=vip, min_context_window=min_context_window)
 
     def _select_candidates(self, path: str, model, is_vip_channel: bool, min_context_window: int = 0):
         model_id = model.id if model else None
@@ -277,21 +277,30 @@ class ProxyService:
                 if server is None:
                     break
 
-                result = self._route_single_attempt(
-                    django_request,
-                    path,
-                    headers,
-                    body,
-                    record,
-                    user_agent,
-                    context,
-                    served_as_vip,
-                    model,
-                    is_stream,
-                    disconnect_scope,
-                    state,
-                    server,
-                )
+                # PD disaggregation: a chosen prefiller is handed to the two-phase
+                # PD forward service (prefill -> pick decoder -> decode). Mixed
+                # servers take the existing single-node path.
+                if getattr(server, "role", "mixed") == "prefiller":
+                    result = self._pd_forward_service().forward(
+                        django_request, path, headers, body, record, user_agent, context,
+                        served_as_vip, model, is_stream, disconnect_scope, state, server,
+                    )
+                else:
+                    result = self._route_single_attempt(
+                        django_request,
+                        path,
+                        headers,
+                        body,
+                        record,
+                        user_agent,
+                        context,
+                        served_as_vip,
+                        model,
+                        is_stream,
+                        disconnect_scope,
+                        state,
+                        server,
+                    )
 
                 if result.response is not None:
                     return result.response
@@ -859,6 +868,13 @@ class ProxyService:
     def _decrement_workload(self, server) -> None:
         if server and getattr(server, "id", 0) != 0:
             ServerRepository.decrement_workload(server)
+
+    def _pd_forward_service(self):
+        # Lazily imported to avoid pulling the PD forward path (and its requests
+        # usage) into deployments that only run single-node servers.
+        from router.services.proxy_pd_forward import PDForwardService
+
+        return PDForwardService(self)
 
     @staticmethod
     def _target_identifier(server) -> str | None:

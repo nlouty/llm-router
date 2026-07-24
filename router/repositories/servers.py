@@ -152,6 +152,118 @@ class ServerRepository:
                 workload=Greatest(F("workload") - count, Value(0))
             )
 
+    # ------------------------------------------------------------------
+    # PD disaggregation: decoder load accounting and cluster helpers.
+    # active_tokens is a decoder-only load estimate, reserved when a decoder
+    # is chosen (after prefill, using the prefiller's exact prompt_tokens)
+    # and released when the decode phase finishes. Prefillers are chosen by
+    # prefix-cache affinity / workload, never by active_tokens.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def reserve_active_tokens(server: Server, load: float) -> None:
+        Server.objects.filter(id=server.id).update(active_tokens=F("active_tokens") + load)
+        server.active_tokens = (server.active_tokens or 0.0) + load
+
+    @staticmethod
+    def release_active_tokens(server: Server, load: float) -> None:
+        Server.objects.filter(id=server.id, active_tokens__gt=0).update(
+            active_tokens=Greatest(F("active_tokens") - load, Value(0))
+        )
+        server.active_tokens = max((server.active_tokens or 0.0) - load, 0.0)
+
+    @staticmethod
+    def list_pd_holders(model_id: int | None, vip: bool | None = None, min_context_window: int = 0) -> list[Server]:
+        """Routable servers eligible for prefix-cache selection.
+
+        Returns only single-node (role='mixed') and prefiller (role='prefiller')
+        servers. Decoders are never directly routable and hold no prefix cache.
+
+        A prefiller is included only if its cluster still has at least one
+        routable decoder; otherwise the cluster cannot serve a PD request and the
+        prefiller is dropped here so the chooser never proposes it.
+        """
+        servers = ServerRepository.list_by_model_id(model_id, vip=vip, min_context_window=min_context_window)
+        prefillers_by_group: dict[str, list[Server]] = {}
+        result: list[Server] = []
+        for server in servers:
+            role = getattr(server, "role", "mixed") or "mixed"
+            if role == "mixed":
+                result.append(server)
+            elif role == "prefiller":
+                prefillers_by_group.setdefault(server.group_id or "", []).append(server)
+            # decoders are skipped
+        if not prefillers_by_group:
+            return result
+        # Keep a prefiller only when its cluster has a routable decoder.
+        decoder_groups = {
+            s.group_id
+            for s in servers
+            if (getattr(s, "role", "mixed") or "mixed") == "decoder"
+        }
+        for group_id, prefillers in prefillers_by_group.items():
+            if group_id in decoder_groups:
+                result.extend(prefillers)
+        return result
+
+    @staticmethod
+    def cluster_bottleneck_load(servers: list[Server]) -> dict[str, float]:
+        """Per-cluster bottleneck load: ``max(min(P workload), min(D workload))``.
+
+        A cluster is represented by the more loaded of its two sides; whichever
+        side (prefillers or decoders) has the higher least-loaded node decides
+        the cluster's effective load. Mixed servers are ignored here.
+
+        Returns a mapping of ``group_id`` -> bottleneck load. Clusters missing a
+        routable side are omitted (they were already filtered out by
+        ``list_pd_holders``).
+        """
+        prefillers: dict[str, list[int]] = {}
+        decoders: dict[str, list[int]] = {}
+        for server in servers:
+            role = getattr(server, "role", "mixed") or "mixed"
+            if role not in ("prefiller", "decoder") or not server.group_id:
+                continue
+            workload = int(getattr(server, "workload", 0) or 0)
+            if role == "prefiller":
+                prefillers.setdefault(server.group_id, []).append(workload)
+            else:
+                decoders.setdefault(server.group_id, []).append(workload)
+        bottleneck: dict[str, float] = {}
+        for group_id in prefillers.keys() & decoders.keys():
+            bottleneck[group_id] = float(max(min(prefillers[group_id]), min(decoders[group_id])))
+        return bottleneck
+
+    @staticmethod
+    def pick_least_tokens_decoder(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
+        """Pick the least-active_tokens routable decoder in a cluster."""
+        attempted_ids = attempted_ids or set()
+        servers = ServerRepository.list_by_model_id(None)
+        decoders = [
+            s for s in servers
+            if (getattr(s, "role", "mixed") or "mixed") == "decoder"
+            and s.group_id == group_id
+            and s.id not in attempted_ids
+        ]
+        if not decoders:
+            return None
+        return min(decoders, key=lambda s: (float(getattr(s, "active_tokens", 0.0) or 0.0)))
+
+    @staticmethod
+    def pick_least_workload_prefiller(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
+        """Pick the least-workload routable prefiller in a cluster."""
+        attempted_ids = attempted_ids or set()
+        servers = ServerRepository.list_by_model_id(None)
+        prefillers = [
+            s for s in servers
+            if (getattr(s, "role", "mixed") or "mixed") == "prefiller"
+            and s.group_id == group_id
+            and s.id not in attempted_ids
+        ]
+        if not prefillers:
+            return None
+        return min(prefillers, key=lambda s: (int(getattr(s, "workload", 0) or 0)))
+
     @staticmethod
     def recalculate_workload(
         include_offline: bool = False,
@@ -172,6 +284,12 @@ class ServerRepository:
         Set ``apply=True`` to persist the corrected values. Uses a PostgreSQL
         advisory lock (a no-op transaction on other backends) so concurrent
         runs or workload mutations during the run cannot interleave.
+
+        NOTE: Does not support PD-Disaggregation (role=prefiller/decoder) servers.
+        PD requests record ``target_pod_ip`` as ``"P: <prefiller> -- D: <decoder>"``
+        rather than a single ``server.base_url``, so the exact-string match below
+        will not reconcile workload for prefillers/decoders. Single-node (role=mixed)
+        servers remain fully supported. PD workload reconciliation is deferred.
         """
         from django.db import connection, transaction
 
