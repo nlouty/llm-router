@@ -554,9 +554,11 @@ def _process_add_server_item(data, now):
 
     base_url = data.get("base_url", "").strip()
     model_name = data.get("model_name", "").strip()
+    role = (data.get("role") or "mixed").strip()
+    group_id = (data.get("group_id") or "").strip() or None
     operation = _create_add_server_operation(data, now)
 
-    validation_failure = _add_server_validation_failure(base_url, model_name)
+    validation_failure = _add_server_validation_failure(base_url, model_name, role, group_id)
     if validation_failure:
         message, result_base_url = validation_failure
         return _fail_add_server_operation(operation, message, result_base_url)
@@ -565,7 +567,7 @@ def _process_add_server_item(data, now):
     if verify_error:
         return _fail_add_server_operation(operation, verify_error, base_url)
 
-    return _create_add_server_success(operation, base_url, model_name)
+    return _create_add_server_success(operation, base_url, model_name, role, group_id)
 
 
 def _create_add_server_operation(data, now):
@@ -578,13 +580,17 @@ def _create_add_server_operation(data, now):
     )
 
 
-def _add_server_validation_failure(base_url: str, model_name: str) -> tuple[str, str | None] | None:
+def _add_server_validation_failure(base_url: str, model_name: str, role: str, group_id: str | None) -> tuple[str, str | None] | None:
     if not base_url:
         return "base_url is required", None
     if not base_url.rstrip("/").endswith("/v1"):
         return "base_url must end with /v1", base_url
     if not model_name:
         return "model_name is required", base_url
+    if role not in ("mixed", "prefiller", "decoder"):
+        return f"role must be one of mixed, prefiller, decoder (got {role!r})", base_url
+    if role in ("prefiller", "decoder") and not group_id:
+        return "group_id is required for prefiller/decoder servers", base_url
     if Server.objects.filter(base_url=base_url).exists():
         return "base_url already exists", base_url
     return None
@@ -616,18 +622,26 @@ def _fail_add_server_operation(operation, message: str, base_url: str | None = N
     return result
 
 
-def _create_add_server_success(operation, base_url: str, model_name: str):
+def _create_add_server_success(operation, base_url: str, model_name: str, role: str = "mixed", group_id: str | None = None):
     model_obj, _ = Model.objects.get_or_create(model_name=model_name)
     server = Server.objects.create(
         model_id=model_obj.id,
         base_url=base_url,
+        role=role,
+        group_id=group_id,
         created_at=timezone.now(),
         updated_at=timezone.now(),
     )
 
     operation.server_id = server.id
     operation.status = "success"
-    operation.response_data = {"id": server.id, "base_url": server.base_url, "model_name": model_name}
+    operation.response_data = {
+        "id": server.id,
+        "base_url": server.base_url,
+        "model_name": model_name,
+        "role": role,
+        "group_id": group_id,
+    }
     operation.updated_at = timezone.now()
     operation.save()
     return operation.response_data

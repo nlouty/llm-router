@@ -335,6 +335,32 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 server.id, server.base_url, count,
             )
 
+    def _load_counts(self, available: Sequence[Any]) -> dict[int, int]:
+        """Workload per server, with PD prefillers reporting cluster bottleneck.
+
+        Mixed servers report their own workload. A prefiller reports its
+        cluster's bottleneck load (``max(min(P workload), min(D workload))``) so
+        the overload guard and least-loaded selection account for the whole
+        cluster rather than the prefiller node alone. Decoders are never in the
+        candidate set (they hold no prefix cache and are chosen later).
+        """
+        load_counts = super()._load_counts(available)
+        prefillers = [s for s in available if getattr(s, "role", "mixed") == "prefiller"]
+        if not prefillers:
+            return load_counts
+        bottlenecks = self._cluster_bottlenecks()
+        for server in prefillers:
+            group_id = getattr(server, "group_id", None)
+            if group_id in bottlenecks:
+                load_counts[server.id] = bottlenecks[group_id]
+        return load_counts
+
+    @staticmethod
+    def _cluster_bottlenecks() -> dict[str, float]:
+        from router.repositories.servers import ServerRepository
+
+        return ServerRepository.cluster_bottleneck_load(ServerRepository.list_all_online())
+
     def _prefix_chars_from_body(self, body: bytes) -> str:
         text = self._text_from_body(body)
         return text[: self.max_prefix_chars]
