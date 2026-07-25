@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 from django.db.models import Count, F, Q, Value
@@ -7,6 +8,8 @@ from django.db.models.functions import Greatest
 from django.utils import timezone
 
 from router.models import Server
+from router.services.request_context import get_request_id
+from router.services.request_logger import append_request_log
 
 # Arbitrary key for the workload-recalculation advisory lock. Only one
 # corrector run may hold it at a time so concurrent runs serialize.
@@ -204,6 +207,18 @@ class ServerRepository:
         for group_id, prefillers in prefillers_by_group.items():
             if group_id in decoder_groups:
                 result.extend(prefillers)
+
+        request_id = get_request_id()
+        if request_id and prefillers_by_group:
+            append_request_log(request_id, json.dumps({
+                "event": "pd_holders_list",
+                "total_candidates": len(result),
+                "mixed_count": sum(1 for s in result if getattr(s, "role", "mixed") == "mixed"),
+                "prefiller_count": sum(1 for s in result if getattr(s, "role", "mixed") == "prefiller"),
+                "prefiller_groups": sorted(prefillers_by_group.keys()),
+                "decoder_groups": sorted(decoder_groups),
+            }, ensure_ascii=False))
+
         return result
 
     @staticmethod
@@ -245,6 +260,17 @@ class ServerRepository:
             and s.group_id == group_id
             and s.id not in attempted_ids
         ]
+        request_id = get_request_id()
+        if request_id:
+            all_decoder_ids = sorted(s.id for s in servers if (getattr(s, "role", "mixed") or "mixed") == "decoder" and s.group_id == group_id)
+            append_request_log(request_id, json.dumps({
+                "event": "pd_decoder_pick",
+                "group_id": group_id,
+                "attempted_ids": sorted(attempted_ids),
+                "all_decoder_ids": all_decoder_ids,
+                "available_count": len(decoders),
+                "chosen_id": min(decoders, key=lambda s: (float(getattr(s, "active_tokens", 0.0) or 0.0))).id if decoders else None,
+            }, ensure_ascii=False))
         if not decoders:
             return None
         return min(decoders, key=lambda s: (float(getattr(s, "active_tokens", 0.0) or 0.0)))
