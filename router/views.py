@@ -81,8 +81,8 @@ def proxy(request, path: str):
             RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message)
             return error_response(403, message, "version_too_old")
 
-        parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 8528)))
-        parsed = parser.parse(body, path)
+        parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 18528)))
+        parsed = parser.parse(body, path, is_vip=is_vip_channel)
         input_model_name = parsed.model_name
         input_is_auto = ModelRepository.is_auto_model_name(input_model_name)
         model = None if input_is_auto else ModelRepository.get_by_name(input_model_name)

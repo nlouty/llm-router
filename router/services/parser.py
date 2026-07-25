@@ -18,10 +18,10 @@ class ParsedRequest:
 
 
 class RequestParser:
-    def __init__(self, default_max_tokens: int = 8528):
+    def __init__(self, default_max_tokens: int = 18528):
         self.default_max_tokens = default_max_tokens
 
-    def parse(self, body: bytes, path: str = "") -> ParsedRequest:
+    def parse(self, body: bytes, path: str = "", *, is_vip: bool = False) -> ParsedRequest:
         if not body:
             return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=False)
         try:
@@ -53,6 +53,10 @@ class RequestParser:
 
             if data.get("max_tokens") is None:
                 data["max_tokens"] = self.default_max_tokens
+            elif not is_vip:
+                existing = self._safe_int(data.get("max_tokens"))
+                if existing is not None and existing < self.default_max_tokens:
+                    data["max_tokens"] = self.default_max_tokens
 
         max_tokens = self._safe_int(data.get("max_tokens"))
 
