@@ -249,6 +249,8 @@ class PDForwardService:
             getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
         )
         self.proxy._increment_workload(prefiller)
+        record.task_status = "prefilling"
+        record.save(update_fields=["task_status"])
 
         # Phase 1: prefill (eager, synchronous).
         try:
@@ -257,6 +259,8 @@ class PDForwardService:
             )
         except requests.RequestException as exc:
             logger.warning("PD prefill connection error on %s: %s", prefiller.base_url, exc)
+            record.task_status = "processing"
+            record.save(update_fields=["task_status"])
             self._release_prefiller(prefiller)
             self.circuit_breaker.record_failure(prefiller)
             state.last_status = 502
@@ -282,6 +286,12 @@ class PDForwardService:
         kv_params = _extract_kv_params(prefill_json)
         # final_prefix_cache comes from the prefiller (authoritative), not decoder.
         context.prefix_cache = (cached_tokens / prompt_tokens) if prompt_tokens else 0.0
+
+        # Prefill succeeded: release prefiller and transition to neutral "processing".
+        record.task_status = "processing"
+        record.input_token_cnt = prompt_tokens
+        record.save(update_fields=["task_status", "input_token_cnt"])
+        self._release_prefiller(prefiller)
 
         if is_stream:
             return self._stream_decode(
@@ -338,12 +348,13 @@ class PDForwardService:
             decoder = ServerRepository.pick_least_tokens_decoder(prefiller.group_id, attempted_decoder_ids)
             if decoder is None:
                 logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
-                self._release_prefiller(prefiller)
                 return _RouteAttemptResult(should_retry=True)
             attempted_decoder_ids.add(decoder.id)
             state.last_server = decoder
             ServerRepository.increment_workload(decoder)
             ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
+            record.task_status = "decoding"
+            record.save(update_fields=["task_status"])
             current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
             if recompute_count > 0:
                 current_target += _KV_TRANSFER_FAIL_TAG
@@ -353,14 +364,14 @@ class PDForwardService:
             try:
                 response, content, status_code = self._post_decode(decoder, decoder_url, headers, decode_body)
             except requests.exceptions.ReadTimeout:
-                self._release_decode_pair(prefiller, decoder, prompt_tokens)
+                self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 state.last_status = 504
                 state.last_reason = "Gateway Timeout"
                 return _RouteAttemptResult(should_retry=True)
             except requests.RequestException as exc:
                 logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
-                self._release_decode_pair(prefiller, decoder, prompt_tokens)
+                self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 state.last_status = 502
                 state.last_reason = "Bad Gateway"
@@ -368,7 +379,7 @@ class PDForwardService:
 
             if status_code >= 400:
                 # 5xx: record failure on the node, NO retry — return error.
-                self._release_decode_pair(prefiller, decoder, prompt_tokens)
+                self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 fail_reason = proxy_response.extract_fail_reason(content, response.reason or "")
                 state.last_status = status_code
@@ -393,9 +404,10 @@ class PDForwardService:
             if data and choice and self._is_recomputed(choice):
                 recompute_count += 1
                 self._release_decoder(decoder, prompt_tokens)
+                record.task_status = "processing"
+                record.save(update_fields=["task_status"])
                 if recompute_count > self.recompute_max:
                     logger.error("PD recompute limit (%s) exceeded for request %s", self.recompute_max, record.id)
-                    self._release_prefiller(prefiller)
                     return _RouteAttemptResult(should_retry=True)
                 decode_body = self._extend_for_recompute(
                     body, generated, origin_max_tokens, completion_tokens, recompute_count
@@ -411,7 +423,7 @@ class PDForwardService:
                 attempt_count=state.attempts, final_prefix_cache=cached_tokens,
                 router_result=proxy_response.router_result(context),
             )
-            self._release_decode_pair(prefiller, decoder, prompt_tokens)
+            self._release_decoder(decoder, prompt_tokens)
             self.proxy._after_finish(served_as_vip, model)
             client_content = rewrite_json_cached_tokens(content, cached_tokens)
             return _RouteAttemptResult(
@@ -462,7 +474,6 @@ class PDForwardService:
                 )
                 if decoder is None:
                     logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
-                    self._release_prefiller(prefiller)
                     self.proxy._after_finish(served_as_vip, model)
                     return
                 attempted_decoder_ids.add(decoder.id)
@@ -471,6 +482,8 @@ class PDForwardService:
                 state.last_server = decoder
                 ServerRepository.increment_workload(decoder)
                 ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
+                record.task_status = "decoding"
+                record.save(update_fields=["task_status"])
                 current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
                 if recompute_count > 0:
                     current_target += _KV_TRANSFER_FAIL_TAG
@@ -494,7 +507,6 @@ class PDForwardService:
                         record, message, current_target, state.attempts, model, context
                     )
                     release_current_decoder()
-                    self._release_prefiller(prefiller)
                     self.proxy._after_finish(served_as_vip, model)
                     return
 
@@ -508,7 +520,6 @@ class PDForwardService:
                     )
                     upstream.close()
                     release_current_decoder()
-                    self._release_prefiller(prefiller)
                     self.proxy._after_finish(served_as_vip, model)
                     return
 
@@ -521,14 +532,12 @@ class PDForwardService:
                             yield timeout_sse_event()
                             proxy_response.finish_stream_total_timeout(record, current_target, state.attempts)
                             release_current_decoder()
-                            self._release_prefiller(prefiller)
                             self.proxy._after_finish(served_as_vip, model)
                             return
                         tracker = getattr(django_request, "client_disconnect_tracker", None)
                         if tracker and tracker.client_disconnected():
                             proxy_response.finish_stream_client_disconnected(record, current_target, state.attempts)
                             release_current_decoder()
-                            self._release_prefiller(prefiller)
                             self.proxy._after_finish(served_as_vip, model)
                             return
                         if chunk:
@@ -550,7 +559,6 @@ class PDForwardService:
                     proxy_response.finish_stream_read_timeout(
                         record, current_target, state.attempts, model, context
                     )
-                    self._release_prefiller(prefiller)
                     self.proxy._after_finish(served_as_vip, model)
                     return
                 except requests.RequestException:
@@ -562,7 +570,6 @@ class PDForwardService:
                     proxy_response.finish_stream_request_exception(
                         record, message, current_target, state.attempts, model, context
                     )
-                    self._release_prefiller(prefiller)
                     self.proxy._after_finish(served_as_vip, model)
                     return
                 finally:
@@ -574,6 +581,8 @@ class PDForwardService:
                 if recomputed:
                     recompute_count += 1
                     release_current_decoder()
+                    record.task_status = "processing"
+                    record.save(update_fields=["task_status"])
                     if recompute_count > self.recompute_max:
                         logger.error("PD recompute limit (%s) exceeded for request %s", self.recompute_max, record.id)
                         message = "PD recompute limit exceeded"
@@ -581,7 +590,6 @@ class PDForwardService:
                         proxy_response.finish_stream_request_exception(
                             record, message, current_target, state.attempts, model, context
                         )
-                        self._release_prefiller(prefiller)
                         self.proxy._after_finish(served_as_vip, model)
                         return
                     decode_body = self._extend_for_recompute(
@@ -600,7 +608,6 @@ class PDForwardService:
                     record.final_prefix_cache = cached_tokens
                     record.save(update_fields=["final_prefix_cache"])
                 release_current_decoder()
-                self._release_prefiller(prefiller)
                 self.proxy._after_finish(served_as_vip, model)
                 return
 
@@ -706,7 +713,3 @@ class PDForwardService:
     def _release_decoder(self, decoder, prompt_tokens: int) -> None:
         self.proxy._decrement_workload(decoder)
         ServerRepository.release_active_tokens(decoder, float(prompt_tokens or 0))
-
-    def _release_decode_pair(self, prefiller, decoder, prompt_tokens: int) -> None:
-        self._release_decoder(decoder, prompt_tokens)
-        self._release_prefiller(prefiller)
