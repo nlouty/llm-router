@@ -238,7 +238,7 @@ class ServerRepository:
     def pick_least_tokens_decoder(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
         """Pick the least-active_tokens routable decoder in a cluster."""
         attempted_ids = attempted_ids or set()
-        servers = ServerRepository.list_by_model_id(None)
+        servers = ServerRepository.list_all_online()
         decoders = [
             s for s in servers
             if (getattr(s, "role", "mixed") or "mixed") == "decoder"
@@ -253,7 +253,7 @@ class ServerRepository:
     def pick_least_workload_prefiller(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
         """Pick the least-workload routable prefiller in a cluster."""
         attempted_ids = attempted_ids or set()
-        servers = ServerRepository.list_by_model_id(None)
+        servers = ServerRepository.list_all_online()
         prefillers = [
             s for s in servers
             if (getattr(s, "role", "mixed") or "mixed") == "prefiller"

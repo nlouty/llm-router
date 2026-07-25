@@ -1,4 +1,4 @@
-from router.models import Server
+from router.models import Model, Server
 from router.repositories.servers import ServerRepository
 
 
@@ -90,3 +90,15 @@ class TestPickDecoder:
         _server("http://d2", role="decoder", group_id="g1", active_tokens=2.0)
         d = ServerRepository.pick_least_tokens_decoder("g1", attempted_ids={d1.id})
         assert d.base_url == "http://d2"
+
+    def test_visible_when_registered_with_model_id(self):
+        # Regression: add_server always assigns a real model_id. The picker must
+        # still find a decoder that carries one (previously list_by_model_id(None)
+        # silently limited results to NULL-model servers).
+        model = Model.objects.create(model_name="glm-4")
+        _server(
+            "http://d1", role="decoder", group_id="g1", model_id=model.id
+        )
+        d = ServerRepository.pick_least_tokens_decoder("g1")
+        assert d is not None
+        assert d.base_url == "http://d1"
