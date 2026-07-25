@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 
 from django.db import models
+from django.db.models import F, Value
+from django.db.models.functions import Greatest
 from django.utils import timezone
 
 from router.models import RequestRecord
@@ -11,6 +13,11 @@ from router.models import RequestRecord
 
 LLM_CHOOSING_IP_ID = 0
 LLM_CHOOSING_USER_AGENT = "llm-choosing"
+
+
+def is_processing_q() -> models.Q:
+    """Return a Q object matching all in-flight (non-terminal) task_status values."""
+    return models.Q(task_status__in=["processing", "prefilling", "decoding"])
 
 
 _EXTRA_STATUS_PHRASES = {
@@ -192,30 +199,47 @@ class RequestRepository:
     @staticmethod
     def cleanup_stale(model_id: int | None = None, threshold_minutes: int = 20, ip_id: int | None = None) -> int:
         from django.db import transaction
+
+        from router.models import Server
         from router.repositories.servers import ServerRepository
 
         cutoff = timezone.now() - timedelta(minutes=threshold_minutes)
-        qs = RequestRecord.objects.filter(task_status="processing", send_time__lt=cutoff)
+        qs = RequestRecord.objects.filter(send_time__lt=cutoff).filter(is_processing_q())
         if model_id:
             qs = qs.filter(model_id=model_id)
         if ip_id:
             qs = qs.filter(ip_id=ip_id)
 
-        # Batch process up to 100 stale records in a single transaction.
-        # This ensures that workload decrements perfectly match the records 
-        # being marked as incomplete, even with concurrent cleanup attempts.
-        # skip_locked=True prevents multiple requests from blocking on the same stale records.
         with transaction.atomic():
             stale_records = list(qs.select_for_update(skip_locked=True)[:100])
             if not stale_records:
                 return 0
 
-            target_counts = {}
+            # Separate records by status: each phase holds different resources.
+            processing_targets: dict[str, int] = {}          # target_pod_ip -> count (non-PD)
+            prefilling_targets: dict[str, int] = {}          # prefiller base_url -> count
+            decoding_workload: dict[str, int] = {}           # decoder base_url -> count
+            decoder_tokens: dict[str, float] = {}            # decoder base_url -> active_tokens sum
             record_ids = []
+
             for record in stale_records:
                 record_ids.append(record.id)
-                if record.target_pod_ip:
-                    target_counts[record.target_pod_ip] = target_counts.get(record.target_pod_ip, 0) + 1
+                target = record.target_pod_ip or ""
+
+                if record.task_status == "prefilling" and target.startswith("P: "):
+                    prefiller_url = target[3:]
+                    if prefiller_url:
+                        prefilling_targets[prefiller_url] = prefilling_targets.get(prefiller_url, 0) + 1
+
+                elif record.task_status == "decoding" and " -- D: " in target:
+                    decoder_part = target.split(" -- D: ", 1)[1]
+                    decoder_part = decoder_part.removesuffix(" -- KV_TRANS_FAIL")
+                    if decoder_part:
+                        decoding_workload[decoder_part] = decoding_workload.get(decoder_part, 0) + 1
+                        decoder_tokens[decoder_part] = decoder_tokens.get(decoder_part, 0.0) + float(record.input_token_cnt or 0)
+
+                elif record.task_status == "processing" and target:
+                    processing_targets[target] = processing_targets.get(target, 0) + 1
 
             # Atomic status update
             RequestRecord.objects.filter(id__in=record_ids).update(
@@ -223,9 +247,30 @@ class RequestRepository:
                 end_time=timezone.now(),
                 fail_reason="stale processing",
             )
-            # Atomic workload decrement
-            if target_counts:
-                ServerRepository.decrement_workload_by_targets(target_counts)
+
+            # Atomic workload decrements
+            if processing_targets:
+                ServerRepository.decrement_workload_by_targets(processing_targets)
+
+            if prefilling_targets:
+                ServerRepository.decrement_workload_by_targets(prefilling_targets)
+
+            # Decoder: decrement workload + release active_tokens
+            if decoding_workload:
+                decoder_urls = list(decoding_workload.keys())
+                decoder_servers: dict[str, Server] = {
+                    s.base_url: s for s in Server.objects.filter(base_url__in=decoder_urls)
+                }
+                for base_url, count in decoding_workload.items():
+                    if count > 0:
+                        Server.objects.filter(base_url=base_url, workload__gt=0).update(
+                            workload=Greatest(F("workload") - count, Value(0))
+                        )
+                for base_url, tokens in decoder_tokens.items():
+                    server = decoder_servers.get(base_url)
+                    if server is not None and tokens > 0:
+                        ServerRepository.release_active_tokens(server, tokens)
+
             return len(record_ids)
 
     @staticmethod
@@ -236,7 +281,7 @@ class RequestRepository:
         must not be counted against a user's normal concurrency buckets.
         """
         return list(
-            RequestRecord.objects.filter(ip_id=ip_id, task_status="processing")
+            RequestRecord.objects.filter(ip_id=ip_id).filter(is_processing_q())
             .exclude(user_ip_id=2)
             .values("model_id", "router_result")
         )
@@ -247,7 +292,7 @@ class RequestRepository:
             return {}
         return {
             row["target_pod_ip"]: row["count"]
-            for row in RequestRecord.objects.filter(task_status="processing", target_pod_ip__in=targets)
+            for row in RequestRecord.objects.filter(target_pod_ip__in=targets).filter(is_processing_q())
             .values("target_pod_ip")
             .annotate(count=models.Count("id"))
         }
@@ -255,8 +300,8 @@ class RequestRepository:
     @staticmethod
     def count_vip_processing(model_id: int) -> int:
         return RequestRecord.objects.filter(
-            task_status="processing", user_ip_id=2, model_id=model_id
-        ).count()
+            user_ip_id=2, model_id=model_id
+        ).filter(is_processing_q()).count()
 
     @staticmethod
     def count_distinct_ips(start: datetime, end: datetime) -> int:

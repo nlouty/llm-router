@@ -272,7 +272,7 @@ class ServerRepository:
         """Reconcile ``Server.workload`` against in-flight processing requests.
 
         The authoritative workload for a server is the number of
-        ``RequestRecord`` rows with ``task_status='processing'`` whose
+        ``RequestRecord`` rows with in-flight statuses whose
         ``target_pod_ip`` equals ``server.base_url`` (requests are linked to
         servers by string, not a foreign key).
 
@@ -303,9 +303,11 @@ class ServerRepository:
                         [_ADVISORY_LOCK_KEY],
                     )
 
+            from router.repositories.requests import is_processing_q
+
             qs = RequestRecord.objects.filter(
-                task_status="processing", target_pod_ip__isnull=False
-            ).exclude(target_pod_ip="")
+                target_pod_ip__isnull=False
+            ).exclude(target_pod_ip="").filter(is_processing_q())
             expected = {
                 row["target_pod_ip"]: row["count"]
                 for row in qs.values("target_pod_ip").annotate(count=Count("id"))

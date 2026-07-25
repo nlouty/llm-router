@@ -149,22 +149,22 @@ class RequestRecord(TimestampedSoftDeleteModel):
             models.Index(
                 name="idx_requests_concurrent_count",
                 fields=["ip_id", "model_id"],
-                condition=Q(task_status="processing"),
+                condition=Q(task_status__in=["processing", "prefilling", "decoding"]),
             ),
             models.Index(
                 name="idx_req_proc_model_send",
                 fields=["model_id", "send_time"],
-                condition=Q(task_status="processing"),
+                condition=Q(task_status__in=["processing", "prefilling", "decoding"]),
             ),
             models.Index(
                 name="idx_requests_processing_target",
                 fields=["target_pod_ip"],
-                condition=Q(task_status="processing"),
+                condition=Q(task_status__in=["processing", "prefilling", "decoding"]),
             ),
             models.Index(
                 name="idx_req_vip_proc_model",
                 fields=["model_id"],
-                condition=Q(task_status="processing", vip=True),
+                condition=Q(task_status__in=["processing", "prefilling", "decoding"], vip=True),
             ),
             models.Index(
                 name="idx_requests_success_send",
