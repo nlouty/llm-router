@@ -16,7 +16,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_normal_servers": 2,
     },
     "proxy": {
-        "default_max_tokens": 8528,
+        "default_max_tokens": 18528,
         "unknown_model_max_tokens": 20480,
         "stream_connect_timeout_seconds": 30,
         "stream_read_timeout_seconds": 900,
