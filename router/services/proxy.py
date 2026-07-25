@@ -11,6 +11,9 @@ from typing import Any
 from django.http import HttpResponse, StreamingHttpResponse
 import requests
 
+from router.services.request_context import set_request_id, clear_request_id
+from router.services.request_logger import append_request_log
+
 from router.config import APP_CONFIG
 from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
@@ -271,16 +274,47 @@ class ProxyService:
     def _route_with_retry(self, django_request, path, headers, body, record, user_agent, candidates, context, served_as_vip, model, is_stream):
         disconnect_scope = self._open_disconnect_scope(django_request, is_stream)
         state = _RetryState()
+        set_request_id(record.id)
         try:
+            append_request_log(record.id, json.dumps({
+                "event": "route_start",
+                "candidates": [
+                    {"id": s.id, "base_url": s.base_url, "role": getattr(s, "role", "mixed") or "mixed"}
+                    for s in candidates
+                ],
+                "max_attempts": self.max_attempts_per_request,
+                "stream": is_stream,
+            }, ensure_ascii=False))
             while state.attempts < self.max_attempts_per_request:
                 server = self._effective_chooser().choose(candidates, context, state.attempted_server_ids)
                 if server is None:
+                    append_request_log(record.id, json.dumps({
+                        "event": "no_server_available",
+                        "attempts_exhausted": True,
+                    }, ensure_ascii=False))
                     break
+
+                append_request_log(record.id, json.dumps({
+                    "event": "server_chosen",
+                    "server_id": server.id,
+                    "base_url": server.base_url,
+                    "role": getattr(server, "role", "mixed") or "mixed",
+                    "group_id": getattr(server, "group_id", None),
+                    "workload": int(getattr(server, "workload", 0) or 0),
+                    "active_tokens": float(getattr(server, "active_tokens", 0.0) or 0.0),
+                    "attempt": state.attempts + 1,
+                }, ensure_ascii=False))
 
                 # PD disaggregation: a chosen prefiller is handed to the two-phase
                 # PD forward service (prefill -> pick decoder -> decode). Mixed
                 # servers take the existing single-node path.
                 if getattr(server, "role", "mixed") == "prefiller":
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_path_selected",
+                        "prefiller_id": server.id,
+                        "prefiller_url": server.base_url,
+                        "group_id": getattr(server, "group_id", None),
+                    }, ensure_ascii=False))
                     result = self._pd_forward_service().forward(
                         django_request, path, headers, body, record, user_agent, context,
                         served_as_vip, model, is_stream, disconnect_scope, state, server,
@@ -314,6 +348,7 @@ class ProxyService:
             return self._retry_failure_response(record, state, served_as_vip, model, user_agent, context)
         finally:
             self._close_disconnect_scope(disconnect_scope)
+            clear_request_id()
 
     def _open_disconnect_scope(self, django_request, is_stream: bool) -> _DisconnectScope:
         scope = _DisconnectScope(threading.Event(), threading.Event())

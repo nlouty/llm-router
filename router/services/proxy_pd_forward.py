@@ -12,10 +12,14 @@ from router.config import APP_CONFIG
 from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
 from router.services import proxy_response
+from router.services.request_context import get_request_id
+from router.services.request_log_handler import install_pd_handler
+from router.services.request_logger import append_request_log
 from router.utils.errors import error_payload, timeout_sse_event
 from router.utils.sse import parse_sse_usage
 
 logger = logging.getLogger(__name__)
+install_pd_handler(logger)
 
 _KV_TRANSFER_FAIL_TAG = " -- KV_TRANS_FAIL"
 
@@ -253,6 +257,13 @@ class PDForwardService:
         record.save(update_fields=["task_status"])
 
         # Phase 1: prefill (eager, synchronous).
+        prefill_start = time.monotonic()
+        append_request_log(record.id, json.dumps({
+            "event": "pd_prefill_start",
+            "prefiller_id": prefiller.id,
+            "prefiller_url": prefiller.base_url,
+            "group_id": getattr(prefiller, "group_id", None),
+        }, ensure_ascii=False))
         try:
             prefill_json, prompt_tokens, cached_tokens = self._do_prefill(
                 prefiller, prefiller_url, headers, body
@@ -261,6 +272,13 @@ class PDForwardService:
             logger.warning("PD prefill connection error on %s: %s", prefiller.base_url, exc)
             record.task_status = "processing"
             record.save(update_fields=["task_status"])
+            append_request_log(record.id, json.dumps({
+                "event": "pd_prefill_error",
+                "error_type": "connection",
+                "prefiller_url": prefiller.base_url,
+                "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+                "reason": str(exc)[:500],
+            }, ensure_ascii=False))
             self._release_prefiller(prefiller)
             self.circuit_breaker.record_failure(prefiller)
             state.last_status = 502
@@ -268,6 +286,13 @@ class PDForwardService:
             return _RouteAttemptResult(should_retry=True)
         except _PrefillHttpError as exc:
             logger.warning("PD prefill HTTP %s on %s", exc.status_code, prefiller.base_url)
+            append_request_log(record.id, json.dumps({
+                "event": "pd_prefill_error",
+                "error_type": "http",
+                "prefiller_url": prefiller.base_url,
+                "status_code": exc.status_code,
+                "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+            }, ensure_ascii=False))
             self._release_prefiller(prefiller)
             self.circuit_breaker.record_failure(prefiller)
             state.last_status = exc.status_code
@@ -287,6 +312,16 @@ class PDForwardService:
         # final_prefix_cache comes from the prefiller (authoritative), not decoder.
         context.prefix_cache = (cached_tokens / prompt_tokens) if prompt_tokens else 0.0
 
+        append_request_log(record.id, json.dumps({
+            "event": "pd_prefill_success",
+            "prefiller_url": prefiller.base_url,
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "prefix_cache_ratio": round(cached_tokens / prompt_tokens, 4) if prompt_tokens else 0.0,
+            "has_kv_params": bool(kv_params),
+            "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+        }, ensure_ascii=False))
+
         # Prefill succeeded: release prefiller and transition to neutral "processing".
         record.task_status = "processing"
         record.input_token_cnt = prompt_tokens
@@ -294,10 +329,14 @@ class PDForwardService:
         self._release_prefiller(prefiller)
 
         if is_stream:
-            return self._stream_decode(
-                django_request, path, headers, body, record, context, served_as_vip, model,
-                state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
-            )["response"]
+            from router.services.proxy import _RouteAttemptResult
+
+            return _RouteAttemptResult(
+                response=self._stream_decode(
+                    django_request, path, headers, body, record, context, served_as_vip, model,
+                    state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
+                )
+            )
         return self._normal_decode(
             path, headers, body, record, context, served_as_vip, model,
             state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
@@ -348,8 +387,21 @@ class PDForwardService:
             decoder = ServerRepository.pick_least_tokens_decoder(prefiller.group_id, attempted_decoder_ids)
             if decoder is None:
                 logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_no_decoder",
+                    "group_id": prefiller.group_id,
+                    "attempted_decoder_ids": sorted(attempted_decoder_ids),
+                    "recompute_count": recompute_count,
+                }, ensure_ascii=False))
                 return _RouteAttemptResult(should_retry=True)
             attempted_decoder_ids.add(decoder.id)
+            append_request_log(record.id, json.dumps({
+                "event": "pd_decoder_chosen",
+                "decoder_id": decoder.id,
+                "decoder_url": decoder.base_url,
+                "active_tokens": float(getattr(decoder, "active_tokens", 0.0) or 0.0),
+                "recompute_count": recompute_count,
+            }, ensure_ascii=False))
             state.last_server = decoder
             ServerRepository.increment_workload(decoder)
             ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
@@ -364,6 +416,12 @@ class PDForwardService:
             try:
                 response, content, status_code = self._post_decode(decoder, decoder_url, headers, decode_body)
             except requests.exceptions.ReadTimeout:
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_decode_error",
+                    "error_type": "read_timeout",
+                    "decoder_url": decoder.base_url,
+                    "recompute_count": recompute_count,
+                }, ensure_ascii=False))
                 self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 state.last_status = 504
@@ -371,6 +429,13 @@ class PDForwardService:
                 return _RouteAttemptResult(should_retry=True)
             except requests.RequestException as exc:
                 logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_decode_error",
+                    "error_type": "connection",
+                    "decoder_url": decoder.base_url,
+                    "reason": str(exc)[:500],
+                    "recompute_count": recompute_count,
+                }, ensure_ascii=False))
                 self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 state.last_status = 502
@@ -379,6 +444,13 @@ class PDForwardService:
 
             if status_code >= 400:
                 # 5xx: record failure on the node, NO retry — return error.
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_decode_response",
+                    "decoder_url": decoder.base_url,
+                    "status_code": status_code,
+                    "recompute_count": recompute_count,
+                    "is_error": True,
+                }, ensure_ascii=False))
                 self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 fail_reason = proxy_response.extract_fail_reason(content, response.reason or "")
@@ -403,11 +475,22 @@ class PDForwardService:
 
             if data and choice and self._is_recomputed(choice):
                 recompute_count += 1
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_recompute",
+                    "decoder_url": decoder.base_url,
+                    "recompute_count": recompute_count,
+                    "recompute_max": self.recompute_max,
+                }, ensure_ascii=False))
                 self._release_decoder(decoder, prompt_tokens)
                 record.task_status = "processing"
                 record.save(update_fields=["task_status"])
                 if recompute_count > self.recompute_max:
                     logger.error("PD recompute limit (%s) exceeded for request %s", self.recompute_max, record.id)
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_recompute_limit_exceeded",
+                        "recompute_count": recompute_count,
+                        "recompute_max": self.recompute_max,
+                    }, ensure_ascii=False))
                     return _RouteAttemptResult(should_retry=True)
                 decode_body = self._extend_for_recompute(
                     body, generated, origin_max_tokens, completion_tokens, recompute_count
@@ -416,6 +499,15 @@ class PDForwardService:
 
             # Terminal success: completion_tokens from the decode usage.
             self.proxy._notify_chooser_response(prefiller, context, status_code)
+            append_request_log(record.id, json.dumps({
+                "event": "pd_decode_success",
+                "decoder_url": decoder.base_url,
+                "status_code": status_code,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cached_tokens": cached_tokens,
+                "recompute_count": recompute_count,
+            }, ensure_ascii=False))
             _prompt, output_tokens, _cached = _parse_usage(data.get("usage") if data else None)
             RequestRepository.finish(
                 record, status_code, response.reason or "", prompt_tokens, output_tokens,
@@ -474,9 +566,27 @@ class PDForwardService:
                 )
                 if decoder is None:
                     logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
+                    message = "No routable decoder in PD cluster"
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_no_decoder",
+                        "group_id": prefiller.group_id,
+                        "attempted_decoder_ids": sorted(attempted_decoder_ids),
+                        "recompute_count": recompute_count,
+                    }, ensure_ascii=False))
+                    yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
+                    proxy_response.finish_stream_request_exception(
+                        record, message, current_target, state.attempts, model, context
+                    )
                     self.proxy._after_finish(served_as_vip, model)
                     return
                 attempted_decoder_ids.add(decoder.id)
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_decoder_chosen",
+                    "decoder_id": decoder.id,
+                    "decoder_url": decoder.base_url,
+                    "active_tokens": float(getattr(decoder, "active_tokens", 0.0) or 0.0),
+                    "recompute_count": recompute_count,
+                }, ensure_ascii=False))
                 current_decoder = decoder
                 decoder_released = False
                 state.last_server = decoder
@@ -500,6 +610,13 @@ class PDForwardService:
                     )
                 except requests.RequestException as exc:
                     logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_decode_error",
+                        "error_type": "connection",
+                        "decoder_url": decoder.base_url,
+                        "reason": str(exc)[:500],
+                        "recompute_count": recompute_count,
+                    }, ensure_ascii=False))
                     self.circuit_breaker.record_failure(decoder)
                     message = "502 Bad Gateway"
                     yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
@@ -580,11 +697,22 @@ class PDForwardService:
 
                 if recomputed:
                     recompute_count += 1
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_recompute",
+                        "decoder_url": decoder.base_url,
+                        "recompute_count": recompute_count,
+                        "recompute_max": self.recompute_max,
+                    }, ensure_ascii=False))
                     release_current_decoder()
                     record.task_status = "processing"
                     record.save(update_fields=["task_status"])
                     if recompute_count > self.recompute_max:
                         logger.error("PD recompute limit (%s) exceeded for request %s", self.recompute_max, record.id)
+                        append_request_log(record.id, json.dumps({
+                            "event": "pd_recompute_limit_exceeded",
+                            "recompute_count": recompute_count,
+                            "recompute_max": self.recompute_max,
+                        }, ensure_ascii=False))
                         message = "PD recompute limit exceeded"
                         yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
                         proxy_response.finish_stream_request_exception(
@@ -599,6 +727,16 @@ class PDForwardService:
 
                 # Terminal success: final_prefix_cache from the prefiller.
                 self.proxy._notify_chooser_response(prefiller, context, 200)
+                append_request_log(record.id, json.dumps({
+                    "event": "pd_decode_success",
+                    "decoder_url": decoder.base_url,
+                    "status_code": 200,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cached_tokens": cached_tokens,
+                    "recompute_count": recompute_count,
+                    "ttft_ms": ttft,
+                }, ensure_ascii=False))
                 proxy_response.finish_stream_success(
                     record, 200, "OK", chunks, current_target, context.model_name,
                     state.attempts, context, ttft,
@@ -614,7 +752,7 @@ class PDForwardService:
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
         response["X-Accel-Buffering"] = "no"
-        return {"response": response}
+        return response
 
     # ------------------------------------------------------------------
     # Helpers

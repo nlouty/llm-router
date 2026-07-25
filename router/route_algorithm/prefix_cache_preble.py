@@ -13,9 +13,12 @@ import redis
 from router.config import APP_CONFIG
 from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import LeastConnectionServerChooser
+from router.services.request_log_handler import install_pd_handler
+from router.services.request_logger import append_request_log
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+install_pd_handler(logger)
 
 
 @dataclass
@@ -121,6 +124,28 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         self._log_prefix_matches(model_key, available, match)
         selected = self._choose_from_prefix_match(available, match)
         self._apply_selected_prefix_context(context, selected, match)
+
+        if context.request_id:
+            if match.best_match_ratio > 0:
+                append_request_log(context.request_id, json.dumps({
+                    "event": "prefix_cache_match",
+                    "model_key": model_key,
+                    "best_match_ratio": round(match.best_match_ratio, 4),
+                    "cached_match_count": len(match.cached_matches) if match.cached_matches else 0,
+                    "available_count": len(available),
+                }, ensure_ascii=False))
+            if selected is not None:
+                match_ratio = match.server_match_ratios.get(selected.id, 0.0)
+                is_cache_hit = match_ratio > self.primary_match_threshold and selected in (match.cached_matches or [])
+                append_request_log(context.request_id, json.dumps({
+                    "event": "prefix_server_chosen",
+                    "server_id": selected.id,
+                    "base_url": selected.base_url,
+                    "match_ratio": round(match_ratio, 4),
+                    "reason": "cache_hit" if is_cache_hit else "least_loaded",
+                    "role": getattr(selected, "role", "mixed") or "mixed",
+                }, ensure_ascii=False))
+
         return selected
 
     def _apply_selected_prefix_context(
