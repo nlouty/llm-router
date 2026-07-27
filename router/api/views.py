@@ -121,42 +121,29 @@ def input_token(request):
     # Determine granularity based on time range
     granularity = choose_granularity(start, end)
 
-    # If granularity is "hour" (date range is a day), return hourly data
-    if granularity == "hour":
-        labels = bucket_labels(start, end, granularity)
-        rows = RequestRepository.sum_input_tokens_by_bucket(
-            start, end, bucket_expression("send_time", granularity), model_id
-        )
-        stats = []
-        for label in labels:
-            bucket_data = rows.get(label)
-            if bucket_data:
-                stats.append({
-                    "time": label,
-                    "total_input_tokens": bucket_data["total_input"],
-                    "cache_hit": bucket_data["cache_hit"],
-                    "cache_miss": bucket_data["cache_miss"]
-                })
-            else:
-                stats.append({
-                    "time": label,
-                    "total_input_tokens": 0,
-                    "cache_hit": 0,
-                    "cache_miss": 0
-                })
-        response = {"code": 200, "stats": stats}
-        if model_obj:
-            response["model_name"] = model_obj.model_name
-        return JsonResponse(response)
-
-    # Otherwise, return single aggregate (backward compatibility)
-    token_stats = RequestRepository.sum_input_tokens(start, end, model_id)
-    response = {
-        "code": 200,
-        "total_input_tokens": token_stats["total_input"],
-        "cache_hit": token_stats["cache_hit"],
-        "cache_miss": token_stats["cache_miss"]
-    }
+    # Return bucketed data based on granularity
+    labels = bucket_labels(start, end, granularity)
+    rows = RequestRepository.sum_input_tokens_by_bucket(
+        start, end, bucket_expression("send_time", granularity), model_id
+    )
+    stats = []
+    for label in labels:
+        bucket_data = rows.get(label)
+        if bucket_data:
+            stats.append({
+                "time": label,
+                "total_input_tokens": bucket_data["total_input"],
+                "cache_hit": bucket_data["cache_hit"],
+                "cache_miss": bucket_data["cache_miss"]
+            })
+        else:
+            stats.append({
+                "time": label,
+                "total_input_tokens": 0,
+                "cache_hit": 0,
+                "cache_miss": 0
+            })
+    response = {"code": 200, "stats": stats}
     if model_obj:
         response["model_name"] = model_obj.model_name
     return JsonResponse(response)
@@ -174,40 +161,30 @@ def output_token(request):
     if model_name is not None and not model_name.strip():
         return _bad_request("model_name cannot be blank")
 
-    # Determine granularity and check if we should return hourly data
+    # Determine granularity
     granularity = choose_granularity(start, end)
 
-    # If model_name is "total" or not provided, return sum for all models
-    if not model_name or model_name.strip().lower() == "total":
-        # Return bucketed data when granularity is hour (date range is a day)
-        if granularity == "hour":
-            labels = bucket_labels(start, end, granularity)
-            rows = RequestRepository.sum_output_tokens_by_bucket(start, end, bucket_expression("send_time", granularity))
-            values = {format_bucket(bucket, granularity): count for bucket, count in rows.items()}
-            return JsonResponse({"code": 200, "stats": fill_series(labels, values, "total_output_tokens", 0)})
-        # Otherwise, return single aggregate for backward compatibility
-        total_tokens = RequestRepository.sum_output_tokens(start, end)
-        return JsonResponse({"code": 200, "total_output_tokens": total_tokens})
+    # Determine model_id filter
+    model_id = None
+    model_obj = None
+    if model_name and model_name.strip().lower() != "total":
+        model_obj = _model_or_error(model_name.strip())
+        if isinstance(model_obj, JsonResponse):
+            return model_obj
+        model_id = model_obj.id
 
-    # Otherwise, filter by specific model
-    model = _model_or_error(model_name.strip())
-    if isinstance(model, JsonResponse):
-        return model
-
-    # Return bucketed data when granularity is hour (date range is a day)
-    if granularity == "hour":
-        labels = bucket_labels(start, end, granularity)
-        rows = RequestRepository.sum_output_tokens_by_bucket(start, end, bucket_expression("send_time", granularity), model.id)
-        values = {format_bucket(bucket, granularity): count for bucket, count in rows.items()}
-        return JsonResponse({"code": 200, "stats": fill_series(labels, values, "total_output_tokens", 0)})
-
-    # Otherwise, return single aggregate for backward compatibility
-    total_tokens = RequestRepository.sum_output_tokens(start, end, model.id)
-    return JsonResponse({
-        "code": 200,
-        "model_name": model.model_name,
-        "total_output_tokens": total_tokens
-    })
+    # Return bucketed data based on granularity
+    labels = bucket_labels(start, end, granularity)
+    rows = RequestRepository.sum_output_tokens_by_bucket(
+        start, end, bucket_expression("send_time", granularity), model_id
+    )
+    values = {format_bucket(bucket, granularity): count for bucket, count in rows.items()}
+    response = {"code": 200, "stats": fill_series(labels, values, "total_output_tokens", 0)}
+    
+    if model_obj:
+        response["model_name"] = model_obj.model_name
+    
+    return JsonResponse(response)
 
 
 @require_http_methods(["GET"])
@@ -221,11 +198,15 @@ def token_summary(request):
     - model_name: 模型名称（可选，不传或传"total"表示所有模型）
 
     返回：
+    时间跨度<=2天时返回单个聚合值：
     - input_token: 输入token总数
     - output_token: 输出token总数
     - cache_hit: 缓存命中数
     - cache_miss: 缓存未命中数
     - hit_rate: 命中率（百分比）
+
+    时间跨度>2天时返回分组数据（每天或每月）：
+    - stats: 数组，每项包含 date, input_token, output_token, cache_hit, cache_miss, hit_rate
     """
     parsed = _time_range_or_error(request)
     if isinstance(parsed, JsonResponse):
@@ -246,24 +227,68 @@ def token_summary(request):
             return model_obj
         model_id = model_obj.id
 
-    # Get token statistics
-    input_stats = RequestRepository.sum_input_tokens(start, end, model_id)
-    output_tokens = RequestRepository.sum_output_tokens(start, end, model_id)
+    # Determine granularity based on time range
+    granularity = choose_granularity(start, end)
 
-    # Calculate hit rate
-    total_input = input_stats["total_input"]
-    cache_hit = input_stats["cache_hit"]
-    hit_rate = round((cache_hit / total_input * 100), 2) if total_input > 0 else 0.0
+    # If granularity is "hour" (date range <= 2 days), return single aggregate
+    if granularity == "hour":
+        # Get token statistics
+        input_stats = RequestRepository.sum_input_tokens(start, end, model_id)
+        output_tokens = RequestRepository.sum_output_tokens(start, end, model_id)
 
-    response = {
-        "code": 200,
-        "input_token": total_input,
-        "output_token": output_tokens,
-        "cache_hit": cache_hit,
-        "cache_miss": input_stats["cache_miss"],
-        "hit_rate": hit_rate
-    }
+        # Calculate hit rate
+        total_input = input_stats["total_input"]
+        cache_hit = input_stats["cache_hit"]
+        hit_rate = round((cache_hit / total_input * 100), 2) if total_input > 0 else 0.0
 
+        response = {
+            "code": 200,
+            "input_token": total_input,
+            "output_token": output_tokens,
+            "cache_hit": cache_hit,
+            "cache_miss": input_stats["cache_miss"],
+            "hit_rate": hit_rate
+        }
+
+        if model_obj:
+            response["model_name"] = model_obj.model_name
+
+        return JsonResponse(response)
+
+    # Otherwise (time span > 2 days), return bucketed data
+    labels = bucket_labels(start, end, granularity)
+
+    # Get input token stats by bucket
+    input_rows = RequestRepository.sum_input_tokens_by_bucket(
+        start, end, bucket_expression("send_time", granularity), model_id
+    )
+
+    # Get output token stats by bucket
+    output_rows = RequestRepository.sum_output_tokens_by_bucket(
+        start, end, bucket_expression("send_time", granularity), model_id
+    )
+
+    # Merge data and calculate hit rates
+    stats = []
+    for label in labels:
+        input_data = input_rows.get(label, {"total_input": 0, "cache_hit": 0, "cache_miss": 0})
+        output_count = output_rows.get(label, 0)
+
+        total_input = input_data["total_input"]
+        cache_hit = input_data["cache_hit"]
+        cache_miss = input_data["cache_miss"]
+        hit_rate = round((cache_hit / total_input * 100), 2) if total_input > 0 else 0.0
+
+        stats.append({
+            "date": label,
+            "input_token": total_input,
+            "output_token": output_count,
+            "cache_hit": cache_hit,
+            "cache_miss": cache_miss,
+            "hit_rate": hit_rate
+        })
+
+    response = {"code": 200, "stats": stats}
     if model_obj:
         response["model_name"] = model_obj.model_name
 
@@ -375,15 +400,29 @@ def model_request_count_by_period(request):
     parsed = _time_range_or_error(request)
     if isinstance(parsed, JsonResponse):
         return parsed
-    model = _model_or_error(request.GET.get("model_name"))
-    if isinstance(model, JsonResponse):
-        return model
     start, end = parsed
+
+    # Handle model_name parameter (optional)
+    model_name = request.GET.get("model_name")
+    model_id = None
+    model_obj = None
+    
+    if model_name and model_name.strip().lower() != "total":
+        model_obj = _model_or_error(model_name.strip())
+        if isinstance(model_obj, JsonResponse):
+            return model_obj
+        model_id = model_obj.id
+
     granularity = choose_granularity(start, end)
     labels = bucket_labels(start, end, granularity)
-    rows = RequestRepository.count_success_by_bucket(start, end, model.id, bucket_expression("send_time", granularity))
+    rows = RequestRepository.count_success_by_bucket(start, end, model_id, bucket_expression("send_time", granularity))
     values = {format_bucket(bucket, granularity): count for bucket, count in rows.items()}
-    return JsonResponse({"code": 200, "stats": fill_series(labels, values, "count", 0)})
+    response = {"code": 200, "stats": fill_series(labels, values, "count", 0)}
+    
+    if model_obj:
+        response["model_name"] = model_obj.model_name
+    
+    return JsonResponse(response)
 
 
 @require_http_methods(["GET"])
@@ -391,15 +430,29 @@ def model_ip_count_by_period(request):
     parsed = _time_range_or_error(request)
     if isinstance(parsed, JsonResponse):
         return parsed
-    model = _model_or_error(request.GET.get("model_name"))
-    if isinstance(model, JsonResponse):
-        return model
     start, end = parsed
+
+    # Handle model_name parameter (optional)
+    model_name = request.GET.get("model_name")
+    model_id = None
+    model_obj = None
+    
+    if model_name and model_name.strip().lower() != "total":
+        model_obj = _model_or_error(model_name.strip())
+        if isinstance(model_obj, JsonResponse):
+            return model_obj
+        model_id = model_obj.id
+
     granularity = choose_granularity(start, end)
     labels = bucket_labels(start, end, granularity)
-    rows = RequestRepository.count_distinct_ips_by_bucket(start, end, model.id, bucket_expression("send_time", granularity))
+    rows = RequestRepository.count_distinct_ips_by_bucket(start, end, model_id, bucket_expression("send_time", granularity))
     values = {format_bucket(bucket, granularity): count for bucket, count in rows.items()}
-    return JsonResponse({"code": 200, "stats": fill_series(labels, values, "count", 0)})
+    response = {"code": 200, "stats": fill_series(labels, values, "count", 0)}
+    
+    if model_obj:
+        response["model_name"] = model_obj.model_name
+    
+    return JsonResponse(response)
 
 
 @require_http_methods(["GET"])
