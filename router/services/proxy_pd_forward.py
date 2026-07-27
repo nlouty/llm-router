@@ -323,9 +323,12 @@ class PDForwardService:
         }, ensure_ascii=False))
 
         # Prefill succeeded: release prefiller and transition to neutral "processing".
+        # cached_tokens is authoritative from the prefiller and fixed at this point, so
+        # persist final_prefix_cache now alongside input_token_cnt rather than at decode end.
         record.task_status = "processing"
         record.input_token_cnt = prompt_tokens
-        record.save(update_fields=["task_status", "input_token_cnt"])
+        record.final_prefix_cache = cached_tokens
+        record.save(update_fields=["task_status", "input_token_cnt", "final_prefix_cache"])
         self._release_prefiller(prefiller)
 
         if is_stream:
