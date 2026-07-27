@@ -57,7 +57,8 @@ def build_decode_body(body: bytes, kv_transfer_params: dict) -> bytes:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    data["kv_transfer_params"] = kv_transfer_params
+    if kv_transfer_params:
+        data["kv_transfer_params"] = kv_transfer_params
     return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -543,6 +544,7 @@ class PDForwardService:
         origin_max_tokens = _origin_max_tokens(body)
 
         def generate():
+            nonlocal decode_body
             generated = ""
             completion_tokens = 0
             recompute_count = 0
