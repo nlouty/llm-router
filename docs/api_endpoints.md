@@ -81,8 +81,8 @@ The range is inclusive. Bucketed endpoints choose granularity automatically: hou
 | `/api/all_model_request_stats` | GET | `start_time`, `end_time` | `model_name` | Successful request counts grouped by model, or one model when provided. |
 | `/api/request_time_stats` | GET | `start_time`, `end_time` | | Average latency series for all models. |
 | `/api/model_request_time_stats` | GET | `start_time`, `end_time`, `model_name` | | Average latency series for one model. |
-| `/api/model_request_count_by_period` | GET | `start_time`, `end_time`, `model_name` | | Bucketed successful request count for one model. |
-| `/api/model_ip_count_by_period` | GET | `start_time`, `end_time`, `model_name` | | Bucketed distinct IP count for one model. |
+| `/api/model_request_count_by_period` | GET | `start_time`, `end_time` | `model_name`; omit for all models | Bucketed successful request count, optionally filtered by model. |
+| `/api/model_ip_count_by_period` | GET | `start_time`, `end_time` | `model_name`; omit for all models | Bucketed distinct IP count, optionally filtered by model. |
 | `/api/model_latency_boxplot` | GET | `start_time`, `end_time` | `model_names` comma list | Per-model latency boxplot data. Drops latencies above 890 seconds from quartiles and reports their ratio. |
 | `/api/access_stats_by_department` | GET | `start_time`, `end_time` | `dept1`, `dept2`, `dept3`, `dept4`, `employee_no`, `user_name`, `ip`; use `all` or omit department params for any department | Aggregates successful requests by IP with user and department info. Filters by department levels and optional user/IP filters when provided. |
 

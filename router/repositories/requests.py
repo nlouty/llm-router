@@ -363,34 +363,37 @@ class RequestRepository:
         }
 
     @staticmethod
-    def count_success_by_bucket(start: datetime, end: datetime, model_id: int, bucket_expr) -> dict:
+    def count_success_by_bucket(start: datetime, end: datetime, model_id: int | None, bucket_expr) -> dict:
+        qs = RequestRepository.external_requests().filter(
+            send_time__gte=start,
+            send_time__lte=end,
+            task_status="success",
+        )
+        if model_id is not None:
+            qs = qs.filter(model_id=model_id)
+        
         return {
             row["bucket"]: row["count"]
-            for row in RequestRepository.external_requests()
-            .filter(
-                send_time__gte=start,
-                send_time__lte=end,
-                task_status="success",
-                model_id=model_id,
-            )
-            .annotate(bucket=bucket_expr)
+            for row in qs.annotate(bucket=bucket_expr)
             .values("bucket")
             .annotate(count=models.Count("id"))
             .order_by("bucket")
         }
 
     @staticmethod
-    def count_distinct_ips_by_bucket(start: datetime, end: datetime, model_id: int, bucket_expr) -> dict:
+    def count_distinct_ips_by_bucket(start: datetime, end: datetime, model_id: int | None, bucket_expr) -> dict:
+        qs = RequestRepository.external_requests().filter(
+            send_time__gte=start,
+            send_time__lte=end,
+            task_status="success",
+            ip_id__isnull=False,
+        )
+        if model_id is not None:
+            qs = qs.filter(model_id=model_id)
+        
         return {
             row["bucket"]: row["count"]
-            for row in RequestRepository.external_requests().filter(
-                send_time__gte=start,
-                send_time__lte=end,
-                task_status="success",
-                model_id=model_id,
-                ip_id__isnull=False,
-            )
-            .annotate(bucket=bucket_expr)
+            for row in qs.annotate(bucket=bucket_expr)
             .values("bucket")
             .annotate(count=models.Count("ip_id", distinct=True))
             .order_by("bucket")
