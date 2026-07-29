@@ -17,24 +17,47 @@ def mock_redis():
     with patch("redis.Redis") as mock:
         client = MagicMock()
         mock.return_value = client
-        # Simple in-memory storage for the mock
+        # In-memory storage modelling each key as a Redis Hash (field -> value),
+        # so per-server writes merge instead of overwrite (the bug being fixed).
         storage = {}
+        queued_reads = []
 
-        def mock_set(key, val, ex=None):
-            storage[key] = val
+        def mock_hset(key, field=None, value=None, mapping=None):
+            store = storage.setdefault(key, {})
+            if mapping:
+                store.update(mapping)
+            else:
+                store[field] = value
             return True
 
-        def mock_mget(keys):
-            return [storage.get(k) for k in keys]
+        def mock_hgetall(key):
+            return dict(storage.get(key, {}))
 
-        client.set.side_effect = mock_set
-        client.mget.side_effect = mock_mget
-        
-        # Pipeline mock
+        def mock_expire(key, seconds):
+            return True
+
+        def pipe_hgetall(key):
+            queued_reads.append(mock_hgetall(key))
+            return True
+
+        def pipe_execute():
+            results = list(queued_reads)
+            queued_reads.clear()
+            return results
+
+        client.hset.side_effect = mock_hset
+        client.hgetall.side_effect = mock_hgetall
+        client.expire.side_effect = mock_expire
+
+        # Pipeline mock: writes apply immediately; reads are queued and returned
+        # by execute(), so call_count assertions still work.
         pipe = MagicMock()
         client.pipeline.return_value = pipe
-        pipe.set.side_effect = mock_set
-        
+        pipe.hset.side_effect = mock_hset
+        pipe.expire.side_effect = mock_expire
+        pipe.hgetall.side_effect = pipe_hgetall
+        pipe.execute.side_effect = pipe_execute
+
         PrefixCachePrebleServerChooser._redis_client = client
         yield client
         PrefixCachePrebleServerChooser._redis_client = None
@@ -361,6 +384,100 @@ def test_prefix_cache_last_match_is_none_without_common_prefix():
     assert context.last_match is None
 
 
+def test_prefix_cache_concurrent_writes_merge_servers_not_overwrite():
+    # Two different servers successfully serve the same prefix concurrently.
+    # The cached affinity set must keep BOTH servers (issue #179 regression).
+    chooser = PrefixCachePrebleServerChooser(lambda targets: {}, prefix_block_chars=1)
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000"),
+        make_server(2, "http://10.0.0.2:8000"),
+    ]
+    cached_body = make_body([str(i) for i in range(100)])
+    chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
+    chooser.on_response(candidates[1], make_context(cached_body, request_id=102), 200)
+
+    # Every prefix key must record both servers, not just the last writer.
+    client = PrefixCachePrebleServerChooser._redis_client
+    prefix_hashes = chooser._get_prefix_hashes(chooser._prefix_chars_from_body(cached_body))
+    model_key = "test-model"
+    for prefix_hash, _ in prefix_hashes:
+        fields = client.hgetall(chooser._cache_key(model_key, prefix_hash))
+        assert set(fields.keys()) == {"1", "2"}
+
+
+def test_prefix_cache_surviving_server_still_reported_after_overwrite_bug():
+    # The reporter's AAA / AAAB scenario: server A caches AAA, then server B
+    # caches AAAB. The shared-prefix keys must retain A so a later request that
+    # lands on A still reports a non-zero ratio instead of a spurious 0.0.
+    chooser = PrefixCachePrebleServerChooser(lambda targets: {}, prefix_block_chars=1)
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000"),
+        make_server(2, "http://10.0.0.2:8000"),
+    ]
+    # A serves the shorter prefix; B serves the same prefix with an extra char.
+    chooser.on_response(
+        candidates[0],
+        make_context(make_body([str(i) for i in range(100)]), request_id=101),
+        200,
+    )
+    chooser.on_response(
+        candidates[1],
+        make_context(make_body([str(i) for i in range(100)] + ["x"]), request_id=102),
+        200,
+    )
+
+    # A request sharing the first 100 chars: server 1's ratio must survive.
+    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
+    chooser.choose(candidates, context, set())
+    assert context.prefix_cache > 0.0
+
+
+def test_prefix_cache_request_id_tracked_per_server():
+    # Each server keeps its own originating request id in the merged entry;
+    # last_match reflects the selected server's request id, not a global writer.
+    chooser = PrefixCachePrebleServerChooser(lambda targets: {}, prefix_block_chars=1)
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000"),
+        make_server(2, "http://10.0.0.2:8000"),
+    ]
+    cached_body = make_body([str(i) for i in range(100)])
+    chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
+    chooser.on_response(candidates[1], make_context(cached_body, request_id=102), 200)
+
+    # Force selection of server 1 by loading server 2 heavily.
+    chooser_loaded = PrefixCachePrebleServerChooser(
+        lambda targets: {"http://10.0.0.1:8000": 0, "http://10.0.0.2:8000": 100},
+        prefix_block_chars=1,
+    )
+    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
+    selected = chooser_loaded.choose(candidates, context, set())
+    assert selected.id == 1
+    assert context.last_match == 101
+
+
+def test_prefix_cache_filters_lazily_expired_entries():
+    # Entries past their expiry must be ignored at read time even if not
+    # physically removed from Redis (lazy expiry via the stored timestamp).
+    chooser = PrefixCachePrebleServerChooser(lambda targets: {}, prefix_block_chars=1)
+    client = PrefixCachePrebleServerChooser._redis_client
+    body = make_body(["hello", "world"])
+    prefix_hashes = chooser._get_prefix_hashes(chooser._prefix_chars_from_body(body))
+    model_key = "test-model"
+
+    # Seed an already-expired entry directly into the hash storage.
+    for prefix_hash, _ in prefix_hashes:
+        client.hset(
+            chooser._cache_key(model_key, prefix_hash),
+            "1",
+            json.dumps({"exp": 0.0, "rid": 999}),
+        )
+
+    context = make_context(body)
+    chooser.choose([make_server(1, "http://10.0.0.1:8000")], context, set())
+    assert context.prefix_cache == 0.0
+    assert context.last_match is None
+
+
 def test_prefix_cache_response_hook_only_marks_successful_responses():
     chooser = PrefixCachePrebleServerChooser(lambda targets: {}, prefix_block_chars=1)
     server = make_server(1, "http://10.0.0.1:8000")
@@ -369,10 +486,10 @@ def test_prefix_cache_response_hook_only_marks_successful_responses():
     chooser.on_response(server, context, 500)
     # Check that nothing was saved to Redis
     pipe = PrefixCachePrebleServerChooser._redis_client.pipeline.return_value
-    assert pipe.set.call_count == 0
+    assert pipe.hset.call_count == 0
 
     chooser.on_response(server, context, 200)
-    assert pipe.set.call_count > 0
+    assert pipe.hset.call_count > 0
 
 
 def test_prefix_cache_max_prefix_chars_default():

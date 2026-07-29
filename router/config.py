@@ -45,7 +45,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "secondary_match_threshold": 0.5,
         "overload_workload_gap": 4,
         "overload_workload_ratio": 2.0,
-        "max_prefix_chars": 1000000,
+        "max_prefix_chars": 2000000,
         "prefix_block_chars": 128,
         "redis": {
             "host": "localhost",

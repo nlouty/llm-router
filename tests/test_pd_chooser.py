@@ -54,18 +54,28 @@ def make_body(text: str) -> bytes:
 def mock_redis():
     with patch("redis.Redis") as mock:
         client = type("C", (), {})()
+        # storage: key -> {field: value}, modelling a Redis Hash per key.
         storage: dict = {}
+        queued_reads = []
 
-        def mget(keys):
-            return [storage.get(k) for k in keys]
-
-        client.mget = mget
+        client.hgetall = lambda key: dict(storage.get(key, {}))
         pipe = type("P", (), {})()
 
-        def setkey(key, val, ex=None):
-            storage[key] = val
-        pipe.set = setkey
-        pipe.execute = lambda: None
+        def hset(key, field=None, value=None, mapping=None):
+            store = storage.setdefault(key, {})
+            if mapping:
+                store.update(mapping)
+            else:
+                store[field] = value
+        pipe.hset = hset
+        pipe.expire = lambda key, seconds: None
+        pipe.hgetall = lambda key: queued_reads.append(dict(storage.get(key, {})))
+
+        def pipe_execute():
+            results = list(queued_reads)
+            queued_reads.clear()
+            return results
+        pipe.execute = pipe_execute
         client.pipeline = lambda: pipe
         mock.return_value = client
         PrefixCachePrebleServerChooser._redis_client = client
@@ -140,10 +150,10 @@ class TestOnResponseRecordsPrefiller:
         chooser.on_response(prefiller, make_context(body, request_id=7), 200)
 
         assert storage, "on_response should have written prefix entries"
-        for value in storage.values():
-            data = json.loads(value)
-            assert data["request_id"] == 7
-            assert "2" in data["servers"]
+        for fields in storage.values():
+            assert "2" in fields
+            data = json.loads(fields["2"])
+            assert data["rid"] == 7
 
 
 class TestChooserIsPdUnaware:

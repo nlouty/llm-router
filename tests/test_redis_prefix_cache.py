@@ -1,10 +1,10 @@
 import json
-import time
 from unittest.mock import MagicMock, patch
 import pytest
 
 from router.route_algorithm.prefix_cache_preble import PrefixCachePrebleServerChooser
 from router.route_algorithm.base import ServerSelectionContext
+
 
 class MockServer:
     def __init__(self, server_id, base_url):
@@ -12,80 +12,98 @@ class MockServer:
         self.base_url = base_url
         self.cache_time = 3600
 
+
 @pytest.fixture
 def mock_redis():
     with patch("redis.Redis") as mock:
         client = MagicMock()
         mock.return_value = client
-        # Simulate MGET returning None by default
-        client.mget.return_value = []
+        # In-memory Redis Hash model: key -> {field: value}. Per-server writes
+        # merge into the same key instead of overwriting the whole value.
+        storage = {}
+        queued_reads = []
+
+        def hset(key, field=None, value=None, mapping=None):
+            store = storage.setdefault(key, {})
+            if mapping:
+                store.update(mapping)
+            else:
+                store[field] = value
+            return True
+
+        def hgetall(key):
+            return dict(storage.get(key, {}))
+
+        client.hset.side_effect = hset
+        client.hgetall.side_effect = hgetall
+        client.expire.return_value = True
+
+        pipe = MagicMock()
+        client.pipeline.return_value = pipe
+        pipe.hset.side_effect = hset
+        pipe.expire.return_value = True
+        pipe.hgetall.side_effect = lambda key: queued_reads.append(hgetall(key))
+        pipe.execute.side_effect = lambda: (list(queued_reads), queued_reads.clear())[0]
+
+        PrefixCachePrebleServerChooser._redis_client = client
         yield client
+        PrefixCachePrebleServerChooser._redis_client = None
+
+
+def _make_context(body, request_id=1):
+    return ServerSelectionContext(
+        request_id=request_id,
+        ip_id=1,
+        model_id=1,
+        model_name="test-model",
+        path="/v1/completions",
+        method="POST",
+        is_stream=False,
+        body=body,
+    )
+
 
 def test_redis_prefix_cache_flow(mock_redis):
-    # Reset class attribute for testing
-    PrefixCachePrebleServerChooser._redis_client = mock_redis
-    
-    # Initialize chooser
     chooser = PrefixCachePrebleServerChooser(
         count_provider=lambda targets: {t: 0 for t in targets},
         prefix_block_chars=4,
     )
-    
-    candidates = [
-        MockServer(1, "http://server1"),
-        MockServer(2, "http://server2")
-    ]
-    
+
+    candidates = [MockServer(1, "http://server1"), MockServer(2, "http://server2")]
     body = b'{"prompt": "abcdefghij"}'
-    context = ServerSelectionContext(
-        request_id=1,
-        ip_id=1,
-        model_id=1,
-        model_name="test-model",
-        path="/v1/completions",
-        method="POST",
-        is_stream=False,
-        body=body
-    )
-    
-    # 1. on_response - should save to Redis
-    chooser.on_response(candidates[0], context, 200)
-    
-    # Verify Redis SET/pipeline calls
-    # character blocks: "abcd", "abcdefgh", "abcdefghij"
-    assert mock_redis.pipeline.called
+
+    # 1. on_response writes per-server hash fields. Character blocks:
+    # "abcd", "abcdefgh", "abcdefghij" -> 3 prefix hashes.
+    chooser.on_response(candidates[0], _make_context(body, request_id=1), 200)
     pipe = mock_redis.pipeline.return_value
-    assert pipe.set.call_count == 3
-    
-    # Capture the keys and values stored
-    saved_data = {}
-    for call in pipe.set.call_args_list:
-        args, kwargs = call
-        saved_data[args[0]] = json.loads(args[1])
-    
-    # 2. choose - should match from Redis
-    # Prepare mock MGET response
-    # We'll simulate a match for the first two blocks
-    mock_redis.mget.return_value = [
-        json.dumps(saved_data[list(saved_data.keys())[0]]),
-        json.dumps(saved_data[list(saved_data.keys())[1]]),
-        None # No match for the full prompt
-    ]
-    
-    new_context = ServerSelectionContext(
-        request_id=2,
-        ip_id=1,
-        model_id=1,
-        model_name="test-model",
-        path="/v1/completions",
-        method="POST",
-        is_stream=False,
-        body=body
-    )
-    
+    assert pipe.hset.call_count == 3
+
+    # 2. choose reads them back. The new request shares the first two blocks
+    # ("abcd", "abcdefgh") but differs in the tail, so the match ratio is 8/10.
+    new_context = _make_context(b'{"prompt": "abcdefghXY"}', request_id=2)
     selected = chooser.choose(candidates, new_context, set())
-    
+
     assert selected.id == 1
-    # Match ratio for 8 characters out of 10 = 0.8
     assert new_context.prefix_cache == 0.8
     assert new_context.last_match == 1
+
+
+def test_redis_prefix_cache_merges_servers_without_overwrite(mock_redis):
+    # Two servers serve the same prompt: both must end up in each hash, not
+    # just the last writer (issue #179).
+    chooser = PrefixCachePrebleServerChooser(
+        count_provider=lambda targets: {t: 0 for t in targets},
+        prefix_block_chars=4,
+    )
+    candidates = [MockServer(1, "http://server1"), MockServer(2, "http://server2")]
+    body = b'{"prompt": "abcdefghij"}'
+
+    chooser.on_response(candidates[0], _make_context(body, request_id=1), 200)
+    chooser.on_response(candidates[1], _make_context(body, request_id=2), 200)
+
+    prefix_hashes = chooser._get_prefix_hashes(chooser._prefix_chars_from_body(body))
+    for prefix_hash, _ in prefix_hashes:
+        fields = mock_redis.hgetall(chooser._cache_key("test-model", prefix_hash))
+        assert set(fields) == {"1", "2"}
+        assert json.loads(fields["1"])["rid"] == 1
+        assert json.loads(fields["2"])["rid"] == 2
