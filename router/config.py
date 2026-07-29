@@ -38,6 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "base_cooldown_seconds": 30,
             "max_cooldown_seconds": 3000,
             "success_threshold": 1,
+            "half_open_probe_limit": 1,
         },
     },
     "prefix_cache": {

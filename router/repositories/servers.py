@@ -7,6 +7,7 @@ from django.db.models import Count, F, Q, Value
 from django.db.models.functions import Greatest
 from django.utils import timezone
 
+from router.config import APP_CONFIG
 from router.models import Server
 from router.services.request_context import get_request_id
 from router.services.request_logger import append_request_log
@@ -52,7 +53,21 @@ class ServerRepository:
 
     @staticmethod
     def _filter_routable(servers: list[Server], now) -> list[Server]:
-        """Include closed servers always; include open/half_open only if cooldown expired (and transition to half_open)."""
+        """Include closed servers always; include open/half_open only if cooldown expired (and transition to half_open).
+
+        A half_open server accepts only a limited number of in-flight probe
+        requests (``half_open_probe_limit``) so a recovering node is not
+        flooded and re-tripped. In-flight count is approximated by
+        ``workload`` (incremented at dispatch, decremented on completion).
+        """
+        probe_limit = max(
+            1,
+            int(
+                APP_CONFIG.get("load_balancer", {})
+                .get("circuit_breaker", {})
+                .get("half_open_probe_limit", 1)
+            ),
+        )
         routable = []
         for s in servers:
             if s.circuit_state == "closed":
@@ -62,7 +77,8 @@ class ServerRepository:
                     ServerRepository.transition_to_half_open(s)
                     routable.append(s)
             elif s.circuit_state == "half_open":
-                routable.append(s)
+                if (s.workload or 0) < probe_limit:
+                    routable.append(s)
         return routable
 
     @staticmethod
@@ -376,14 +392,18 @@ class ServerRepository:
     @staticmethod
     def transition_to_half_open(server: Server) -> None:
         now = timezone.now()
-        Server.objects.filter(id=server.id).update(
+        # Compare-and-set: only transition servers still in the "open" state.
+        # This avoids clobbering a concurrent record_success (-> closed) or
+        # record_failure (-> open with doubled cooldown) from another thread.
+        updated = Server.objects.filter(id=server.id, circuit_state="open").update(
             circuit_state="half_open",
             last_state_change_at=now,
             updated_at=now,
         )
-        server.circuit_state = "half_open"
-        server.last_state_change_at = now
-        server.updated_at = now
+        if updated:
+            server.circuit_state = "half_open"
+            server.last_state_change_at = now
+            server.updated_at = now
 
     @staticmethod
     def promote_to_vip(server: Server) -> bool:

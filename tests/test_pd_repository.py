@@ -1,5 +1,9 @@
-from router.models import Model, Server
+from django.utils import timezone
+
+from router.models import Model, RequestRecord, Server
 from router.repositories.servers import ServerRepository
+from router.route_algorithm.base import ServerSelectionContext
+from router.services.proxy import _RetryState
 
 
 def _server(base_url, role="mixed", group_id=None, workload=0, active_tokens=0.0, **kwargs):
@@ -102,3 +106,85 @@ class TestPickDecoder:
         d = ServerRepository.pick_least_tokens_decoder("g1")
         assert d is not None
         assert d.base_url == "http://d1"
+
+
+class TestDecoderCircuitRecovery:
+    def test_decode_success_closes_half_open_decoder(self):
+        # Regression for #192: a decoder must recover from half_open on a
+        # successful decode. Decode success previously only recorded success on
+        # the prefiller, leaving the decoder stuck half_open indefinitely.
+        from router.services.circuit_breaker import CircuitBreakerService
+
+        decoder = _server(
+            "http://d-rec", role="decoder", group_id="g1",
+            circuit_state="half_open", consecutive_failures=3, cooldown_seconds=30,
+        )
+        cb = CircuitBreakerService()
+        cb.record_success(decoder)
+        decoder.refresh_from_db()
+        assert decoder.circuit_state == "closed"
+        assert decoder.consecutive_failures == 0
+
+    def test_normal_decode_records_success_on_decoder(self, monkeypatch):
+        # The actual fix lives here: on a terminal-success decode, PDForwardService
+        # must call record_success on the decoder (not just the prefiller). Before
+        # the fix this assertion failed because only _notify_chooser_response
+        # (prefiller) ran.
+        from router.services import proxy_pd_forward
+        from router.services.proxy_pd_forward import PDForwardService
+
+        prefiller = _server("http://p-rec", role="prefiller", group_id="g1")
+        decoder = _server(
+            "http://d-rec2", role="decoder", group_id="g1",
+            circuit_state="half_open", consecutive_failures=3,
+        )
+
+        record = RequestRecord.objects.create(
+            user_ip_id=1, ip_id=None, send_time=timezone.now(),
+            model_id=1, task_status="processing",
+        )
+
+        fake_cb = type("CB", (), {"record_success": staticmethod(lambda s: None)})()
+        fake_proxy = type(
+            "P",
+            (),
+            {
+                "_build_url": staticmethod(lambda base, path, qs: f"{base}/{path}"),
+                "_notify_chooser_response": staticmethod(lambda s, ctx, code: None),
+                "_after_finish": staticmethod(lambda vip, m: None),
+                "_decrement_workload": staticmethod(lambda s: None),
+                "circuit_breaker": fake_cb,
+                "normal_timeout": 5,
+            },
+        )()
+
+        svc = PDForwardService.__new__(PDForwardService)
+        svc.proxy = fake_proxy
+        svc.circuit_breaker = fake_cb
+
+        called = []
+
+        def fake_record_success(server):
+            called.append(server.id)
+
+        monkeypatch.setattr(fake_cb, "record_success", fake_record_success)
+
+        def fake_post_decode(d, url, h, b):
+            fake_response = type("R", (), {"reason": "OK", "headers": {}})()
+            content = b'{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}'
+            return fake_response, content, 200
+
+        monkeypatch.setattr(PDForwardService, "_post_decode", staticmethod(fake_post_decode))
+
+        result = svc._normal_decode(
+            "chat/completions", {}, b'{"messages":[]}', record,
+            ServerSelectionContext(
+                request_id=1, ip_id=None, model_id=1, model_name="m",
+                path="chat/completions", method="POST", is_stream=False, body=b"{}",
+            ),
+            False, None,
+            _RetryState(), prefiller, {}, 1, 0, "P: x",
+        )
+
+        assert result.response is not None  # terminal success, not a retry
+        assert decoder.id in called  # decoder success recorded

@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 
+from router.config import APP_CONFIG
 from router.models import Server
 from router.repositories.servers import ServerRepository
 from router.services.circuit_breaker import CircuitBreakerService
@@ -210,3 +211,106 @@ class TestCircuitBreakerInlineProbe:
         assert server.circuit_state == "open"
         assert server.vip is False
         assert server.cooldown_seconds == 30  # reset to base
+
+
+class TestCircuitBreakerTransitionRace:
+    def test_transition_to_half_open_does_not_clobber_closed(self):
+        """If another thread already closed the circuit, transition is a no-op."""
+        server = Server.objects.create(
+            base_url="http://race-closed.example",
+            is_online=True,
+            circuit_state="closed",
+            consecutive_failures=0,
+            cooldown_seconds=30,
+        )
+
+        ServerRepository.transition_to_half_open(server)
+
+        server.refresh_from_db()
+        assert server.circuit_state == "closed"
+
+    def test_transition_to_half_open_is_noop_when_already_half_open(self):
+        """A second concurrent transition must not re-stamp last_state_change_at."""
+        original_timestamp = timezone.now() - timedelta(seconds=60)
+        server = Server.objects.create(
+            base_url="http://race-half.example",
+            is_online=True,
+            circuit_state="half_open",
+            consecutive_failures=3,
+            last_state_change_at=original_timestamp,
+            cooldown_seconds=30,
+        )
+
+        ServerRepository.transition_to_half_open(server)
+
+        server.refresh_from_db()
+        assert server.circuit_state == "half_open"
+        # Not re-stamped: the compare-and-set found it already half_open.
+        assert abs((server.last_state_change_at - original_timestamp).total_seconds()) < 1
+
+    def test_transition_to_half_open_only_transitions_open_servers(self):
+        server = Server.objects.create(
+            base_url="http://race-ok.example",
+            is_online=True,
+            circuit_state="open",
+            consecutive_failures=3,
+            last_state_change_at=timezone.now() - timedelta(seconds=60),
+            cooldown_seconds=30,
+        )
+
+        ServerRepository.transition_to_half_open(server)
+
+        server.refresh_from_db()
+        assert server.circuit_state == "half_open"
+
+
+class TestCircuitBreakerHalfOpenProbeLimit:
+    def test_half_open_server_routable_when_below_probe_limit(self):
+        server = Server.objects.create(
+            base_url="http://probe-below.example",
+            is_online=True,
+            circuit_state="half_open",
+            consecutive_failures=3,
+            workload=0,
+            cooldown_seconds=30,
+        )
+        # default probe_limit=1, workload 0 < 1 -> routable
+        assert server in ServerRepository.list_all_online()
+
+    def test_half_open_server_excluded_at_probe_limit(self):
+        """A half_open server with an in-flight probe is excluded until it completes."""
+        server = Server.objects.create(
+            base_url="http://probe-full.example",
+            is_online=True,
+            circuit_state="half_open",
+            consecutive_failures=3,
+            workload=1,  # probe in flight, probe_limit default = 1
+            cooldown_seconds=30,
+        )
+        assert server not in ServerRepository.list_all_online()
+
+    def test_closed_server_routable_regardless_of_workload(self):
+        """Closed servers must not be gated by the probe limit."""
+        server = Server.objects.create(
+            base_url="http://probe-closed.example",
+            is_online=True,
+            circuit_state="closed",
+            workload=100,
+        )
+        assert server in ServerRepository.list_all_online()
+
+    def test_probe_limit_respects_config_override(self, monkeypatch):
+        monkeypatch.setitem(
+            APP_CONFIG["load_balancer"]["circuit_breaker"],
+            "half_open_probe_limit",
+            3,
+        )
+        server = Server.objects.create(
+            base_url="http://probe-override.example",
+            is_online=True,
+            circuit_state="half_open",
+            consecutive_failures=3,
+            workload=2,  # < 3 (overridden limit)
+            cooldown_seconds=30,
+        )
+        assert server in ServerRepository.list_all_online()

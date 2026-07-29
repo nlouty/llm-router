@@ -11,6 +11,7 @@ class CircuitBreakerService:
         self.failure_threshold = int(cb_config.get("failure_threshold", 3))
         self.base_cooldown_seconds = int(cb_config.get("base_cooldown_seconds", 30))
         self.max_cooldown_seconds = int(cb_config.get("max_cooldown_seconds", 3000))
+        self.half_open_probe_limit = max(1, int(cb_config.get("half_open_probe_limit", 1)))
 
     def record_failure(self, server: Server) -> None:
         """Record a failure. Opens the circuit if threshold is reached."""
