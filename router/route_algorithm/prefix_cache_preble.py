@@ -24,7 +24,6 @@ install_pd_handler(logger)
 @dataclass
 class _PrefixMatch:
     best_match_ratio: float = 0.0
-    best_match_request_id: Any = None
     cached_matches: list[Any] = field(default_factory=list)
     server_match_ratios: dict[int, float] = field(default_factory=dict)
     server_match_request_ids: dict[int, Any] = field(default_factory=dict)
@@ -68,7 +67,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         self.max_prefix_chars = self._positive_int_setting(
             max_prefix_chars,
             prefix_config.get("max_prefix_chars"),
-            1000000,
+            2000000,
         )
         self.prefix_block_chars = self._positive_int_setting(
             prefix_block_chars,
@@ -167,17 +166,20 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
     def _read_cached_prefixes(self, model_key: str, prefix_data: list[tuple[str, int]]):
         redis_keys = [self._cache_key(model_key, prefix_hash) for prefix_hash, _ in prefix_data]
-        return self._mget_cache_values(redis_keys, "[PrefixCachePreble] Redis MGET failed: %s")
+        return self._read_cache_hashes(redis_keys, "[PrefixCachePreble] Redis HGETALL failed: %s")
 
     def _cache_key(self, model_key: str, prefix_hash: str) -> str:
         return f"{self._cache_key_namespace}:{model_key}:{prefix_hash}"
 
-    def _mget_cache_values(self, redis_keys: list[str], error_message: str):
+    def _read_cache_hashes(self, redis_keys: list[str], error_message: str):
         try:
-            return self._redis_client.mget(redis_keys)
+            pipe = self._redis_client.pipeline()
+            for key in redis_keys:
+                pipe.hgetall(key)
+            return pipe.execute()
         except Exception as e:
             logger.error(error_message, e)
-            return [None] * len(redis_keys)
+            return [{} for _ in redis_keys]
 
     def _collect_prefix_matches(
         self,
@@ -213,14 +215,10 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         available_by_id: dict[int, Any],
         now_ts: float,
     ) -> None:
-        data = json.loads(value)
-        request_id = data.get("request_id")
-        servers_data = data.get("servers", {})
         match_ratio = prefix_len / request_len
         valid_servers = self._valid_servers_for_prefix(
-            servers_data,
+            value,
             match_ratio,
-            request_id,
             available_by_id,
             match.server_match_ratios,
             match.server_match_request_ids,
@@ -230,22 +228,26 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             return
         if match_ratio > match.best_match_ratio:
             match.best_match_ratio = match_ratio
-            match.best_match_request_id = request_id
         if valid_servers.primary:
             match.cached_matches = valid_servers.primary
 
     def _valid_servers_for_prefix(
         self,
-        servers_data: dict[str, float],
+        servers_data: dict[str, str],
         match_ratio: float,
-        request_id: Any,
         available_by_id: dict[int, Any],
         server_match_ratios: dict[int, float],
         server_match_request_ids: dict[int, Any],
         now_ts: float,
     ) -> _ValidPrefixServers:
         valid_servers = _ValidPrefixServers()
-        for server_id_text, expiry_ts in servers_data.items():
+        for server_id_text, field_value in servers_data.items():
+            try:
+                entry = json.loads(field_value)
+                expiry_ts = float(entry.get("exp", 0))
+                request_id = entry.get("rid")
+            except (TypeError, ValueError):
+                continue
             if now_ts >= expiry_ts:
                 continue
             server_id = int(server_id_text)
@@ -317,17 +319,16 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         if not prefix_data:
             return
 
+        field_value = json.dumps({"exp": expiry_ts, "rid": context.request_id})
         try:
             pipe = self._redis_client.pipeline()
             for h, _ in prefix_data:
-                data = {
-                    "request_id": context.request_id,
-                    "servers": {str(server.id): expiry_ts}
-                }
-                pipe.set(self._cache_key(model_key, h), json.dumps(data), ex=cache_time)
+                key = self._cache_key(model_key, h)
+                pipe.hset(key, str(server.id), field_value)
+                pipe.expire(key, cache_time)
             pipe.execute()
         except Exception as e:
-            logger.error("[PrefixCachePreble] Redis SET failed: %s", e)
+            logger.error("[PrefixCachePreble] Redis HSET failed: %s", e)
 
     def _get_prefix_hashes(self, text: str) -> list[tuple[str, int]]:
         results = []
@@ -483,7 +484,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         if not redis_keys:
             return results
 
-        cached_values = self._mget_cache_values(redis_keys, "[PrefixCachePreble] Multi-model Redis MGET failed: %s")
+        cached_values = self._read_cache_hashes(redis_keys, "[PrefixCachePreble] Multi-model Redis HGETALL failed: %s")
         self._apply_model_prefix_ratios(results, cached_values, key_map, prefix_data, len(request_chars))
         return results
 
@@ -526,9 +527,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         request_len: int,
         now_ts: float,
     ) -> None:
-        data = json.loads(value)
-        servers_data = data.get("servers", {})
-        if not PrefixCachePrebleServerChooser._has_valid_cached_server(servers_data, now_ts):
+        if not PrefixCachePrebleServerChooser._has_valid_cached_server(value, now_ts):
             return
 
         model_name, prefix_index = mapped_key
@@ -538,5 +537,12 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             results[model_name] = ratio
 
     @staticmethod
-    def _has_valid_cached_server(servers_data: dict[str, float], now_ts: float) -> bool:
-        return any(now_ts < expiry_ts for expiry_ts in servers_data.values())
+    def _has_valid_cached_server(servers_data: dict[str, str], now_ts: float) -> bool:
+        for field_value in servers_data.values():
+            try:
+                entry = json.loads(field_value)
+                if now_ts < float(entry.get("exp", 0)):
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
