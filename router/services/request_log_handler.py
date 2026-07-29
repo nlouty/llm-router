@@ -33,12 +33,20 @@ _request_context_filter = RequestContextFilter()
 def install_pd_handler(target_logger: logging.Logger) -> None:
     """Attach a request-aware file handler to *target_logger*.
 
-    Log records are only written to the per-request file when ``set_request_id``
-    has been called for the current context (thread / asyncio task).  When no
-    request is active the handler silently does nothing, so startup and
-    healthcheck noise does not leak into request files.
+    Server-choosing diagnostics (INFO and below) are written to the per-request
+    file only — they never reach the root logger / main log.  Errors (ERROR and
+    above) are still surfaced to the main log via a console handler attached to
+    *target_logger*, and also land in the per-request file.  ``propagate`` is set
+    to ``False`` so records never travel up to the root logger.
     """
-    handler = RequestFileHandler()
-    handler.addFilter(_request_context_filter)
-    handler.setLevel(logging.DEBUG)
-    target_logger.addHandler(handler)
+    file_handler = RequestFileHandler()
+    file_handler.addFilter(_request_context_filter)
+    file_handler.setLevel(logging.DEBUG)
+    target_logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)
+    target_logger.addHandler(console_handler)
+
+    target_logger.setLevel(logging.DEBUG)
+    target_logger.propagate = False
