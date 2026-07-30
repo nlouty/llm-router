@@ -11,7 +11,6 @@ from router.config import APP_CONFIG
 from router.models import Ips, Model
 from router.repositories.departments import DepartmentRepository
 from router.repositories.requests import RequestRepository
-from router.repositories.user_ips import UserIPRepository
 from router.repositories.whitelist import WhitelistRepository
 
 
@@ -35,18 +34,17 @@ class AdmissionService:
         self.stale_minutes = int(APP_CONFIG.get("proxy", {}).get("stale_processing_minutes", 20))
         self.unknown_model_max_tokens = int(APP_CONFIG.get("proxy", {}).get("unknown_model_max_tokens", 20480))
 
-    def check_permission(self, ip: Ips) -> AdmissionResult:
-        user_ip = UserIPRepository.get_by_ip_id(ip.id)
-        if not user_ip:
+    def check_permission(self, identity) -> AdmissionResult:
+        if not identity.has_employee:
             return AdmissionResult(True) if self.allow_missing_user_info else self._permission_denied()
-        if user_ip.department_id is None:
+        if identity.department_id is None:
             return AdmissionResult(True)
-        department = DepartmentRepository.get(user_ip.department_id)
+        department = DepartmentRepository.get(identity.department_id)
         if department is None:
             return AdmissionResult(True)
         if department.is_allowed == 1:
             return AdmissionResult(True)
-        if WhitelistRepository.is_allowed(user_ip.employee_no):
+        if WhitelistRepository.is_allowed(identity.employee_no):
             return AdmissionResult(True)
         return self._permission_denied()
 

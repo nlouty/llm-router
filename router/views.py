@@ -17,6 +17,7 @@ from router.repositories.requests import RequestRepository
 from router.repositories.whitelist import WhitelistRepository
 from router.services.admission import AdmissionService
 from router.services.cmdb import CMDBService
+from router.services.identity import IdentityService
 from router.services.opencode import OpencodeVersionService
 from router.services.parser import RequestParser
 from router.services.proxy import ProxyService
@@ -49,6 +50,7 @@ def proxy(request, path: str):
     ip = None
     model = None
     parsed = None
+    identity = None
     try:
         body = request.body
     except RequestDataTooBig:
@@ -63,22 +65,24 @@ def proxy(request, path: str):
         if created:
             threading.Thread(target=CMDBService().fetch_and_save_user, args=(client_ip,), daemon=True).start()
 
+        identity = IdentityService.resolve(request, ip)
+
         if is_vip_channel and not ip.vip:
             message = _vip_port_closed_message(request)
-            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 503, message)
+            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 503, message, user_ip_id=identity.user_ip_id)
             return error_response(503, message, "service_unavailable")
 
         admission = AdmissionService()
-        permission = admission.check_permission(ip)
+        permission = admission.check_permission(identity)
         if not permission.allowed:
             message = permission.message or "Access denied, you do not have permission"
-            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message)
+            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
             return error_response(permission.status_code, message, permission.error_type or "permission_denied")
 
         blocked, version = OpencodeVersionService.should_block(user_agent)
         if blocked:
             message = f"Your opencode version ({version}) is no longer supported. Please upgrade opencode to latest version."
-            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message)
+            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
             return error_response(403, message, "version_too_old")
 
         parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 18528)))
@@ -89,18 +93,18 @@ def proxy(request, path: str):
 
         if input_model_name and not input_is_auto and model is None:
             message = f"Model {input_model_name} is not supported."
-            RequestRepository.create_blocked(ip.id, 0, parsed.stream, user_agent, 400, message, estimate_tokens=parsed.estimated_full_body_tokens)
+            RequestRepository.create_blocked(ip.id, 0, parsed.stream, user_agent, 400, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
             return error_response(400, message, "invalid_request_error")
 
         if model and model.deprecation and not is_vip_channel:
             message = model.deprecation
-            RequestRepository.create_blocked(ip.id, model.id, parsed.stream, user_agent, 400, message, estimate_tokens=parsed.estimated_full_body_tokens)
+            RequestRepository.create_blocked(ip.id, model.id, parsed.stream, user_agent, 400, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
             return error_response(400, message, "invalid_request_error")
 
         max_token_check = admission.check_max_tokens(parsed.max_tokens, model)
         if not max_token_check.allowed:
             message = max_token_check.message or "invalid request"
-            RequestRepository.create_blocked(ip.id, model.id if model else 0, parsed.stream, user_agent, 400, message, estimate_tokens=parsed.estimated_full_body_tokens)
+            RequestRepository.create_blocked(ip.id, model.id if model else 0, parsed.stream, user_agent, 400, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
             return error_response(max_token_check.status_code, message, max_token_check.error_type or "invalid_request_error")
 
         if not is_vip_channel:
@@ -111,17 +115,18 @@ def proxy(request, path: str):
             )
             if not concurrency.allowed:
                 message = concurrency.message or "concurrent limit exceeded"
-                RequestRepository.create_blocked(ip.id, model.id if model else 0, parsed.stream, user_agent, 429, message, estimate_tokens=parsed.estimated_full_body_tokens)
+                RequestRepository.create_blocked(ip.id, model.id if model else 0, parsed.stream, user_agent, 429, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
                 return error_response(concurrency.status_code, message, concurrency.error_type or "concurrent_limit_exceeded")
 
-        return ProxyService().forward(request, path, parsed, ip.id, model, user_agent, is_vip_channel=is_vip_channel)
+        return ProxyService().forward(request, path, parsed, ip.id, model, user_agent, is_vip_channel=is_vip_channel, user_ip_id=identity.user_ip_id, is_identity_vip=identity.is_vip)
     except Exception:
         message = "502 Bad Gateway"
         model_id = model.id if model else 0
         ip_id = ip.id if ip else None
         is_stream = parsed.stream if parsed else None
         estimate_tokens = parsed.estimated_full_body_tokens if 'parsed' in locals() and parsed else 0
-        RequestRepository.create_blocked(ip_id, model_id, is_stream, user_agent, 502, message, estimate_tokens=estimate_tokens)
+        user_ip_id = identity.user_ip_id if identity is not None else 0
+        RequestRepository.create_blocked(ip_id, model_id, is_stream, user_agent, 502, message, user_ip_id=user_ip_id, estimate_tokens=estimate_tokens)
         return error_response(502, message, "server_error")
 
 

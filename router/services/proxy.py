@@ -87,24 +87,24 @@ class ProxyService:
         self.vip_port = int(APP_CONFIG.get("server", {}).get("vip_port", 8008))
         self._active_chooser = None
 
-    def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False):
+    def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False):
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
-        record = self._create_processing_record(ip_id, model, parsed, user_agent)
+        record = self._create_processing_record(ip_id, model, parsed, user_agent, user_ip_id=user_ip_id)
         append_verbose_request_log(record.id, django_request.body)
         normalized = path.rstrip("/")
         if normalized == "chat/completions":
             return self._forward_chat(
-                django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel
+                django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
             )
         if normalized == "embeddings":
             return self._forward_embeddings(
-                django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel
+                django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
             )
         return self._forward_default(
-            django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel
+            django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
         )
 
-    def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool):
+    def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False):
         auto_model_selection = self.auto_router.should_auto_select(
             parsed,
             model,
@@ -141,10 +141,10 @@ class ProxyService:
                     int((time.monotonic() - model_choice_started) * 1000),
                 )
 
-        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel)
+        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
         if served_as_vip:
-            record.user_ip_id = 2
-            record.save(update_fields=["user_ip_id"])
+            record.vip = True
+            record.save(update_fields=["vip"])
 
         if not candidates:
             return self._handle_no_candidates(record, user_agent, context, model)
@@ -154,7 +154,7 @@ class ProxyService:
             candidates, context, served_as_vip, model, parsed.stream
         )
 
-    def _forward_embeddings(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool):
+    def _forward_embeddings(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False):
         # Embeddings skip the chat-completions auto-routing algorithm entirely
         # and select a server by least-connection (random among least-loaded).
         # The request body is forwarded unchanged (no max_tokens / model rewrite).
@@ -162,10 +162,10 @@ class ProxyService:
             record, ip_id, model, parsed, path, django_request.method, False
         )
         context.router_result = path.rstrip("/")
-        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel)
+        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
         if served_as_vip:
-            record.user_ip_id = 2
-            record.save(update_fields=["user_ip_id"])
+            record.vip = True
+            record.save(update_fields=["vip"])
         if not candidates:
             return self._handle_no_candidates(record, user_agent, context, model)
         self._active_chooser = self.auto_router.workload_chooser
@@ -177,17 +177,17 @@ class ProxyService:
         finally:
             self._active_chooser = None
 
-    def _forward_default(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool):
+    def _forward_default(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False):
         # Non-chat, non-embeddings endpoints (e.g. /v1/models): no auto-routing;
         # record the endpoint path as the router_result.
         context = self._selection_context(
             record, ip_id, model, parsed, path, django_request.method, False
         )
         context.router_result = path.rstrip("/")
-        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel)
+        candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
         if served_as_vip:
-            record.user_ip_id = 2
-            record.save(update_fields=["user_ip_id"])
+            record.vip = True
+            record.save(update_fields=["vip"])
         if not candidates:
             return self._handle_no_candidates(record, user_agent, context, model)
         return self._route_with_retry(
@@ -196,8 +196,7 @@ class ProxyService:
         )
 
     @staticmethod
-    def _create_processing_record(ip_id: int | None, model, parsed, user_agent: str | None):
-        user_ip_id = 1
+    def _create_processing_record(ip_id: int | None, model, parsed, user_agent: str | None, user_ip_id: int = 0):
         return RequestRepository.create_processing(
             ip_id,
             model.id if model else 0,
@@ -243,7 +242,7 @@ class ProxyService:
             return [random.choice(candidates)] if candidates else []
         return ServerRepository.list_pd_holders(model_id, vip=vip, min_context_window=min_context_window)
 
-    def _select_candidates(self, path: str, model, is_vip_channel: bool, min_context_window: int = 0):
+    def _select_candidates(self, path: str, model, is_vip_channel: bool, is_identity_vip: bool = False, min_context_window: int = 0):
         model_id = model.id if model else None
         if path.rstrip("/") == "models" and model_id is None:
             return self._candidates_for_request(path, None), False
@@ -251,7 +250,7 @@ class ProxyService:
         if self.vip_service.is_vip_eligible(model):
             ServerRepository.demote_expired_cooldowns(self.vip_service.cooldown_seconds, model.id)
 
-        if is_vip_channel and self.vip_service.is_vip_eligible(model):
+        if (is_vip_channel or is_identity_vip) and self.vip_service.is_vip_eligible(model):
             return self.vip_service.select_candidates(model)
         return self._candidates_for_request(path, model_id, vip=False, min_context_window=min_context_window), False
 

@@ -39,7 +39,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - Router-managed `servers.vip` and `servers.vip_cooldown` track pool membership; non-VIP traffic never lands on VIP servers
   - Scale-up: on each VIP request, if `(current_load + 1) / active_vip_servers > threshold`, cancels a cooling cooldown if any, otherwise promotes the least-loaded normal server (subject to `vip.min_normal_servers` floor, default 2)
   - Scale-down: on each VIP request finish, if projected average drops below threshold, cools the least-loaded VIP server; if VIP load reaches zero, cools all active VIP servers; cooldowns demote after `vip.cooldown_seconds` (default 300)
-  - VIP load counted via `requests.user_ip_id = 2` so leftover normal traffic on freshly-promoted servers does not skew scaling decisions
+  - VIP load counted via `requests.vip` (set for VIP-channel and VIP-identity requests) so leftover normal traffic on freshly-promoted servers does not skew scaling decisions
   - `release_vip_cooldowns` management command demotes expired cooldowns when the VIP channel is fully idle
 
 - **Circuit Breaker & Health Probing**

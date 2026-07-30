@@ -171,7 +171,7 @@ Routing LLM calls are separate internal request rows. Statistics APIs exclude ro
 - A request for a concrete model by name counts under that model's bucket (limit `models.concurrent_limit`), whether or not the model is also `auto = TRUE`. While unresolved the record has a `NULL` `router_result` and its own `model_id`; after resolution it carries a `<name>:` prefix.
 - Because the bucket follows the entrance, an `auto -> B` request never counts against `B`'s concurrency, and a `source-model -> B` request never counts against the resolved target. Each entrance model enforces its own limit independently.
 
-VIP-channel requests are excluded from these counts (their records carry the `user_ip_id = 2` sentinel and are filtered out), since VIP capacity is managed by VIP scaling. Occasional over-limit under concurrent arrivals is tolerated; the check intentionally uses no locking.
+VIP-channel requests are excluded from these counts (their records carry `vip = TRUE` and are filtered out), since VIP capacity is managed by VIP scaling. Occasional over-limit under concurrent arrivals is tolerated; the check intentionally uses no locking.
 
 ## Example
 

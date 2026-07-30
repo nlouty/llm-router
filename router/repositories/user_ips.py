@@ -37,6 +37,14 @@ class UserIPRepository:
         ).filter(~Q(apikey="")).first()
 
     @staticmethod
+    def get_active_by_apikey(apikey: str) -> UserIP | None:
+        return UserIP.objects.filter(
+            apikey=apikey,
+            is_valid=True,
+            deleted_at__isnull=True,
+        ).first()
+
+    @staticmethod
     def create_or_update_apikey(
         apikey: str,
         employee_no: str,
