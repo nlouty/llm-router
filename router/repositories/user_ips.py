@@ -29,6 +29,16 @@ class UserIPRepository:
         return UserIP.objects.filter(ip_id=ip_id, deleted_at__isnull=True).exists()
 
     @staticmethod
+    def all_active_apikeys() -> list[UserIP]:
+        return list(
+            UserIP.objects.filter(
+                ip_id=0,
+                is_valid=True,
+                deleted_at__isnull=True,
+            ).exclude(apikey="").order_by("id")
+        )
+
+    @staticmethod
     def get_active_apikey_by_employee_no(employee_no: str) -> UserIP | None:
         return UserIP.objects.filter(
             employee_no=employee_no,
@@ -86,6 +96,7 @@ class UserIPRepository:
         user_charge: str = "",
         employee_no: str = "",
         department_id: int | None = None,
+        vip: bool = False,
     ) -> UserIP:
         now = timezone.now()
         obj, created = UserIP.objects.get_or_create(
@@ -95,6 +106,7 @@ class UserIPRepository:
                 "user_charge": user_charge,
                 "employee_no": employee_no,
                 "department_id": department_id,
+                "vip": vip,
                 "is_valid": True,
                 "created_at": now,
                 "updated_at": now,
@@ -105,7 +117,8 @@ class UserIPRepository:
             obj.user_charge = user_charge
             obj.employee_no = employee_no
             obj.department_id = department_id
+            obj.vip = vip
             obj.is_valid = True
             obj.updated_at = now
-            obj.save(update_fields=["user_name", "user_charge", "employee_no", "department_id", "is_valid", "updated_at"])
+            obj.save(update_fields=["user_name", "user_charge", "employee_no", "department_id", "vip", "is_valid", "updated_at"])
         return obj
