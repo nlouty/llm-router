@@ -110,7 +110,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
    - the configured system prompt
    - only user-role messages from the original request
    - at most the last 20 user messages
-   - each forwarded user message truncated to `500` characters
+   - each forwarded user message truncated to at most `1500` characters (3× the 500-char base). Messages up to `1500` characters are forwarded in full; longer messages keep the first `500` and last `500` characters with a `... collapsed <n> chars ...` marker between them.
    - `response_format` requiring JSON schema `{"complexity": <integer 1-10>}`
    - `chat_template_kwargs.enable_thinking = false`
 
