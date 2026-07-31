@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import traceback
 
 from django.core.exceptions import RequestDataTooBig
 from django.db import connection
@@ -21,7 +23,12 @@ from router.services.identity import IdentityService
 from router.services.opencode import OpencodeVersionService
 from router.services.parser import RequestParser
 from router.services.proxy import ProxyService
+from router.services.request_context import clear_request_id, set_request_id
+from router.services.request_log_handler import install_pd_handler
 from router.utils.errors import error_response
+
+logger = logging.getLogger(__name__)
+install_pd_handler(logger)
 
 
 @require_http_methods(["GET"])
@@ -119,15 +126,25 @@ def proxy(request, path: str):
                 return error_response(concurrency.status_code, message, concurrency.error_type or "concurrent_limit_exceeded")
 
         return ProxyService().forward(request, path, parsed, ip.id, model, user_agent, is_vip_channel=is_vip_channel, user_ip_id=identity.user_ip_id, is_identity_vip=identity.is_vip)
-    except Exception:
-        message = "502 Bad Gateway"
+    except Exception as exc:
+        fail_reason = f"unhandled {type(exc).__name__}: {exc}"[:200]
         model_id = model.id if model else 0
         ip_id = ip.id if ip else None
         is_stream = parsed.stream if parsed else None
         estimate_tokens = parsed.estimated_full_body_tokens if 'parsed' in locals() and parsed else 0
         user_ip_id = identity.user_ip_id if identity is not None else 0
-        RequestRepository.create_blocked(ip_id, model_id, is_stream, user_agent, 502, message, user_ip_id=user_ip_id, estimate_tokens=estimate_tokens)
-        return error_response(502, message, "server_error")
+        record = RequestRepository.create_blocked(ip_id, model_id, is_stream, user_agent, 502, fail_reason, user_ip_id=user_ip_id, estimate_tokens=estimate_tokens)
+        # install_pd_handler routes records to the per-request file when a
+        # request_id is in context. Emit the summary at ERROR so it also reaches
+        # the main log (one line); emit the traceback at DEBUG so only the
+        # per-request file records it.
+        set_request_id(record.id)
+        try:
+            logger.error("proxy unhandled %s request_id=%s path=/v1/%s: %s", type(exc).__name__, record.id, path, str(exc)[:200])
+            logger.debug("%s", traceback.format_exc())
+        finally:
+            clear_request_id()
+        return error_response(502, "502 Bad Gateway", "server_error")
 
 
 @csrf_exempt
