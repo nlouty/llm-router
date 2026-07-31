@@ -50,7 +50,12 @@ python manage.py prod release_vip_cooldowns --cooldown 600 --dry-run
 
 ## `refresh_user_info`
 
-Refresh `user_ips` table from the CMDB source. Requires `cmdb.enabled` to be true in `config.yaml`. Supports dry-run mode to generate SQL without applying changes and `--ip` to refresh one address.
+Refresh `user_ips` table from the CMDB source. Requires `cmdb.enabled` to be true in `config.yaml` and a CMDB adapter that implements the lookup methods in `CMDBService`. The full refresh walks both row kinds:
+
+- **IP-backed rows** (`ip`/`ip_id` fixed, `apikey` empty): iterates active IPs, calls `CMDBService.fetch_user_data(ip) -> dict`.
+- **API-key-backed rows** (`apikey`/`employee_no` fixed, `ip_id = 0`): iterates active API-key rows, calls `CMDBService.fetch_user_data_by_employee_no(employee_no) -> dict`.
+
+Both lookups return `user_name`, `user_charge`, `employee_no`, `department_id`, and `vip`; `None` when there is no CMDB record. The public adapter is a dummy, so each pass exits with an explanatory error until an internal adapter provides the corresponding method. Supports dry-run mode to generate SQL without applying changes and `--ip` to refresh a single IP-backed address (the API-key pass only runs in a full refresh).
 
 ```bash
 python manage.py prod refresh_user_info --dry-run
