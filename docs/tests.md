@@ -34,6 +34,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_opencode.py` | Opencode UA blocking and 400-delay version comparisons |
 | `test_parser.py` | JSON body rewriting, stream options, default max tokens, non-JSON passthrough |
 | `test_proxy.py` | Proxy flow, auto routing, routing LLM calls, router results, retries, and `/v1/models` routing |
+| `test_proxy_unhandled_exception.py` | View catch-all: 502 + self-describing `fail_reason`, one-line main log, full traceback in per-request log file |
 | `test_proxy_usage.py` | JSON usage parsing, including cached token counts |
 | `test_redis_prefix_cache.py` | Redis prefix-cache write/read flow and match ratios |
 | `test_refresh_user_info_command.py` | CMDB refresh command dry-run and single-IP behavior |
