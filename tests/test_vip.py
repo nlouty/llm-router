@@ -35,7 +35,7 @@ def make_server(model_id, base_url, *, vip=False, vip_cooldown=None, workload=0,
 
 def add_vip_processing(model_id, target_pod_ip=None):
     record = RequestRepository.create_processing(
-        ip_id=1, model_id=model_id, is_stream=False, user_agent="t", user_ip_id=2,
+        ip_id=1, model_id=model_id, is_stream=False, user_agent="t", vip=True,
     )
     if target_pod_ip:
         RequestRecord.objects.filter(id=record.id).update(target_pod_ip=target_pod_ip)
@@ -129,7 +129,7 @@ class TestCountVIPProcessing:
         add_vip_processing(model_id=7)
         add_vip_processing(model_id=7)
         # non-VIP request on same model:
-        RequestRepository.create_processing(ip_id=1, model_id=7, is_stream=False, user_agent="t", user_ip_id=1)
+        RequestRepository.create_processing(ip_id=1, model_id=7, is_stream=False, user_agent="t")
         # VIP request on different model:
         add_vip_processing(model_id=8)
 

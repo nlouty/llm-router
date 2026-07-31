@@ -27,11 +27,12 @@ def _make_ip(concurrent_multiplier=1.0):
     return Ips.objects.create(ip="10.20.30.40", concurrent_multiplier=concurrent_multiplier, vip=False)
 
 
-def _seed_processing(ip_id, model_id, router_result=None, user_ip_id=1):
+def _seed_processing(ip_id, model_id, router_result=None, user_ip_id=1, vip=False):
     # send_time must be recent so the throttled cleanup_stale run inside
     # check_concurrency does not sweep these seed rows away before counting.
     return RequestRecord.objects.create(
         user_ip_id=user_ip_id,
+        vip=vip,
         ip_id=ip_id,
         send_time=timezone.now(),
         model_id=model_id,
@@ -174,15 +175,15 @@ def test_auto_flagged_model_by_name_excludes_unrelated_auto_requests():
     assert result.allowed is True
 
 
-# --- VIP sentinel rows are excluded from the count ---
+# --- VIP rows are excluded from the count ---
 
 
 @pytest.mark.django_db
-def test_vip_sentinel_rows_excluded_from_concurrency_count():
+def test_vip_rows_excluded_from_concurrency_count():
     ip = _make_ip()
     model_b = Model.objects.create(model_name="model-b", concurrent_limit=1)
 
-    _seed_processing(ip.id, model_b.id, router_result=None, user_ip_id=2)
+    _seed_processing(ip.id, model_b.id, router_result=None, vip=True)
 
     result = AdmissionService().check_concurrency(ip, model_b, is_auto=False)
 

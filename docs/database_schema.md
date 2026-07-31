@@ -47,7 +47,7 @@ When `admission.allow_when_user_info_missing` is true, missing `user_ips` data d
 
 `user_ips` supports separate IP-backed and API-key-backed rows. An IP-backed row has `ip_id > 0` and an empty `apikey`; an API-key-backed row has `ip_id = 0` and a nonempty `apikey`. Nonzero IP IDs and nonempty API keys are individually unique, and an employee can have only one active API-key row.
 
-`user_ips.vip` is populated in this phase but is not yet used for request admission. `ips.vip` remains the active VIP-port gate until the request-identity rollout. Likewise, `requests.vip` is present but remains `FALSE`; current code continues to use `requests.user_ip_id = 2` for VIP accounting.
+`user_ips.vip` now drives identity-based VIP routing: a request carrying a VIP `user_ips` row (apikey- or IP-backed) is routed through the VIP server pool on the normal port. `ips.vip` still gates VIP-port admission. VIP load accounting uses `requests.vip` (set for VIP-channel and VIP-identity requests); the old `requests.user_ip_id = 2` sentinel is retired. `requests.user_ip_id` now holds the real backing `user_ips.id`, or `0` when no identity resolves.
 
 Before applying the schema change, these preflight queries must return no rows:
 
@@ -96,6 +96,8 @@ CREATE INDEX CONCURRENTLY idx_req_vip_proc_model
 ```
 
 Do not convert historical `requests.user_ip_id` values or derive `requests.vip` in this phase. Rollback is safe only before API-key rows are registered; afterward, dropping `apikey` would destroy registered credentials.
+
+> Note: after the request-identity rollout, `requests.vip` is the active VIP-accounting column. If you need historical VIP traffic reflected, run a one-time `UPDATE requests SET vip = TRUE WHERE user_ip_id = 2;` backfill before retiring the sentinel.
 
 ## `models` Table
 

@@ -44,11 +44,13 @@ class RequestRepository:
         model_id: int,
         is_stream: bool,
         user_agent: str | None,
-        user_ip_id: int = 1,
+        user_ip_id: int = 0,
+        vip: bool = False,
         estimate_tokens: int = 0,
     ) -> RequestRecord:
         return RequestRecord.objects.create(
             user_ip_id=user_ip_id,
+            vip=vip,
             ip_id=ip_id,
             send_time=timezone.now(),
             model_id=model_id,
@@ -70,7 +72,7 @@ class RequestRepository:
         target_pod_ip: str | None,
     ) -> RequestRecord:
         return RequestRecord.objects.create(
-            user_ip_id=1,
+            user_ip_id=0,
             ip_id=LLM_CHOOSING_IP_ID,
             send_time=timezone.now(),
             model_id=model_id,
@@ -95,12 +97,14 @@ class RequestRepository:
         user_agent: str | None,
         status_code: int,
         fail_reason: str,
-        user_ip_id: int = 1,
+        user_ip_id: int = 0,
+        vip: bool = False,
         estimate_tokens: int = 0,
     ) -> RequestRecord:
         now = timezone.now()
         return RequestRecord.objects.create(
             user_ip_id=user_ip_id,
+            vip=vip,
             ip_id=ip_id,
             send_time=now,
             end_time=now,
@@ -275,14 +279,14 @@ class RequestRepository:
 
     @staticmethod
     def list_processing_for_concurrency(ip_id: int) -> list[dict]:
-        """In-flight rows for an IP, excluding VIP-sentinel traffic (user_ip_id == 2).
+        """In-flight rows for an IP, excluding VIP traffic (``vip = TRUE``).
 
         VIP-channel requests are accounted separately by VIP scaling, so they
         must not be counted against a user's normal concurrency buckets.
         """
         return list(
             RequestRecord.objects.filter(ip_id=ip_id).filter(is_processing_q())
-            .exclude(user_ip_id=2)
+            .exclude(vip=True)
             .values("model_id", "router_result")
         )
 
@@ -300,7 +304,7 @@ class RequestRepository:
     @staticmethod
     def count_vip_processing(model_id: int) -> int:
         return RequestRecord.objects.filter(
-            user_ip_id=2, model_id=model_id
+            vip=True, model_id=model_id
         ).filter(is_processing_q()).count()
 
     @staticmethod
