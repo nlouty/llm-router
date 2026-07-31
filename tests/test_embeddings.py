@@ -158,6 +158,41 @@ def test_embeddings_retries_on_failure(monkeypatch):
     assert attempts[1].startswith("http://second.example")
 
 
+def test_embeddings_does_not_retry_on_non_connection_error(monkeypatch):
+    """A non-connection RequestException must not retry (POST idempotency, #198)."""
+    Model.objects.create(model_name="emb")
+    first = Server.objects.create(base_url="http://first.example", is_online=True)
+    second = Server.objects.create(base_url="http://second.example", is_online=True)
+    first.workload = 0
+    first.save()
+    second.workload = 5
+    second.save()
+
+    attempts = []
+
+    def fake_request(self_inner, method, url, **kwargs):
+        attempts.append(url)
+        if url.startswith("http://first.example"):
+            # A mid-stream transport error: the connection was established, so
+            # the server may have started processing — must NOT retry.
+            raise requests.exceptions.ChunkedEncodingError("truncated")
+        return _make_upstream(200, b'{"data":[]}')
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fake_request,
+    )
+
+    service = ProxyService()
+    parsed = MagicMock(stream=False, body=b'{"model":"emb","input":"x"}', model_name="emb", estimated_full_body_tokens=0)
+    response = service.forward(_django_request(), "embeddings", parsed, None, None, None)
+
+    # Only the first server was contacted; the request terminated with 502.
+    assert response.status_code == 502
+    assert len(attempts) == 1
+    assert attempts[0].startswith("http://first.example")
+
+
 def test_embeddings_no_candidates_returns_502():
     """No servers for the model -> 502."""
     Model.objects.create(model_name="emb")
