@@ -269,13 +269,31 @@ class PDForwardService:
             prefill_json, prompt_tokens, cached_tokens = self._do_prefill(
                 prefiller, prefiller_url, headers, body
             )
-        except requests.RequestException as exc:
-            logger.warning("PD prefill connection error on %s: %s", prefiller.base_url, exc)
+        except requests.exceptions.ReadTimeout:
+            logger.warning("PD prefill read timeout on %s", prefiller.base_url)
             record.task_status = "processing"
             record.save(update_fields=["task_status"])
             append_request_log(record.id, json.dumps({
                 "event": "pd_prefill_error",
-                "error_type": "connection",
+                "error_type": "read_timeout",
+                "prefiller_url": prefiller.base_url,
+                "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+            }, ensure_ascii=False))
+            self._release_prefiller(prefiller)
+            self.circuit_breaker.record_failure(prefiller)
+            state.last_status = 504
+            state.last_reason = "Gateway Timeout"
+            return _RouteAttemptResult()
+        except requests.RequestException as exc:
+            is_connection = self.proxy._is_connection_failure(exc)
+            logger.warning("PD prefill %s on %s: %s",
+                           "connection error" if is_connection else "request error",
+                           prefiller.base_url, exc)
+            record.task_status = "processing"
+            record.save(update_fields=["task_status"])
+            append_request_log(record.id, json.dumps({
+                "event": "pd_prefill_error",
+                "error_type": "connection" if is_connection else "request_error",
                 "prefiller_url": prefiller.base_url,
                 "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
                 "reason": str(exc)[:500],
@@ -284,7 +302,7 @@ class PDForwardService:
             self.circuit_breaker.record_failure(prefiller)
             state.last_status = 502
             state.last_reason = "Bad Gateway"
-            return _RouteAttemptResult(should_retry=True)
+            return _RouteAttemptResult(should_retry=is_connection)
         except _PrefillHttpError as exc:
             logger.warning("PD prefill HTTP %s on %s", exc.status_code, prefiller.base_url)
             append_request_log(record.id, json.dumps({
@@ -397,7 +415,9 @@ class PDForwardService:
                     "attempted_decoder_ids": sorted(attempted_decoder_ids),
                     "recompute_count": recompute_count,
                 }, ensure_ascii=False))
-                return _RouteAttemptResult(should_retry=True)
+                state.last_status = 502
+                state.last_reason = "no routable decoder in cluster"
+                return _RouteAttemptResult()
             attempted_decoder_ids.add(decoder.id)
             append_request_log(record.id, json.dumps({
                 "event": "pd_decoder_chosen",
@@ -430,12 +450,15 @@ class PDForwardService:
                 self.circuit_breaker.record_failure(decoder)
                 state.last_status = 504
                 state.last_reason = "Gateway Timeout"
-                return _RouteAttemptResult(should_retry=True)
+                return _RouteAttemptResult()
             except requests.RequestException as exc:
-                logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
+                is_connection = self.proxy._is_connection_failure(exc)
+                logger.warning("PD decode %s on %s: %s",
+                               "connection error" if is_connection else "request error",
+                               decoder.base_url, exc)
                 append_request_log(record.id, json.dumps({
                     "event": "pd_decode_error",
-                    "error_type": "connection",
+                    "error_type": "connection" if is_connection else "request_error",
                     "decoder_url": decoder.base_url,
                     "reason": str(exc)[:500],
                     "recompute_count": recompute_count,
@@ -444,7 +467,7 @@ class PDForwardService:
                 self.circuit_breaker.record_failure(decoder)
                 state.last_status = 502
                 state.last_reason = "Bad Gateway"
-                return _RouteAttemptResult(should_retry=True)
+                return _RouteAttemptResult(should_retry=is_connection)
 
             if status_code >= 400:
                 # 5xx: record failure on the node, NO retry — return error.
@@ -495,7 +518,9 @@ class PDForwardService:
                         "recompute_count": recompute_count,
                         "recompute_max": self.recompute_max,
                     }, ensure_ascii=False))
-                    return _RouteAttemptResult(should_retry=True)
+                    state.last_status = 502
+                    state.last_reason = "PD recompute limit exceeded"
+                    return _RouteAttemptResult()
                 decode_body = self._extend_for_recompute(
                     body, generated, origin_max_tokens, completion_tokens, recompute_count
                 )

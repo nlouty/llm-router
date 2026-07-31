@@ -694,7 +694,7 @@ class ProxyService:
             return _RouteAttemptResult(response=self._client_closed_response(record, served_as_vip, model))
         state.last_status = 502
         state.last_reason = "Bad Gateway"
-        retry = state.attempts < self.max_attempts_per_request
+        retry = self._is_connection_failure(exc) and state.attempts < self.max_attempts_per_request
         self._mark_unhealthy(server)
         proxy_logging.log_attempt(
             record.id,
@@ -862,6 +862,16 @@ class ProxyService:
     def _maybe_delay_opencode_failure(self, user_agent: str | None, status_code: int) -> None:
         if self.opencode_failure_delay > 0 and OpencodeVersionService.should_delay_failure(user_agent, status_code):
             time.sleep(self.opencode_failure_delay)
+
+    @staticmethod
+    def _is_connection_failure(exc: BaseException) -> bool:
+        # A connection failure guarantees the request body never reached the
+        # upstream, so retrying on another server is safe even for non-idempotent
+        # POST. ReadTimeout and other RequestException subclasses mean the
+        # connection was established (the server may have started processing),
+        # so they must not trigger a retry. ConnectTimeout subclasses
+        # ConnectionError and is therefore treated as a connection failure.
+        return isinstance(exc, requests.exceptions.ConnectionError)
 
     @staticmethod
     def _load_chooser(path: str):
