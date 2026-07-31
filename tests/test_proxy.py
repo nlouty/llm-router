@@ -448,11 +448,51 @@ def test_auto_route_payload_only_forwards_user_role_messages(monkeypatch):
     assert "secret_tool" not in payload_text
 
 
-def test_auto_route_payload_truncates_long_user_messages(monkeypatch):
+def test_auto_route_payload_forwards_medium_user_messages_in_full(monkeypatch):
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
-    long_content = "x" * 501
+    medium_content = "x" * 1200
+    sent = {}
+
+    def fake_post(url, json, headers, timeout):
+        sent["json"] = json
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
+        return response
+
+    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
+
+    body = json.dumps({
+        "model": "auto",
+        "messages": [{"role": "user", "content": medium_content}],
+    }).encode("utf-8")
+
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+        body,
+        MagicMock(id=123),
+        MagicMock(),
+        [target_model],
+        [target_model.model_name],
+    )
+
+    assert model == target_model
+    assert router_result == "complexity:5"
+    assert sent["json"]["messages"][-1] == {
+        "role": "user",
+        "content": f"Here is the user's 1st message:\n```\n{medium_content}\n```\n",
+    }
+
+
+def test_auto_route_payload_collapses_very_long_user_messages(monkeypatch):
+    target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+    head = "h" * 500
+    tail = "t" * 500
+    middle = "m" * 600
+    long_content = head + middle + tail
     sent = {}
 
     def fake_post(url, json, headers, timeout):
@@ -477,11 +517,12 @@ def test_auto_route_payload_truncates_long_user_messages(monkeypatch):
         [target_model.model_name],
     )
 
+    omitted = len(middle)
     assert model == target_model
     assert router_result == "complexity:5"
     assert sent["json"]["messages"][-1] == {
         "role": "user",
-        "content": f"Here is the user's 1st message:\n```\n{'x' * 500}...\n```\n",
+        "content": f"Here is the user's 1st message:\n```\n{head} ... collapsed {omitted} chars ... {tail}\n```\n",
     }
 
 

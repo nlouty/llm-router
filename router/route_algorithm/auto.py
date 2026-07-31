@@ -32,6 +32,7 @@ class AutoRouteAlgorithm:
     SMALL_REQUEST_ROUTING_TOKEN_LIMIT = 3000
     PREFIX_CACHE_AUTO_HIT_THRESHOLD = 0.7
     ROUTING_USER_PROMPT_CHAR_LIMIT = 500
+    ROUTING_USER_PROMPT_COLLAPSE_MULTIPLIER = 3
     ROUTING_USER_PROMPT_MESSAGE_LIMIT = 20
 
     def __init__(self, chooser=None):
@@ -672,9 +673,19 @@ class AutoRouteAlgorithm:
 
     @classmethod
     def _truncate_routing_user_prompt(cls, content: str) -> str:
-        if len(content) <= cls.ROUTING_USER_PROMPT_CHAR_LIMIT:
+        collapse_threshold = (
+            cls.ROUTING_USER_PROMPT_CHAR_LIMIT
+            * cls.ROUTING_USER_PROMPT_COLLAPSE_MULTIPLIER
+        )
+        if len(content) <= collapse_threshold:
             return content
-        return content[: cls.ROUTING_USER_PROMPT_CHAR_LIMIT] + "..."
+        limit = cls.ROUTING_USER_PROMPT_CHAR_LIMIT
+        omitted = len(content) - 2 * limit
+        return (
+            content[:limit]
+            + f" ... collapsed {omitted} chars ... "
+            + content[-limit:]
+        )
 
     def _get_default_model(self) -> Any:
         return ModelRepository.get_by_name(self.fallback_model_name())
