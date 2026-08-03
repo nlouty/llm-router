@@ -25,7 +25,7 @@ exec gunicorn router_project.wsgi:application \
   --worker-class gthread \
   --timeout "${GUNICORN_TIMEOUT:-960}" \
   --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT:-1200}" \
-  --max-requests "${GUNICORN_MAX_REQUESTS:-1000}" \
-  --max-requests-jitter "${GUNICORN_MAX_REQUESTS_JITTER:-200}" \
+  --max-requests "${GUNICORN_MAX_REQUESTS:-3000}" \
+  --max-requests-jitter "${GUNICORN_MAX_REQUESTS_JITTER:-3000}" \
   --access-logfile - \
   --error-logfile -
