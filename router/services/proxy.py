@@ -469,6 +469,15 @@ class ProxyService:
             return self._handle_read_timeout(record, server, disconnect_scope, state, served_as_vip, model)
         except requests.RequestException as exc:
             return self._handle_request_exception(record, server, exc, disconnect_scope, state, served_as_vip, model)
+        except Exception:
+            if disconnect_scope.disconnect_event.is_set():
+                # The client disconnected while this attempt was in flight, so
+                # whatever blew up (e.g. the cancel path racing the upstream
+                # socket write and surfacing as a raw AttributeError) is a
+                # symptom of that, not an upstream failure. Finish as 499
+                # instead of leaking a 502.
+                return _RouteAttemptResult(response=self._client_closed_response(record, served_as_vip, model))
+            raise
         finally:
             if not workload_handed_off:
                 self._decrement_workload(server)
