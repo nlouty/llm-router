@@ -12,6 +12,24 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.poolmanager import SSL_KEYWORDS
 
 
+def _shutdown_socket(connection) -> None:
+    """Abort in-flight I/O on a connection without calling close().
+
+    HTTPConnection.close() nulls ``sock``, which races with http.client's
+    ``send()`` (``self.sock.sendall(...)``) and surfaces as a spurious
+    ``AttributeError: 'NoneType' object has no attribute 'sendall'``. A bare
+    shutdown() is enough to fail the in-flight request with an OSError that
+    urllib3/requests convert into ConnectionError; the broken connection is
+    then closed by urllib3's error path (or session.close()).
+    """
+    sock = connection.sock
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
 class UpstreamCancellationController:
     def __init__(self):
         self._lock = threading.Lock()
@@ -21,12 +39,12 @@ class UpstreamCancellationController:
     def register(self, connection) -> None:
         with self._lock:
             if self._cancelled:
-                should_close = True
+                should_abort = True
             else:
                 self._connections.add(connection)
-                should_close = False
-        if should_close:
-            connection.close()
+                should_abort = False
+        if should_abort:
+            _shutdown_socket(connection)
 
     def unregister(self, connection) -> None:
         with self._lock:
@@ -37,13 +55,7 @@ class UpstreamCancellationController:
             self._cancelled = True
             connections = list(self._connections)
         for connection in connections:
-            sock = connection.sock
-            if sock is not None:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-            connection.close()
+            _shutdown_socket(connection)
 
     @property
     def cancelled(self) -> bool:
