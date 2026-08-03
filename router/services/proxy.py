@@ -92,17 +92,34 @@ class ProxyService:
         record = self._create_processing_record(ip_id, model, parsed, user_agent, user_ip_id=user_ip_id)
         append_verbose_request_log(record.id, django_request.body)
         normalized = path.rstrip("/")
-        if normalized == "chat/completions":
-            return self._forward_chat(
+        # Open the per-request log for every proxied request, not only when a
+        # server is chosen in _route_with_retry: failures before that point
+        # (e.g. no candidates -> synthetic 502) would otherwise leave the DB
+        # row without any <request_id>.log to diagnose.
+        set_request_id(record.id)
+        try:
+            append_request_log(record.id, json.dumps({
+                "event": "request_received",
+                "request_id": record.id,
+                "path": f"/v1/{normalized}",
+                "model": (model.model_name if model else None) or parsed.model_name,
+                "stream": bool(parsed.stream),
+                "is_vip_channel": is_vip_channel,
+                "user_ip_id": user_ip_id,
+            }, ensure_ascii=False))
+            if normalized == "chat/completions":
+                return self._forward_chat(
+                    django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
+                )
+            if normalized == "embeddings":
+                return self._forward_embeddings(
+                    django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
+                )
+            return self._forward_default(
                 django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
             )
-        if normalized == "embeddings":
-            return self._forward_embeddings(
-                django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
-            )
-        return self._forward_default(
-            django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
-        )
+        finally:
+            clear_request_id()
 
     def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False):
         auto_model_selection = self.auto_router.should_auto_select(
@@ -262,6 +279,12 @@ class ProxyService:
         reason = "no available server"
         if model is not None:
             reason = f"no available server for model {model.model_name}"
+        append_request_log(record.id, json.dumps({
+            "event": "no_candidates",
+            "request_id": record.id,
+            "reason": reason,
+            "model": model.model_name if model else None,
+        }, ensure_ascii=False))
         proxy_response.finish_no_candidates(record, reason, context, model)
         self._maybe_delay_opencode_failure(user_agent, 502)
         return HttpResponse(
@@ -284,6 +307,15 @@ class ProxyService:
                 "max_attempts": self.max_attempts_per_request,
                 "stream": is_stream,
             }, ensure_ascii=False))
+            # Absolute timeout budget: once the applicable timeout has elapsed,
+            # the request must end as a 504 regardless of the last failure.
+            # Without this, an upstream that drops the connection after ~900s
+            # looks like a ConnectionError (which #198 retries) and a retry
+            # storm of 3 x ~900s ends in a synthetic "502 Bad Gateway" instead
+            # of the 504 the client should see.
+            budget = self.stream_total_timeout if is_stream else self.normal_timeout[1]
+            request_started = time.monotonic()
+            deadline = request_started + budget
             while state.attempts < self.max_attempts_per_request:
                 server = self._effective_chooser().choose(candidates, context, state.attempted_server_ids)
                 if server is None:
@@ -341,6 +373,17 @@ class ProxyService:
                 model = result.model if result.model is not None else model
                 body = result.body if result.body is not None else body
                 if result.should_retry:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        elapsed_ms = int((now - request_started) * 1000)
+                        state.last_status = 504
+                        state.last_reason = "Gateway Timeout"
+                        append_request_log(record.id, json.dumps({
+                            "event": "timeout_budget_exceeded",
+                            "elapsed_ms": elapsed_ms,
+                            "attempts": state.attempts,
+                        }, ensure_ascii=False))
+                        break
                     continue
                 break
 
@@ -745,7 +788,13 @@ class ProxyService:
         )
         self._after_finish(served_as_vip, model)
         error_type = "gateway_timeout_error" if status == 504 else "server_error"
-        self._maybe_delay_opencode_failure(user_agent, status)
+        # The opencode failure delay exists to backpressure retry storms on
+        # fast failures. After a 504 the client has already waited the full
+        # timeout budget; sleeping another 180s here only postpones the timeout
+        # response (and lets an upstream proxy cut it off, surfacing as a
+        # spurious 502 instead of the 504 we decided).
+        if status != 504:
+            self._maybe_delay_opencode_failure(user_agent, status)
         return HttpResponse(json.dumps(error_payload(message, error_type)), status=status, content_type="application/json")
 
     def _handle_normal(self, django_request, server, upstream_url, headers, body, upstream_client):
