@@ -1636,7 +1636,7 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
-    monotonic_values = iter([10.0, 10.125])
+    monotonic_values = iter([10.0, 10.125, 10.125])
     monkeypatch.setattr("router.services.proxy.time.monotonic", lambda: next(monotonic_values))
 
     django_request = MagicMock()

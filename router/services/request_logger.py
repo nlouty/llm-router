@@ -5,6 +5,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from django.utils import timezone
+
 from router.config import APP_CONFIG, BASE_DIR
 
 
@@ -24,7 +26,13 @@ def _resolve_log_path() -> Path:
 
 
 def _current_log_time() -> datetime:
-    return datetime.now()
+    # Bucket per-request files by Django's configured TIME_ZONE (Asia/Shanghai),
+    # the same timezone the DB timestamps are shown in, so a request is findable
+    # under the yyyy/mm/dd/hh/mm the user sees in the UI. datetime.now() would
+    # use the server's OS timezone, which can drift from the DB by hours. Avoid
+    # timezone.localtime() here: it calls timezone.now(), which code that mocks
+    # the clock (tests) must not be surprised by.
+    return datetime.now(timezone.get_current_timezone())
 
 
 def _request_log_file(request_id: int) -> Path:
