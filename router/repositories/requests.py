@@ -558,9 +558,9 @@ class RequestRepository:
         dept2: str | None = None,
         dept3: str | None = None,
         dept4: str | None = None,
-        employee_no: str | None = None,
-        user_name: str | None = None,
-        ip: str | None = None,
+        employee_no: list[str] | None = None,
+        user_name: list[str] | None = None,
+        ip: list[str] | None = None,
     ) -> list[dict]:
         """
         聚合查询每个IP的成功请求数，关联用户和部门信息。
@@ -572,9 +572,9 @@ class RequestRepository:
             dept2: 二级部门，"all"表示所有
             dept3: 三级部门，"all"表示所有
             dept4: 四级部门，"all"表示所有
-            employee_no: 工号过滤（可选）
-            user_name: 用户名过滤（可选）
-            ip: IP地址过滤（可选）
+            employee_no: 工号过滤列表（可选）
+            user_name: 用户名过滤列表（可选）
+            ip: IP地址过滤列表（可选）
 
         Returns:
             包含ip、access_count、input_token、output_token、user_name、user_charge、employee_no、dept1-4的字典列表
@@ -670,12 +670,12 @@ class RequestRepository:
                 continue
 
             # 应用新增的过滤条件
-            if employee_no and user_info.get("employee_no") != employee_no:
+            if employee_no and user_info.get("employee_no") not in employee_no:
                 continue
-            if user_name and user_info.get("user_name") != user_name:
+            if user_name and user_info.get("user_name") not in user_name:
                 continue
             ip_addr = ips_map.get(ip_id, "")
-            if ip and ip_addr != ip:
+            if ip and ip_addr not in ip:
                 continue
 
             results.append({

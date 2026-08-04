@@ -1553,9 +1553,9 @@ def access_stats_by_department(request):
     - dept2: 二级部门（可选，"all"表示所有部门）
     - dept3: 三级部门（可选，"all"表示所有部门）
     - dept4: 四级部门（可选，"all"表示所有部门）
-    - employee_no: 工号（可选）
-    - user_name: 用户名（可选）
-    - ip: IP地址（可选）
+    - employee_no: 工号（可选，支持多个值，逗号分隔或多次传参）
+    - user_name: 用户名（可选，支持多个值，逗号分隔或多次传参）
+    - ip: IP地址（可选，支持多个值，逗号分隔或多次传参）
 
     返回：
     - 按IP聚合的访问统计，包含用户信息、部门信息和token统计
@@ -1579,15 +1579,28 @@ def access_stats_by_department(request):
     dept3 = None if not dept3 or dept3.strip().lower() == "all" else dept3.strip()
     dept4 = None if not dept4 or dept4.strip().lower() == "all" else dept4.strip()
 
-    # 获取新增的可选过滤参数
-    employee_no = request.GET.get("employee_no")
-    user_name = request.GET.get("user_name")
-    ip = request.GET.get("ip")
+    # 获取新增的可选过滤参数（支持多值）
+    employee_no_raw = request.GET.getlist("employee_no")
+    user_name_raw = request.GET.getlist("user_name")
+    ip_raw = request.GET.getlist("ip")
 
-    # 处理新增参数：空字符串视为不限制
-    employee_no = employee_no.strip() if employee_no and employee_no.strip() else None
-    user_name = user_name.strip() if user_name and user_name.strip() else None
-    ip = ip.strip() if ip and ip.strip() else None
+    # 处理多值参数：支持逗号分隔和多次传参两种方式
+    def parse_multi_value(values: list) -> list | None:
+        """解析多值参数，支持逗号分隔和多次传参"""
+        if not values:
+            return None
+        # 展开逗号分隔的值
+        expanded = []
+        for v in values:
+            if v:
+                # 拆分逗号分隔的值
+                parts = [p.strip() for p in v.split(",") if p.strip()]
+                expanded.extend(parts)
+        return expanded if expanded else None
+
+    employee_no = parse_multi_value(employee_no_raw)
+    user_name = parse_multi_value(user_name_raw)
+    ip = parse_multi_value(ip_raw)
 
     # 查询数据
     results = RequestRepository.count_success_by_ip_with_user_info(
@@ -1615,9 +1628,9 @@ def export_access_stats_csv(request):
     - dept2: 二级部门（可选，"all"表示所有部门）
     - dept3: 三级部门（可选，"all"表示所有部门）
     - dept4: 四级部门（可选，"all"表示所有部门）
-    - employee_no: 工号（可选）
-    - user_name: 用户名（可选）
-    - ip: IP地址（可选）
+    - employee_no: 工号（可选，支持多个值，逗号分隔或多次传参）
+    - user_name: 用户名（可选，支持多个值，逗号分隔或多次传参）
+    - ip: IP地址（可选，支持多个值，逗号分隔或多次传参）
 
     返回：
     - CSV文件下载，包含IP访问统计、用户信息、部门信息和token统计
@@ -1640,15 +1653,28 @@ def export_access_stats_csv(request):
     dept3 = None if not dept3 or dept3.strip().lower() == "all" else dept3.strip()
     dept4 = None if not dept4 or dept4.strip().lower() == "all" else dept4.strip()
 
-    # 获取新增的可选过滤参数
-    employee_no = request.GET.get("employee_no")
-    user_name = request.GET.get("user_name")
-    ip = request.GET.get("ip")
+    # 获取新增的可选过滤参数（支持多值）
+    employee_no_raw = request.GET.getlist("employee_no")
+    user_name_raw = request.GET.getlist("user_name")
+    ip_raw = request.GET.getlist("ip")
 
-    # 处理新增参数：空字符串视为不限制
-    employee_no = employee_no.strip() if employee_no and employee_no.strip() else None
-    user_name = user_name.strip() if user_name and user_name.strip() else None
-    ip = ip.strip() if ip and ip.strip() else None
+    # 处理多值参数：支持逗号分隔和多次传参两种方式
+    def parse_multi_value(values: list) -> list | None:
+        """解析多值参数，支持逗号分隔和多次传参"""
+        if not values:
+            return None
+        # 展开逗号分隔的值
+        expanded = []
+        for v in values:
+            if v:
+                # 拆分逗号分隔的值
+                parts = [p.strip() for p in v.split(",") if p.strip()]
+                expanded.extend(parts)
+        return expanded if expanded else None
+
+    employee_no = parse_multi_value(employee_no_raw)
+    user_name = parse_multi_value(user_name_raw)
+    ip = parse_multi_value(ip_raw)
 
     # 查询数据
     results = RequestRepository.count_success_by_ip_with_user_info(

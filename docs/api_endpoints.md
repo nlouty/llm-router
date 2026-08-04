@@ -84,7 +84,7 @@ The range is inclusive. Bucketed endpoints choose granularity automatically: hou
 | `/api/model_request_count_by_period` | GET | `start_time`, `end_time` | `model_name`; omit for all models | Bucketed successful request count, optionally filtered by model. |
 | `/api/model_ip_count_by_period` | GET | `start_time`, `end_time` | `model_name`; omit for all models | Bucketed distinct IP count, optionally filtered by model. |
 | `/api/model_latency_boxplot` | GET | `start_time`, `end_time` | `model_names` comma list | Per-model latency boxplot data. Drops latencies above 890 seconds from quartiles and reports their ratio. |
-| `/api/access_stats_by_department` | GET | `start_time`, `end_time` | `dept1`, `dept2`, `dept3`, `dept4`, `employee_no`, `user_name`, `ip`; use `all` or omit department params for any department | Aggregates successful requests by IP with user and department info. Filters by department levels and optional user/IP filters when provided. |
+| `/api/access_stats_by_department` | GET | `start_time`, `end_time` | `dept1`, `dept2`, `dept3`, `dept4`, `employee_no`, `user_name`, `ip`; use `all` or omit department params for any department. `employee_no`, `user_name`, `ip` support multiple values via comma-separated (`employee_no=EMP001,EMP002`) or repeated params (`employee_no=EMP001&employee_no=EMP002`) | Aggregates successful requests by IP with user and department info. Filters by department levels and optional user/IP filters when provided. |
 
 ### Input Token Cache Statistics
 
@@ -1674,6 +1674,24 @@ Example - filter by IP address:
 curl 'http://localhost:8001/api/access_stats_by_department?start_time=2026-06-24%2000:00:00&end_time=2026-06-25%2023:59:59&ip=192.168.1.100'
 ```
 
+Example - multiple employee numbers (comma-separated):
+
+```bash
+curl 'http://localhost:8001/api/access_stats_by_department?start_time=2026-06-24%2000:00:00&end_time=2026-06-25%2023:59:59&employee_no=EMP001,EMP002,EMP003'
+```
+
+Example - multiple user names (repeated parameter):
+
+```bash
+curl 'http://localhost:8001/api/access_stats_by_department?start_time=2026-06-24%2000:00:00&end_time=2026-06-25%2023:59:59&user_name=张三&user_name=李四'
+```
+
+Example - multiple IPs (mixed format):
+
+```bash
+curl 'http://localhost:8001/api/access_stats_by_department?start_time=2026-06-24%2000:00:00&end_time=2026-06-25%2023:59:59&ip=192.168.1.100,192.168.1.101'
+```
+
 Example - combine multiple filters:
 
 ```bash
@@ -1684,7 +1702,11 @@ Notes:
 
 - Department filters use exact matching, not pattern matching
 - Multiple department filters are combined with AND logic
-- `employee_no`, `user_name`, and `ip` filters use exact matching
+- `employee_no`, `user_name`, and `ip` filters support multiple values:
+  - Comma-separated: `employee_no=EMP001,EMP002,EMP003`
+  - Repeated parameter: `user_name=张三&user_name=李四`
+  - Both formats can be mixed
+- Multiple values are combined with OR logic (any match includes the result)
 - All filters can be combined together with AND logic
 - Only valid, non-deleted user and department records are included
 - Internal routing requests (`ip_id=0`) are excluded from results
@@ -1705,9 +1727,9 @@ Query parameters:
 - `dept2`: Level 2 department filter (optional; use `all` or omit to include all)
 - `dept3`: Level 3 department filter (optional; use `all` or omit to include all)
 - `dept4`: Level 4 department filter (optional; use `all` or omit to include all)
-- `employee_no`: Employee number filter (optional; exact match)
-- `user_name`: User name filter (optional; exact match)
-- `ip`: IP address filter (optional; exact match)
+- `employee_no`: Employee number filter (optional; supports multiple values via comma-separated or repeated params)
+- `user_name`: User name filter (optional; supports multiple values via comma-separated or repeated params)
+- `ip`: IP address filter (optional; supports multiple values via comma-separated or repeated params)
 
 Note: Pagination parameters (`page`, `page_size`) are NOT supported for this endpoint. All matching records are exported.
 
