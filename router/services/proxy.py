@@ -524,7 +524,7 @@ class ProxyService:
         reason = upstream.reason or ""
         state.last_status = status_code
         state.last_reason = reason
-        self._record_upstream_status(record, state, server, user_agent, context, status_code)
+        self._record_upstream_status(record, state, server, user_agent, context, status_code, is_stream)
 
         if status_code >= 400:
             return self._handle_upstream_error(
@@ -577,7 +577,7 @@ class ProxyService:
         )
         return _RouteAttemptResult(response=response)
 
-    def _record_upstream_status(self, record, state: _RetryState, server, user_agent, context, status_code: int) -> None:
+    def _record_upstream_status(self, record, state: _RetryState, server, user_agent, context, status_code: int, is_stream: bool) -> None:
         proxy_logging.log_attempt(
             record.id,
             state.attempts,
@@ -594,7 +594,13 @@ class ProxyService:
             server.id,
         )
         self._maybe_delay_opencode_failure(user_agent, status_code)
-        self._notify_chooser_response(server, context, status_code)
+        # For streams, the status code is known only at header time and the body
+        # still has to stream. Recording a circuit-breaker success now would reset
+        # consecutive_failures before a mid-stream timeout/disconnect (a real
+        # failure) can be counted, so a chronically slow server never trips the
+        # circuit. The chooser on_response hook still runs (prefix cache etc.);
+        # the success record is deferred to _stream_success on full completion.
+        self._notify_chooser_response(server, context, status_code, record_circuit=not is_stream)
 
     def _handle_upstream_error(
         self,
@@ -731,6 +737,11 @@ class ProxyService:
             return _RouteAttemptResult(response=self._client_closed_response(record, served_as_vip, model))
         state.last_status = 504
         state.last_reason = "Gateway Timeout"
+        # A read timeout is a real upstream failure (the request was accepted but
+        # the server never answered). It must count toward the circuit breaker,
+        # otherwise a chronically slow server returns 504 forever without its
+        # consecutive_failures ever accumulating and the circuit never opens.
+        self._mark_unhealthy(server)
         proxy_logging.log_attempt(
             record.id,
             state.attempts,
@@ -841,6 +852,7 @@ class ProxyService:
                 deadline = request_start + self.stream_total_timeout
                 for chunk in upstream.iter_content(chunk_size=8192):
                     if time.monotonic() > deadline:
+                        self._mark_unhealthy(server)
                         yield timeout_sse_event()
                         proxy_response.finish_stream_total_timeout(
                             record,
@@ -875,6 +887,7 @@ class ProxyService:
                     ttft,
                 )
             except requests.exceptions.ReadTimeout:
+                self._mark_unhealthy(server)
                 yield timeout_sse_event()
                 proxy_response.finish_stream_read_timeout(
                     record,
@@ -943,8 +956,8 @@ class ProxyService:
     def _effective_chooser(self):
         return self._active_chooser or self.chooser
 
-    def _notify_chooser_response(self, server, context, status_code: int) -> None:
-        if 200 <= status_code < 300:
+    def _notify_chooser_response(self, server, context, status_code: int, *, record_circuit: bool = True) -> None:
+        if record_circuit and 200 <= status_code < 300:
             self.circuit_breaker.record_success(server)
         hook = getattr(self._effective_chooser(), "on_response", None)
         if not hook:
