@@ -547,6 +547,7 @@ class PDForwardService:
                 current_target, model.id if model else None,
                 attempt_count=state.attempts, final_prefix_cache=cached_tokens,
                 router_result=proxy_response.router_result(context),
+                success_note=proxy_response.request_non_utf8_fail_reason(getattr(context, "body", b"")),
             )
             self._release_decoder(decoder, prompt_tokens)
             self.proxy._after_finish(served_as_vip, model)

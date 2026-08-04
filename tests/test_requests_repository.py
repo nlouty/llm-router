@@ -131,6 +131,16 @@ def test_finish_status_success_clears_fail_reason():
     assert record.fail_reason is None
 
 
+def test_finish_success_note_marks_fail_reason_on_success():
+    record = RequestRepository.create_processing(ip_id=1, model_id=7, is_stream=False, user_agent="pytest")
+
+    RequestRepository.finish(record, 200, "OK", success_note="request body contains non-utf-8 bytes")
+
+    record.refresh_from_db()
+    assert record.task_status == "success"
+    assert record.fail_reason == "request body contains non-utf-8 bytes"
+
+
 def test_finish_persists_final_prefix_cache():
     record = RequestRepository.create_processing(ip_id=1, model_id=7, is_stream=False, user_agent="pytest")
 

@@ -138,13 +138,17 @@ class RequestRepository:
         final_prefix_cache: int = 0,
         router_result: str | None = None,
         ttft: int | None = None,
+        success_note: str | None = None,
     ) -> None:
         end_time = timezone.now()
         record.end_time = end_time
         record.latency = int((end_time - record.send_time).total_seconds() * 1000)
         record.status = _status_text(http_status)
         record.task_status = task_status or ("success" if 200 <= http_status < 300 else "failed")
-        record.fail_reason = None if record.task_status == "success" else reason[:200]
+        if record.task_status == "success":
+            record.fail_reason = success_note[:200] if success_note else None
+        else:
+            record.fail_reason = reason[:200]
         record.input_token_cnt = input_tokens or 0
         record.output_token_cnt = output_tokens or 0
         record.final_prefix_cache = final_prefix_cache or 0
