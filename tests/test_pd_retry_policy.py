@@ -231,3 +231,89 @@ class TestDecodeRetryPolicy:
         assert result.should_retry is False
         assert result.response is None
         assert state.last_status == 502
+
+
+@pytest.mark.django_db
+class TestDecodeRecordsPrefixContext:
+    """Issue #208: the decode phase must forward prefix_cache/last_match to
+    record_attempt. Previously it omitted them, so last_match (set during
+    prefill) was clobbered back to NULL after decoding in PD clusters."""
+
+    def _capture_record_attempt(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(
+            "router.services.proxy_pd_forward.RequestRepository.record_attempt",
+            lambda *args, **kwargs: captured.append(args),
+        )
+        return captured
+
+    def _wire_single_decoder(self, monkeypatch):
+        decoder = Server.objects.create(
+            base_url="http://d0.example", role="decoder", group_id="g1"
+        )
+        monkeypatch.setattr(
+            ServerRepository, "pick_least_tokens_decoder",
+            lambda group_id, attempted: decoder,
+        )
+        return decoder
+
+    def _context_with_last_match(self, record, last_match):
+        context = _context(record)
+        context.last_match = last_match
+        return context
+
+    def test_normal_decode_forwards_last_match_to_record_attempt(self, monkeypatch):
+        svc = _make_svc(monkeypatch)
+        captured = self._capture_record_attempt(monkeypatch)
+        self._wire_single_decoder(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise requests.ConnectionError("refused")
+        monkeypatch.setattr(PDForwardService, "_post_decode", staticmethod(boom))
+
+        prefiller = Server.objects.create(
+            base_url="http://p.example", role="prefiller", group_id="g1"
+        )
+        record = _record()
+        state = _RetryState()
+        svc._normal_decode(
+            "chat/completions", {}, b'{"messages":[]}', record,
+            self._context_with_last_match(record, 76543),
+            False, None, state, prefiller, {}, 1, 0, "P: x",
+        )
+
+        assert len(captured) == 1
+        # Positional args: record, target_pod_ip, attempts, prefix_cache, last_match
+        assert captured[0][4] == 76543
+
+    def test_stream_decode_forwards_last_match_to_record_attempt(self, monkeypatch):
+        svc = _make_svc(monkeypatch)
+        captured = self._capture_record_attempt(monkeypatch)
+        self._wire_single_decoder(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise requests.ConnectionError("refused")
+        monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", boom)
+
+        prefiller = Server.objects.create(
+            base_url="http://p.example", role="prefiller", group_id="g1"
+        )
+        record = _record()
+        state = _RetryState()
+        response = svc._stream_decode(
+            _django_request(), "chat/completions", {}, b'{"messages":[]}', record,
+            self._context_with_last_match(record, 76543),
+            False, None, state, prefiller, {}, 1, 0, "P: x",
+        )
+        gen = response.streaming_content
+        try:
+            # Runs up to the connection-error yield, past the record_attempt call.
+            next(gen)
+        except StopIteration:
+            pass
+        finally:
+            if hasattr(gen, "close"):
+                gen.close()
+
+        assert len(captured) == 1
+        assert captured[0][4] == 76543

@@ -434,7 +434,10 @@ class PDForwardService:
             current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
             if recompute_count > 0:
                 current_target += _KV_TRANSFER_FAIL_TAG
-            RequestRepository.record_attempt(record, current_target, state.attempts)
+            RequestRepository.record_attempt(
+                record, current_target, state.attempts,
+                getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
+            )
             decoder_url = self.proxy._build_url(decoder.base_url, path, "")
 
             try:
@@ -628,7 +631,10 @@ class PDForwardService:
                 current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
                 if recompute_count > 0:
                     current_target += _KV_TRANSFER_FAIL_TAG
-                RequestRepository.record_attempt(record, current_target, state.attempts)
+                RequestRepository.record_attempt(
+                    record, current_target, state.attempts,
+                    getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
+                )
                 decoder_url = self.proxy._build_url(decoder.base_url, path, "")
 
                 req_headers = {**headers}
