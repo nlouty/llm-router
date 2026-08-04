@@ -60,6 +60,17 @@ def parse_stream_usage(chunks: list[bytes]) -> tuple[int, int, int]:
     return parse_sse_usage(chunks)
 
 
+NON_UTF8_FAIL_REASON = "request body contains non-utf-8 bytes"
+
+
+def request_non_utf8_fail_reason(body: bytes) -> str | None:
+    try:
+        body.decode("utf-8")
+    except UnicodeDecodeError:
+        return NON_UTF8_FAIL_REASON
+    return None
+
+
 def extract_fail_reason(content: bytes, http_reason: str) -> str:
     try:
         data = json.loads(content.decode("utf-8"))
@@ -139,6 +150,7 @@ def finish_normal_success(
         final_prefix_cache=cached_tokens,
         router_result=router_result(context),
         ttft=ttft,
+        success_note=request_non_utf8_fail_reason(getattr(context, "body", b"")),
     )
 
 
@@ -185,6 +197,7 @@ def finish_stream_success(
         final_prefix_cache=cached_tokens,
         router_result=router_result(context),
         ttft=ttft,
+        success_note=request_non_utf8_fail_reason(getattr(context, "body", b"")),
     )
 
 
