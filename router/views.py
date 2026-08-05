@@ -92,11 +92,12 @@ def proxy(request, path: str):
             RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
             return error_response(403, message, "version_too_old")
 
-        parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 18528)))
+        parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 28528)))
         parsed = parser.parse(body, path, is_vip=is_vip_channel)
         input_model_name = parsed.model_name
         input_is_auto = ModelRepository.is_auto_model_name(input_model_name)
         model = None if input_is_auto else ModelRepository.get_by_name(input_model_name)
+        is_auto = input_is_auto or ModelRepository.should_auto_select(model)
 
         if input_model_name and not input_is_auto and model is None:
             message = f"Model {input_model_name} is not supported."
@@ -108,7 +109,7 @@ def proxy(request, path: str):
             RequestRepository.create_blocked(ip.id, model.id, parsed.stream, user_agent, 400, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
             return error_response(400, message, "invalid_request_error")
 
-        max_token_check = admission.check_max_tokens(parsed.max_tokens, model)
+        max_token_check = admission.check_max_tokens(parsed.max_tokens, model, is_auto=is_auto)
         if not max_token_check.allowed:
             message = max_token_check.message or "invalid request"
             RequestRepository.create_blocked(ip.id, model.id if model else 0, parsed.stream, user_agent, 400, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
@@ -118,7 +119,7 @@ def proxy(request, path: str):
             concurrency = admission.check_concurrency(
                 ip,
                 model,
-                is_auto=input_is_auto or ModelRepository.should_auto_select(model),
+                is_auto=is_auto,
             )
             if not concurrency.allowed:
                 message = concurrency.message or "concurrent limit exceeded"

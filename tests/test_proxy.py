@@ -1060,7 +1060,7 @@ def test_auto_entrance_multimodal_request_selects_auto_false_multimodal_model(mo
 
 
 def test_auto_false_concrete_model_request_keeps_requested_model_for_multimodal(monkeypatch):
-    vision_model = Model.objects.create(model_name="vision-model", auto=False, multimodal=True)
+    vision_model = Model.objects.create(model_name="vision-model", auto=False, multimodal=True, max_tokens=65536)
     Server.objects.create(model_id=vision_model.id, base_url="http://vision.example", is_online=True)
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
@@ -1793,6 +1793,7 @@ def test_deprecated_model_blocks_normal_user_but_serves_vip(monkeypatch):
     deprecated_model = Model.objects.create(
         model_name="glm-5",
         deprecation="glm-5 is deprecated, please use glm-6.",
+        max_tokens=65536,
     )
     Server.objects.create(model_id=deprecated_model.id, base_url="http://glm5.example", is_online=True)
     monkeypatch.setitem(APP_CONFIG.setdefault("server", {}), "vip_port", 8008)

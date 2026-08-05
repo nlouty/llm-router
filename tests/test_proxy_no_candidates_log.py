@@ -15,7 +15,7 @@ def reset_request_logger_cache(monkeypatch):
 
 def _post_chat(tmp_path, monkeypatch, model_name="any-model"):
     monkeypatch.setitem(request_logger.APP_CONFIG, "log_path", str(tmp_path))
-    Model.objects.create(model_name=model_name)
+    Model.objects.create(model_name=model_name, max_tokens=65536)
     return Client().post(
         "/v1/chat/completions",
         data=json.dumps({"model": model_name, "messages": [{"role": "user", "content": "hi"}]}),

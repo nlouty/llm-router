@@ -125,7 +125,7 @@ def _upstream_ok(monkeypatch):
 
 @pytest.mark.django_db
 def test_apikey_request_records_real_user_ip_id(monkeypatch):
-    model = Model.objects.create(model_name="m")
+    model = Model.objects.create(model_name="m", max_tokens=65536)
     Server.objects.create(model_id=model.id, base_url="http://s.example", is_online=True)
     UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001")
     _upstream_ok(monkeypatch)
@@ -148,7 +148,7 @@ def test_apikey_request_records_real_user_ip_id(monkeypatch):
 
 @pytest.mark.django_db
 def test_ip_request_without_user_ips_row_records_zero(monkeypatch):
-    model = Model.objects.create(model_name="m")
+    model = Model.objects.create(model_name="m", max_tokens=65536)
     Server.objects.create(model_id=model.id, base_url="http://s.example", is_online=True)
     _upstream_ok(monkeypatch)
 

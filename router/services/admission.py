@@ -33,6 +33,7 @@ class AdmissionService:
         self.allow_missing_user_info = bool(APP_CONFIG.get("admission", {}).get("allow_when_user_info_missing", True))
         self.stale_minutes = int(APP_CONFIG.get("proxy", {}).get("stale_processing_minutes", 20))
         self.unknown_model_max_tokens = int(APP_CONFIG.get("proxy", {}).get("unknown_model_max_tokens", 20480))
+        self.auto_max_tokens = int(APP_CONFIG.get("proxy", {}).get("auto_max_tokens", 40000))
 
     def check_permission(self, identity) -> AdmissionResult:
         if not identity.has_employee:
@@ -48,10 +49,15 @@ class AdmissionService:
             return AdmissionResult(True)
         return self._permission_denied()
 
-    def check_max_tokens(self, requested: int | None, model: Model | None) -> AdmissionResult:
+    def check_max_tokens(self, requested: int | None, model: Model | None, is_auto: bool = False) -> AdmissionResult:
         if requested is None:
             return AdmissionResult(True)
-        maximum = model.max_tokens if model else self.unknown_model_max_tokens
+        if is_auto:
+            # The target model is not known until auto routing resolves it, so
+            # cap auto requests with a global limit instead of the entrance.
+            maximum = self.auto_max_tokens
+        else:
+            maximum = model.max_tokens if model else self.unknown_model_max_tokens
         if requested > maximum:
             return AdmissionResult(
                 False,

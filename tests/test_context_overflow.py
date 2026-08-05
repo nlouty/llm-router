@@ -68,7 +68,7 @@ def test_context_overflow_switches_to_flash_when_auto(monkeypatch):
 def test_context_overflow_does_not_switch_when_explicit_model(monkeypatch):
     # Setup models
     flash_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
-    other_model = Model.objects.create(model_name="Other-Model")
+    other_model = Model.objects.create(model_name="Other-Model", max_tokens=65536)
 
     # The explicit model server advertises a small window.
     Server.objects.create(
@@ -243,7 +243,7 @@ def test_sync_500_error_returns_real_body_when_retries_exhausted(monkeypatch):
     # real upstream body. Uses an explicit model with several same-window
     # servers so the retry loop runs through multiple attempts before the
     # chooser returns None.
-    model = Model.objects.create(model_name="Other-Model")
+    model = Model.objects.create(model_name="Other-Model", max_tokens=65536)
     for i in range(3):
         Server.objects.create(
             model_id=model.id,
