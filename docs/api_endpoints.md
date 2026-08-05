@@ -174,7 +174,7 @@ curl -i -X POST http://localhost:8001/api/apikey \
   -d '{"apikey":"employee-key","employee_no":"E001"}'
 ```
 
-After validating the JSON fields, the endpoint delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 until an internal adapter provides this method.
+After validating the JSON fields, the endpoint rejects an `employee_no` that already has an active apikey with HTTP 409 before performing any write. Otherwise it delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 until an internal adapter provides this method.
 
 ```json
 {
@@ -186,7 +186,70 @@ After validating the JSON fields, the endpoint delegates lookup and all database
 }
 ```
 
+When the employee already has an active apikey:
+
+```json
+{
+  "code": 409,
+  "error": "employee already has an active apikey"
+}
+```
+
 This first-stage endpoint only stores credentials. Proxy requests do not resolve or apply registered API keys yet.
+
+## API-Key Lookup
+
+```http
+GET /api/apikey?employee_no=E001
+```
+
+Looks up a single employee's active apikey. `employee_no` is required; omitting it returns HTTP 400. The full key value is never returned — only a masked preview of its first and last four characters.
+
+```bash
+curl -i 'http://localhost:8001/api/apikey?employee_no=E001'
+```
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "employee_no": "E001",
+    "apikey_preview": "abcd…wxyz",
+    "is_valid": true,
+    "created_at": "2026-08-05T06:42:47+00:00",
+    "updated_at": "2026-08-05T06:42:47+00:00"
+  }
+}
+```
+
+Returns HTTP 404 when the employee has no active apikey.
+
+## API-Key Invalidation
+
+```http
+POST /api/apikey/invalidate
+```
+
+Disables an employee's active apikey by marking it invalid. Invalidated keys immediately stop authenticating proxy requests, and the per-employee slot is released so a new key can be registered (key rotation).
+
+```bash
+curl -i -X POST http://localhost:8001/api/apikey/invalidate \
+  -H 'Content-Type: application/json' \
+  -d '{"employee_no":"E001"}'
+```
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "employee_no": "E001"
+  }
+}
+```
+
+Returns HTTP 404 when the employee has no active apikey to invalidate.
 
 ## Whitelist List
 

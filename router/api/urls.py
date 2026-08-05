@@ -4,7 +4,8 @@ from router import views as router_views
 from router.api import views
 
 urlpatterns = [
-    path("apikey", views.register_apikey),
+    path("apikey", views.apikey),
+    path("apikey/invalidate", views.invalidate_apikey),
     path("request_stats", views.request_stats),
     path("total_request_count", views.total_request_count),
     path("input_token", views.input_token),

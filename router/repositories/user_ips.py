@@ -55,6 +55,16 @@ class UserIPRepository:
         ).first()
 
     @staticmethod
+    def invalidate_apikey_by_employee_no(employee_no: str) -> bool:
+        obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
+        if obj is None:
+            return False
+        obj.is_valid = False
+        obj.updated_at = timezone.now()
+        obj.save(update_fields=["is_valid", "updated_at"])
+        return True
+
+    @staticmethod
     def create_or_update_apikey(
         apikey: str,
         employee_no: str,
