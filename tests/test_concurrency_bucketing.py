@@ -195,7 +195,7 @@ def test_vip_rows_excluded_from_concurrency_count():
 
 @pytest.mark.django_db
 def test_resolved_auto_request_does_not_inflate_direct_model_b_concurrency(monkeypatch):
-    model_b = Model.objects.create(model_name="model-b", concurrent_limit=1, complexity_min=1, complexity_max=10)
+    model_b = Model.objects.create(model_name="model-b", concurrent_limit=1, max_tokens=65536, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=model_b.id, base_url="http://b.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
