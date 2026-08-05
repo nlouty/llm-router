@@ -11,7 +11,7 @@ from django.http import StreamingHttpResponse
 from router.config import APP_CONFIG
 from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
-from router.services import proxy_response
+from router.services import proxy_logging, proxy_response
 from router.services.request_context import get_request_id
 from router.services.request_log_handler import install_pd_handler
 from router.services.request_logger import append_request_log
@@ -249,6 +249,7 @@ class PDForwardService:
             prefiller.base_url, path, django_request.META.get("QUERY_STRING", "")
         )
         target_pod_ip = f"P: {prefiller.base_url}"
+        state.last_target_pod_ip = target_pod_ip
         RequestRepository.record_attempt(
             record, target_pod_ip, state.attempts,
             getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
@@ -311,16 +312,18 @@ class PDForwardService:
                 "prefiller_url": prefiller.base_url,
                 "status_code": exc.status_code,
                 "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+                "response_body": proxy_logging.decode_body_for_log(exc.content)[:5000],
             }, ensure_ascii=False))
             self._release_prefiller(prefiller)
             self.circuit_breaker.record_failure(prefiller)
+            fail_reason = proxy_response.extract_fail_reason(exc.content, exc.reason)
             state.last_status = exc.status_code
             state.last_reason = exc.reason
             state.last_upstream = exc.response
             state.last_content = exc.content
-            state.last_fail_reason = exc.reason
+            state.last_fail_reason = fail_reason
             proxy_response.finish_upstream_error(
-                record, exc.status_code, exc.reason, target_pod_ip, model, state.attempts, context
+                record, exc.status_code, fail_reason, target_pod_ip, model, state.attempts, context
             )
             self.proxy._after_finish(served_as_vip, model)
             return _RouteAttemptResult(
@@ -434,6 +437,7 @@ class PDForwardService:
             current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
             if recompute_count > 0:
                 current_target += _KV_TRANSFER_FAIL_TAG
+            state.last_target_pod_ip = current_target
             RequestRepository.record_attempt(
                 record, current_target, state.attempts,
                 getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
@@ -480,6 +484,7 @@ class PDForwardService:
                     "status_code": status_code,
                     "recompute_count": recompute_count,
                     "is_error": True,
+                    "response_body": proxy_logging.decode_body_for_log(content)[:5000],
                 }, ensure_ascii=False))
                 self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
@@ -632,6 +637,7 @@ class PDForwardService:
                 current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
                 if recompute_count > 0:
                     current_target += _KV_TRANSFER_FAIL_TAG
+                state.last_target_pod_ip = current_target
                 RequestRepository.record_attempt(
                     record, current_target, state.attempts,
                     getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
@@ -666,12 +672,24 @@ class PDForwardService:
                     return
 
                 if upstream.status_code >= 400:
-                    content = upstream.content
+                    try:
+                        content = upstream.content
+                    except Exception:
+                        content = b""
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_decode_response",
+                        "decoder_url": decoder.base_url,
+                        "status_code": upstream.status_code,
+                        "recompute_count": recompute_count,
+                        "is_error": True,
+                        "response_body": proxy_logging.decode_body_for_log(content)[:5000],
+                    }, ensure_ascii=False))
+                    fail_reason = proxy_response.extract_fail_reason(content, upstream.reason or "")
                     self.circuit_breaker.record_failure(decoder)
                     if content:
                         yield content
                     proxy_response.finish_upstream_error(
-                        record, upstream.status_code, upstream.reason or "", current_target, model, state.attempts, context
+                        record, upstream.status_code, fail_reason, current_target, model, state.attempts, context
                     )
                     upstream.close()
                     release_current_decoder()

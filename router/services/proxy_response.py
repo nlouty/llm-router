@@ -72,18 +72,39 @@ def request_non_utf8_fail_reason(body: bytes) -> str | None:
 
 
 def extract_fail_reason(content: bytes, http_reason: str) -> str:
+    """Extract the most specific failure reason from an upstream error body.
+
+    Returns the server-provided detail when available (a JSON ``error.message``,
+    a top-level ``message``/``detail``, or the raw body text). When the server
+    responded with no body at all, returns ``"no detailed reason from server"``
+    — this signals a real HTTP response was received (vs. a timeout/connection
+    failure that never got one) but the server gave nothing to diagnose.
+    """
+    text = ""
+    if content:
+        try:
+            text = content.decode("utf-8", "replace")
+        except Exception:
+            text = repr(content)
+    if not text.strip():
+        return "no detailed reason from server"
     try:
-        data = json.loads(content.decode("utf-8"))
+        data = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return http_reason
+        return text.strip()[:200]
     if isinstance(data, dict):
         error = data.get("error")
         if isinstance(error, dict):
-            msg = error.get("message", "")
-            err_type = error.get("type", "")
+            msg = (error.get("message") or "").strip()
+            err_type = (error.get("type") or "").strip()
             if msg:
                 return f"{err_type}: {msg}" if err_type else msg
-    return http_reason
+        elif isinstance(error, str) and error.strip():
+            return error.strip()
+        msg = data.get("message") or data.get("detail")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    return text.strip()[:200]
 
 
 def ensure_model_after_success(model_name: str | None, status_code: int) -> int | None:
