@@ -58,6 +58,11 @@ def register_apikey(request):
     if len(employee_no) > 50:
         return _bad_request("employee_no must be at most 50 characters")
 
+    if UserIPRepository.get_active_apikey_by_employee_no(employee_no):
+        return JsonResponse(
+            {"code": 409, "error": "employee already has an active apikey"}, status=409
+        )
+
     try:
         CMDBService().fetch_and_save_apikey(apikey, employee_no)
     except NotImplementedError:
@@ -67,6 +72,74 @@ def register_apikey(request):
     except Exception:
         logger.exception("CMDB API key registration failed for employee %s", employee_no)
         return JsonResponse({"code": 502, "error": "CMDB API key registration failed"}, status=502)
+
+    return JsonResponse(
+        {
+            "code": 200,
+            "message": "success",
+            "data": {
+                "employee_no": employee_no,
+            },
+        }
+    )
+
+
+@require_http_methods(["GET", "POST"])
+def apikey(request):
+    if request.method == "POST":
+        return register_apikey(request)
+    return get_apikey(request)
+
+
+def _mask_apikey(apikey: str) -> str:
+    if len(apikey) <= 8:
+        return ""
+    return f"{apikey[:4]}…{apikey[-4:]}"
+
+
+def _apikey_info(user_ip) -> dict:
+    return {
+        "employee_no": user_ip.employee_no,
+        "apikey_preview": _mask_apikey(user_ip.apikey),
+        "is_valid": user_ip.is_valid,
+        "created_at": user_ip.created_at.isoformat() if user_ip.created_at else None,
+        "updated_at": user_ip.updated_at.isoformat() if user_ip.updated_at else None,
+    }
+
+
+@require_http_methods(["GET"])
+def get_apikey(request):
+    employee_no = request.GET.get("employee_no")
+    if not employee_no or not employee_no.strip():
+        return _bad_request("employee_no is required")
+    employee_no = employee_no.strip()
+
+    user_ip = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
+    if user_ip is None:
+        return JsonResponse({"code": 404, "error": "apikey not found for employee"}, status=404)
+
+    return JsonResponse({"code": 200, "message": "success", "data": _apikey_info(user_ip)})
+
+
+@require_http_methods(["POST"])
+def invalidate_apikey(request):
+    try:
+        data = json.loads(request.body.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _bad_request("invalid JSON body")
+
+    if not isinstance(data, dict):
+        return _bad_request("JSON body must be an object")
+
+    employee_no = data.get("employee_no")
+    if not isinstance(employee_no, str) or not employee_no.strip():
+        return _bad_request("employee_no is required")
+    employee_no = employee_no.strip()
+    if len(employee_no) > 50:
+        return _bad_request("employee_no must be at most 50 characters")
+
+    if not UserIPRepository.invalidate_apikey_by_employee_no(employee_no):
+        return JsonResponse({"code": 404, "error": "apikey not found for employee"}, status=404)
 
     return JsonResponse(
         {
