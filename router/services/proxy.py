@@ -46,6 +46,11 @@ class _RetryState:
     last_server: Any = None
     last_status: int = 502
     last_reason: str = "Bad Gateway"
+    # The display string of the most recent attempt's target ("P: <url>",
+    # "P: <url> -- D: <url>", or a bare mixed-server url). Preserved across
+    # terminal failure so finish_* records the same target that was shown while
+    # the request was in flight, instead of regressing to a bare base_url.
+    last_target_pod_ip: str | None = None
     # The most recent real upstream error response, captured so that when
     # retries are exhausted (all candidates tried or max attempts hit) the
     # caller gets the actual upstream body/status rather than a synthetic
@@ -488,6 +493,7 @@ class ProxyService:
         state.attempts += 1
         upstream_url = self._build_url(server.base_url, path, django_request.META.get("QUERY_STRING", ""))
         target_pod_ip = self._target_identifier(server)
+        state.last_target_pod_ip = target_pod_ip
         RequestRepository.record_attempt(
             record,
             target_pod_ip,
@@ -776,16 +782,24 @@ class ProxyService:
             state.attempted_server_ids,
             final_server_id,
         )
+        final_target_pod_ip = state.last_target_pod_ip or self._target_identifier(state.last_server)
         # Retries exhausted (all candidates tried or max attempts hit). If the
         # last failure was a real upstream error, return that response so the
         # caller sees the actual upstream status/body. Only synthesize a 502/504
         # for failures with no body, i.e. read timeouts or connection errors.
         if state.last_upstream is not None and state.last_status >= 400:
+            # This branch is only reached when the deadline broke after a retry
+            # was scheduled (the normal terminal path returns a response and
+            # never gets here), so the upstream body for this attempt was never
+            # logged — capture it now.
+            proxy_logging.log_failure_response(
+                record.id, final_target_pod_ip, state.last_status, state.last_content
+            )
             proxy_response.finish_upstream_error(
                 record,
                 state.last_status,
                 state.last_fail_reason or state.last_reason,
-                self._target_identifier(state.last_server),
+                final_target_pod_ip,
                 model,
                 state.attempts,
                 context,
@@ -802,7 +816,7 @@ class ProxyService:
             record,
             status,
             message,
-            self._target_identifier(state.last_server),
+            final_target_pod_ip,
             state.attempts,
             context,
         )

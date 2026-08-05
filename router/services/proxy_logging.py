@@ -94,6 +94,39 @@ def log_error_detail(
     append_error_log(request_id, log_entry)
 
 
+def decode_body_for_log(body: bytes) -> str:
+    """Best-effort decode an upstream request/response body for log output."""
+    if not body:
+        return ""
+    try:
+        return body.decode("utf-8", "replace")
+    except Exception:
+        return repr(body)
+
+
+def log_failure_response(
+    request_id: int,
+    target_pod_ip: str | None,
+    status_code: int,
+    response_body: bytes,
+) -> None:
+    """Log the upstream response body for a terminal failure.
+
+    Used by disaggregated prefill/decode paths (and retry exhaustion) where the
+    richer ``log_error_detail`` (request headers/body) is not available, but the
+    server's error body must still be preserved for debugging.
+    """
+    payload = {
+        "event": "failure_response",
+        "request_id": request_id,
+        "status_code": status_code,
+        "response_body": decode_body_for_log(response_body)[:5000],
+    }
+    if target_pod_ip:
+        payload["target_pod_ip"] = target_pod_ip
+    safe_append_request_log(request_id, json.dumps(payload, ensure_ascii=False))
+
+
 def log_chooser_response_hook_error(context, server, status_code: int, exc: Exception) -> None:
     append_request_log(
         context.request_id,

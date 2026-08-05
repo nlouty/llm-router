@@ -8,6 +8,7 @@ whole request is re-run on a new server.
 """
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -317,3 +318,107 @@ class TestDecodeRecordsPrefixContext:
 
         assert len(captured) == 1
         assert captured[0][4] == 76543
+
+
+@pytest.mark.django_db
+class TestDecodeErrorLogsBodyAndDetailedReason:
+    """A decode 4xx must log the decoder's error body (``pd_decode_response``
+    with ``response_body``) and record the extracted ``fail_reason`` — not a
+    bare HTTP reason like "Bad Request" — for both streaming and non-streaming
+    requests. Previously the streaming 4xx branch logged only ``pd_decoder_chosen``
+    and discarded the body, leaving failures undiagnosable.
+    """
+
+    ERR_BODY = b'{"error":{"message":"kv transfer lookup failed","type":"val_error"}}'
+
+    def _capture_logs(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(
+            "router.services.proxy_pd_forward.append_request_log",
+            lambda rid, msg: events.append(json.loads(msg)),
+        )
+        return events
+
+    def _wire_decoder(self, monkeypatch):
+        decoder = Server.objects.create(
+            base_url="http://d0.example", role="decoder", group_id="g1"
+        )
+        monkeypatch.setattr(
+            ServerRepository, "pick_least_tokens_decoder",
+            lambda group_id, attempted: decoder,
+        )
+        return decoder
+
+    def _prefiller(self):
+        return Server.objects.create(
+            base_url="http://p.example", role="prefiller", group_id="g1"
+        )
+
+    def test_stream_decode_4xx_logs_body_and_extracted_reason(self, monkeypatch):
+        svc = _make_svc(monkeypatch)
+        events = self._capture_logs(monkeypatch)
+        self._wire_decoder(monkeypatch)
+
+        class _FakeUpstream:
+            status_code = 400
+            reason = "Bad Request"
+            content = self.ERR_BODY
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "router.services.proxy_pd_forward.requests.request",
+            lambda *a, **k: _FakeUpstream(),
+        )
+
+        record = _record()
+        state = _RetryState()
+        response = svc._stream_decode(
+            _django_request(), "chat/completions", {}, b'{"messages":[]}', record,
+            _context(record), False, None, state, self._prefiller(), {}, 1, 0, "P: x",
+        )
+        gen = response.streaming_content
+        try:
+            list(gen)
+        finally:
+            if hasattr(gen, "close"):
+                gen.close()
+
+        resp_events = [e for e in events if e.get("event") == "pd_decode_response"]
+        assert len(resp_events) == 1
+        assert resp_events[0]["status_code"] == 400
+        assert resp_events[0]["is_error"] is True
+        assert "kv transfer lookup failed" in resp_events[0]["response_body"]
+
+        record.refresh_from_db()
+        assert record.fail_reason == "val_error: kv transfer lookup failed"
+        assert record.target_pod_ip.startswith("P: ")
+        assert "-- D: http://d0.example" in record.target_pod_ip
+
+    def test_normal_decode_4xx_logs_body_and_extracted_reason(self, monkeypatch):
+        svc = _make_svc(monkeypatch)
+        events = self._capture_logs(monkeypatch)
+        self._wire_decoder(monkeypatch)
+
+        resp = type("R", (), {"reason": "Bad Request", "headers": {}})()
+        monkeypatch.setattr(
+            PDForwardService, "_post_decode",
+            staticmethod(lambda *a, **k: (resp, self.ERR_BODY, 400)),
+        )
+
+        record = _record()
+        state = _RetryState()
+        svc._normal_decode(
+            "chat/completions", {}, b'{"messages":[]}', record, _context(record),
+            False, None, state, self._prefiller(), {}, 1, 0, "P: x",
+        )
+
+        resp_events = [e for e in events if e.get("event") == "pd_decode_response"]
+        assert len(resp_events) == 1
+        assert resp_events[0]["status_code"] == 400
+        assert "kv transfer lookup failed" in resp_events[0]["response_body"]
+
+        record.refresh_from_db()
+        assert record.fail_reason == "val_error: kv transfer lookup failed"
+        assert "-- D: http://d0.example" in record.target_pod_ip
