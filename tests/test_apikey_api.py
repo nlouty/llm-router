@@ -158,7 +158,7 @@ def test_get_apikey_missing_returns_404(client):
 
 
 @pytest.mark.django_db
-def test_invalidate_apikey_marks_invalid(client):
+def test_invalidate_apikey_deletes_row(client):
     UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001")
 
     response = _invalidate(client, "E001")
@@ -166,7 +166,7 @@ def test_invalidate_apikey_marks_invalid(client):
     assert response.status_code == 200
     assert response.json()["data"]["employee_no"] == "E001"
     assert UserIPRepository.get_active_apikey_by_employee_no("E001") is None
-    assert UserIP.objects.get(apikey="key-1").is_valid is False
+    assert not UserIP.objects.filter(apikey="key-1").exists()
 
 
 @pytest.mark.django_db
