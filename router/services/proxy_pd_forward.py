@@ -331,8 +331,6 @@ class PDForwardService:
             )
 
         kv_params = _extract_kv_params(prefill_json)
-        # final_prefix_cache comes from the prefiller (authoritative), not decoder.
-        context.prefix_cache = (cached_tokens / prompt_tokens) if prompt_tokens else 0.0
 
         append_request_log(record.id, json.dumps({
             "event": "pd_prefill_success",
