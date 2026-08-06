@@ -73,7 +73,7 @@ The range is inclusive. Bucketed endpoints choose granularity automatically: hou
 
 | Endpoint | Method | Required params | Optional params | Description |
 |----------|--------|-----------------|-----------------|-------------|
-| `/api/request_stats` | GET | `start_time`, `end_time` | | Distinct requesting IP count. |
+| `/api/request_stats` | GET | `start_time`, `end_time` | | Distinct successful requesting IP count. |
 | `/api/total_request_count` | GET | `start_time`, `end_time` | | Successful external request count. |
 | `/api/input_token` | GET | `start_time`, `end_time` | `model_name`; use `total` or omit for all models | Sum of input tokens with cache hit/miss breakdown. |
 | `/api/output_token` | GET | `start_time`, `end_time` | `model_name`; use `total` or omit for all models | Sum of output tokens. |
