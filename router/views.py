@@ -74,17 +74,22 @@ def proxy(request, path: str):
 
         identity = IdentityService.resolve(request, ip)
 
-        if is_vip_channel and not ip.vip:
-            message = _vip_port_closed_message(request)
-            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 503, message, user_ip_id=identity.user_ip_id)
-            return error_response(503, message, "service_unavailable")
-
         admission = AdmissionService()
-        permission = admission.check_permission(identity)
-        if not permission.allowed:
-            message = permission.message or "Access denied, you do not have permission"
-            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
-            return error_response(permission.status_code, message, permission.error_type or "permission_denied")
+
+        # A valid apikey authorizes the request on its own. The client IP is
+        # recorded and enriched via CMDB above, but must not drive any admission
+        # decision, so skip both the VIP-port gate and the permission check.
+        if not identity.is_apikey:
+            if is_vip_channel and not ip.vip:
+                message = _vip_port_closed_message(request)
+                RequestRepository.create_blocked(ip.id, 0, None, user_agent, 503, message, user_ip_id=identity.user_ip_id)
+                return error_response(503, message, "service_unavailable")
+
+            permission = admission.check_permission(identity)
+            if not permission.allowed:
+                message = permission.message or "Access denied, you do not have permission"
+                RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
+                return error_response(permission.status_code, message, permission.error_type or "permission_denied")
 
         blocked, version = OpencodeVersionService.should_block(user_agent)
         if blocked:
