@@ -59,9 +59,7 @@ class UserIPRepository:
         obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
         if obj is None:
             return False
-        obj.is_valid = False
-        obj.updated_at = timezone.now()
-        obj.save(update_fields=["is_valid", "updated_at"])
+        obj.delete()
         return True
 
     @staticmethod

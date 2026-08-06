@@ -231,7 +231,7 @@ Returns HTTP 404 when the employee has no active apikey.
 POST /api/apikey/invalidate
 ```
 
-Disables an employee's active apikey by marking it invalid. Invalidated keys immediately stop authenticating proxy requests, and the per-employee slot is released so a new key can be registered (key rotation).
+Deletes an employee's active apikey row. The key immediately stops authenticating proxy requests, and the per-employee slot is released so a new key can be registered (key rotation).
 
 ```bash
 curl -i -X POST http://localhost:8001/api/apikey/invalidate \
