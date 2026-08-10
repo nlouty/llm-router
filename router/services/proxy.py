@@ -652,10 +652,11 @@ class ProxyService:
         state.last_content = content
         state.last_fail_reason = fail_reason
 
-        # On a real context overflow, first retry on a same-model server with a
+        # On a real context overflow, retry on a same-model server with a
         # strictly larger context window (the chooser excludes already-tried
-        # servers). Only fall back to a long-context model when no such server
-        # exists. Issue #153: never pre-decide by estimated tokens.
+        # servers). The router never switches to a different model on overflow
+        # (issue #224); if no larger-window same-model server exists the real
+        # upstream error surfaces. Issue #153: never pre-decide by estimated tokens.
         if (
             self.auto_router.check_context_overflow(status_code, failed_context_window, fail_reason)
             and failed_context_window
@@ -670,31 +671,6 @@ class ProxyService:
                 return _RouteAttemptResult(
                     should_retry=True,
                     candidates=higher_candidates,
-                    model=model,
-                    body=body,
-                )
-
-        switch = self.auto_router.context_overflow_switch(
-            record,
-            context,
-            body,
-            model,
-            failed_context_window,
-            status_code,
-            fail_reason,
-        )
-        if switch.model is not None:
-            model = switch.model
-            body = switch.body
-            switched_candidates, _ = self._select_candidates(
-                context.path,
-                model,
-                served_as_vip,
-            )
-            if switched_candidates:
-                return _RouteAttemptResult(
-                    should_retry=True,
-                    candidates=switched_candidates,
                     model=model,
                     body=body,
                 )

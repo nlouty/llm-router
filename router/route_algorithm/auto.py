@@ -22,12 +22,6 @@ class AutoRouteDecision:
     router_result: str | None = None
 
 
-@dataclass
-class ContextOverflowDecision:
-    model: Any | None = None
-    body: bytes | None = None
-
-
 class AutoRouteAlgorithm:
     SMALL_REQUEST_ROUTING_TOKEN_LIMIT = 3000
     PREFIX_CACHE_AUTO_HIT_THRESHOLD = 0.7
@@ -693,39 +687,6 @@ class AutoRouteAlgorithm:
     @staticmethod
     def fallback_model_name() -> str:
         return APP_CONFIG.get("router", {}).get("fallback_model", "DeepSeek-V4-Flash")
-
-    def context_overflow_switch(
-        self,
-        record,
-        context: ServerSelectionContext,
-        body: bytes,
-        model,
-        failed_context_window: int | None,
-        status_code: int,
-        fail_reason: str,
-    ) -> ContextOverflowDecision:
-        fallback_name = self.fallback_model_name()
-        if not context.auto_model_selection:
-            return ContextOverflowDecision(body=body)
-        if not model or model.model_name == fallback_name:
-            return ContextOverflowDecision(body=body)
-        if not self.check_context_overflow(status_code, failed_context_window, fail_reason):
-            return ContextOverflowDecision(body=body)
-
-        fallback_model = ModelRepository.get_by_name(fallback_name)
-        if not fallback_model:
-            return ContextOverflowDecision(body=body)
-
-        proxy_logging.log_context_overflow_switch(
-            record.id,
-            fail_reason,
-            fallback_name,
-        )
-        body = self.update_body_model(body, fallback_model.model_name)
-        context.model_id = fallback_model.id
-        context.model_name = fallback_model.model_name
-        context.body = body
-        return ContextOverflowDecision(model=fallback_model, body=body)
 
     @staticmethod
     def check_context_overflow(status_code: int, context_window: int | None, fail_reason: str) -> bool:

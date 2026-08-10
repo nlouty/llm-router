@@ -140,10 +140,3 @@ def log_chooser_response_hook_error(context, server, status_code: int, exc: Exce
             ensure_ascii=False,
         ),
     )
-
-
-def log_context_overflow_switch(request_id: int, fail_reason: str, model_name: str) -> None:
-    append_request_log(
-        request_id,
-        f"Context overflow detected ({fail_reason}), switching to {model_name}",
-    )

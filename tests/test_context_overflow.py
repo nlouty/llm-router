@@ -4,18 +4,19 @@ import pytest
 from django.test import Client
 from router.models import Model, Server, RequestRecord
 
-def test_context_overflow_switches_to_flash_when_auto(monkeypatch):
-    # Setup models
-    flash_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
+def test_context_overflow_does_not_switch_to_fallback_when_auto(monkeypatch):
+    # Issue #224: when an auto-selected model overflows and no larger-window
+    # same-model server exists, the router must not switch to the fallback
+    # model. The real upstream overflow error surfaces instead.
     other_model = Model.objects.create(
         model_name="Other-Model",
         auto=True,
         complexity_min=1,
         complexity_max=10,
     )
+    flash_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
 
-    # Setup servers: the only Other-Model server advertises a small context window.
-    other_server = Server.objects.create(
+    Server.objects.create(
         model_id=other_model.id,
         base_url="http://other.example",
         is_online=True,
@@ -23,29 +24,18 @@ def test_context_overflow_switches_to_flash_when_auto(monkeypatch):
     )
     Server.objects.create(model_id=flash_model.id, base_url="http://flash.example", is_online=True)
 
-    # Mock routing LLM to return other_model for 'auto'
     def fake_query_routing_llm(self, body, record, context, active_models, model_names):
         return other_model, "router_decision"
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._query_routing_llm", fake_query_routing_llm)
 
-    # First attempt on other_server overflows (error body contains its context
-    # window value, 1000); no larger-window Other-Model server exists, so the
-    # router falls back to the flash model on the second attempt.
-    attempt_count = 0
+    contacted = []
     def fake_request(self_inner, method, url, **kwargs):
-        nonlocal attempt_count
-        attempt_count += 1
+        contacted.append(url)
         upstream = MagicMock()
-        if "other.example" in url:
-            upstream.status_code = 400
-            upstream.reason = "Bad Request"
-            upstream.content = b'{"error": {"message": "context window 1000 exceeded"}}'
-            upstream.headers = {"content-type": "application/json"}
-        else:
-            upstream.status_code = 200
-            upstream.reason = "OK"
-            upstream.content = b'{"choices": [{"message": {"content": "flash response"}}]}'
-            upstream.headers = {"content-type": "application/json"}
+        upstream.status_code = 400
+        upstream.reason = "Bad Request"
+        upstream.content = b'{"error": {"message": "context window 1000 exceeded"}}'
+        upstream.headers = {"content-type": "application/json"}
         return upstream
 
     monkeypatch.setattr(
@@ -61,9 +51,10 @@ def test_context_overflow_switches_to_flash_when_auto(monkeypatch):
         HTTP_X_FORWARDED_FOR="1.2.3.4"
     )
 
-    assert response.status_code == 200
-    assert b"flash response" in response.content
-    assert attempt_count == 2
+    # The real upstream overflow error surfaces; the fallback is never contacted.
+    assert response.status_code == 400
+    assert b"context window 1000 exceeded" in response.content
+    assert not any("flash.example" in u for u in contacted)
 
 def test_context_overflow_does_not_switch_when_explicit_model(monkeypatch):
     # Setup models
@@ -176,11 +167,11 @@ def test_context_overflow_retries_same_model_larger_window(monkeypatch):
 
 
 def test_context_overflow_returns_real_body_when_retries_exhausted(monkeypatch):
-    # Issue: when retries are exhausted (all candidates tried / max attempts
-    # hit), the client must receive the actual upstream error body and status,
-    # not a synthetic 502. This exercises the fallback cascade where model A
-    # overflows -> switch to fallback model B -> B overflows too, with no
-    # larger-window B server available.
+    # Issue #224: when an auto-selected model overflows and no larger-window
+    # same-model server exists, the client must receive the actual upstream
+    # overflow error, not a synthetic 502 and not the fallback model's response.
+    # The fallback server is configured to overflow differently so we can prove
+    # it is never contacted.
     flash_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
     other_model = Model.objects.create(
         model_name="Other-Model",
@@ -189,7 +180,6 @@ def test_context_overflow_returns_real_body_when_retries_exhausted(monkeypatch):
         complexity_max=10,
     )
 
-    # Both models have exactly one server; each overflows on its own window.
     Server.objects.create(
         model_id=other_model.id,
         base_url="http://other.example",
@@ -207,14 +197,16 @@ def test_context_overflow_returns_real_body_when_retries_exhausted(monkeypatch):
         return other_model, "router_decision"
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._query_routing_llm", fake_query_routing_llm)
 
+    contacted = []
     def fake_request(self_inner, method, url, **kwargs):
         upstream = MagicMock()
         upstream.headers = {"content-type": "application/json"}
+        contacted.append(url)
         if "other.example" in url:
             upstream.status_code = 400
             upstream.reason = "Bad Request"
             upstream.content = b'{"error": {"message": "context window 1000 exceeded"}}'
-        else:  # flash (the fallback) also overflows
+        else:  # would only happen if the fallback were wrongly contacted
             upstream.status_code = 400
             upstream.reason = "Bad Request"
             upstream.content = b'{"error": {"message": "context window 2000 exceeded"}}'
@@ -233,9 +225,11 @@ def test_context_overflow_returns_real_body_when_retries_exhausted(monkeypatch):
         HTTP_X_FORWARDED_FOR="1.2.3.4",
     )
 
-    # The real upstream 400 body/status must surface, not a synthetic 502.
+    # The original model's overflow error surfaces; the fallback is untouched.
     assert response.status_code == 400
-    assert b"2000 exceeded" in response.content
+    assert b"1000 exceeded" in response.content
+    assert b"2000 exceeded" not in response.content
+    assert not any("flash.example" in u for u in contacted)
 
 
 def test_sync_500_error_returns_real_body_when_retries_exhausted(monkeypatch):

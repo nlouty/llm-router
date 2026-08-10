@@ -136,4 +136,4 @@ Prefix cache blocks are measured in Python Unicode characters, not LLM tokenizer
 
 `prefix_cache.primary_match_threshold` chooses among cached servers when the best per-server match is above the threshold. `secondary_match_threshold` chooses among partially matching servers before falling back to all candidates. `max_prefix_chars` caps the prefix text stored and checked per request. `prefix_block_chars` controls the character block size used to build Redis prefix hashes.
 
-`router.fallback_model` is used by auto routing when the classifier cannot produce a unique target and when an auto-selected model hits a context-overflow fallback. `router.system_prompt_path` points to the complexity-classifier prompt. `router.auto_concurrent_limit` is the base concurrency limit for exact `model: auto` requests before multiplying by `ips.concurrent_multiplier`.
+`router.fallback_model` is used by auto routing when the classifier cannot produce a unique target. `router.system_prompt_path` points to the complexity-classifier prompt. `router.auto_concurrent_limit` is the base concurrency limit for exact `model: auto` requests before multiplying by `ips.concurrent_multiplier`.
