@@ -55,6 +55,63 @@ def maybe_log_multi_server_route(
     append_request_log(request_id, json.dumps(payload, ensure_ascii=False))
 
 
+_SECRET_REQUEST_HEADERS = ("authorization", "csb-token")
+
+
+def _safe_headers(headers) -> dict:
+    if not headers:
+        return {}
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in _SECRET_REQUEST_HEADERS
+    }
+
+
+def _redact_request_body(body) -> str:
+    """Decode a request body for logging, dropping ``messages`` for privacy
+    while keeping tools, mcp servers, and all other options (issue #225)."""
+    try:
+        text = body.decode("utf-8") if body else ""
+    except (UnicodeDecodeError, AttributeError):
+        return repr(body)[:2000]
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text[:5000]
+    if isinstance(data, dict):
+        data.pop("messages", None)
+        text = json.dumps(data, ensure_ascii=False)
+    return text[:5000]
+
+
+def log_request_context(request_id: int, method: str, url: str, headers, body) -> None:
+    """Log the request context of a failed request: HTTP headers (with
+    authorization/csb-token redacted) and the request body with ``messages``
+    removed, so tools, mcp servers, and other options stay available for
+    debugging without leaking user prompts (issue #225)."""
+    payload = {
+        "event": "request_context",
+        "request_id": request_id,
+        "method": method,
+        "url": url,
+        "request_headers": _safe_headers(headers),
+        "request_body": _redact_request_body(body),
+    }
+    append_error_log(request_id, json.dumps(payload, ensure_ascii=False))
+
+
+def log_request_context_for(context) -> None:
+    """Log request context derived from a ServerSelectionContext (issue #225)."""
+    log_request_context(
+        context.request_id,
+        getattr(context, "method", "") or "",
+        f"/v1/{(getattr(context, 'path', '') or '').rstrip('/')}",
+        getattr(context, "headers", None),
+        getattr(context, "body", b""),
+    )
+
+
 def log_error_detail(
     request_id: int,
     method: str,
@@ -64,28 +121,19 @@ def log_error_detail(
     status_code: int,
     response_body: bytes,
 ) -> None:
-    try:
-        req_body_str = body.decode("utf-8") if body else ""
-    except (UnicodeDecodeError, AttributeError):
-        req_body_str = repr(body)[:2000]
+    # Every failed request emits a uniform ``request_context`` event (issue
+    # #225). The upstream-specific ``upstream_error`` event carries only the
+    # response, so request context lives in exactly one place across all paths.
+    log_request_context(request_id, method, url, headers, body)
     try:
         resp_body_str = response_body.decode("utf-8") if response_body else ""
     except (UnicodeDecodeError, AttributeError):
         resp_body_str = repr(response_body)[:2000]
 
-    safe_headers = {
-        key: value
-        for key, value in headers.items()
-        if key.lower() not in ("authorization", "csb-token")
-    }
     log_entry = json.dumps(
         {
             "event": "upstream_error",
             "request_id": request_id,
-            "method": method,
-            "url": url,
-            "request_headers": safe_headers,
-            "request_body": req_body_str[:5000],
             "response_status": status_code,
             "response_body": resp_body_str[:5000],
         },

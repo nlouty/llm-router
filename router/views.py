@@ -22,6 +22,7 @@ from router.services.cmdb import CMDBService
 from router.services.identity import IdentityService
 from router.services.opencode import OpencodeVersionService
 from router.services.parser import RequestParser
+from router.services import proxy_logging
 from router.services.proxy import ProxyService
 from router.services.request_context import clear_request_id, set_request_id
 from router.services.request_log_handler import install_pd_handler
@@ -146,6 +147,14 @@ def proxy(request, path: str):
         # per-request file records it.
         set_request_id(record.id)
         try:
+            # Best-effort: the request-context log must never prevent the 502
+            # response from being returned by this catch-all handler.
+            try:
+                proxy_logging.log_request_context(
+                    record.id, request.method, f"/v1/{path.rstrip('/')}", dict(request.headers), body
+                )
+            except Exception:
+                pass
             logger.error("proxy unhandled %s request_id=%s path=/v1/%s: %s", type(exc).__name__, record.id, path, str(exc)[:200])
             logger.debug("%s", traceback.format_exc())
         finally:
