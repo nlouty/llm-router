@@ -314,6 +314,7 @@ class PDForwardService:
                 "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
                 "response_body": proxy_logging.decode_body_for_log(exc.content)[:5000],
             }, ensure_ascii=False))
+            proxy_logging.log_request_context_for(context)
             self._release_prefiller(prefiller)
             self.circuit_breaker.record_failure(prefiller)
             fail_reason = proxy_response.extract_fail_reason(exc.content, exc.reason)
@@ -484,6 +485,7 @@ class PDForwardService:
                     "is_error": True,
                     "response_body": proxy_logging.decode_body_for_log(content)[:5000],
                 }, ensure_ascii=False))
+                proxy_logging.log_request_context_for(context)
                 self._release_decoder(decoder, prompt_tokens)
                 self.circuit_breaker.record_failure(decoder)
                 fail_reason = proxy_response.extract_fail_reason(content, response.reason or "")
@@ -611,6 +613,7 @@ class PDForwardService:
                         "attempted_decoder_ids": sorted(attempted_decoder_ids),
                         "recompute_count": recompute_count,
                     }, ensure_ascii=False))
+                    proxy_logging.log_request_context_for(context)
                     yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
                     proxy_response.finish_stream_request_exception(
                         record, message, current_target, state.attempts, model, context
@@ -659,6 +662,7 @@ class PDForwardService:
                         "reason": str(exc)[:500],
                         "recompute_count": recompute_count,
                     }, ensure_ascii=False))
+                    proxy_logging.log_request_context_for(context)
                     self.circuit_breaker.record_failure(decoder)
                     message = "502 Bad Gateway"
                     yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
@@ -682,6 +686,7 @@ class PDForwardService:
                         "is_error": True,
                         "response_body": proxy_logging.decode_body_for_log(content)[:5000],
                     }, ensure_ascii=False))
+                    proxy_logging.log_request_context_for(context)
                     fail_reason = proxy_response.extract_fail_reason(content, upstream.reason or "")
                     self.circuit_breaker.record_failure(decoder)
                     if content:
@@ -700,6 +705,7 @@ class PDForwardService:
                 try:
                     for chunk in upstream.iter_content(chunk_size=8192):
                         if time.monotonic() > deadline:
+                            proxy_logging.log_request_context_for(context)
                             yield timeout_sse_event()
                             proxy_response.finish_stream_total_timeout(record, current_target, state.attempts)
                             release_current_decoder()
@@ -726,6 +732,7 @@ class PDForwardService:
                     upstream.close()
                     release_current_decoder()
                     self.circuit_breaker.record_failure(decoder)
+                    proxy_logging.log_request_context_for(context)
                     yield timeout_sse_event()
                     proxy_response.finish_stream_read_timeout(
                         record, current_target, state.attempts, model, context
@@ -736,6 +743,7 @@ class PDForwardService:
                     upstream.close()
                     release_current_decoder()
                     self.circuit_breaker.record_failure(decoder)
+                    proxy_logging.log_request_context_for(context)
                     message = "502 Bad Gateway"
                     yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
                     proxy_response.finish_stream_request_exception(
@@ -767,6 +775,7 @@ class PDForwardService:
                             "recompute_count": recompute_count,
                             "recompute_max": self.recompute_max,
                         }, ensure_ascii=False))
+                        proxy_logging.log_request_context_for(context)
                         message = "PD recompute limit exceeded"
                         yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
                         proxy_response.finish_stream_request_exception(

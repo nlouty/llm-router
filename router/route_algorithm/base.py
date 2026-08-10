@@ -14,6 +14,7 @@ class ServerSelectionContext:
     method: str
     is_stream: bool
     body: bytes
+    headers: dict | None = None
     origin_model_name: str | None = None
     auto_model_selection: bool = False
     prefix_cache: float = 0.0

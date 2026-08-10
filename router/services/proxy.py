@@ -140,6 +140,7 @@ class ProxyService:
             path,
             django_request.method,
             auto_model_selection,
+            headers,
         )
         should_record_model_choice = self.auto_router.should_record_model_choice(
             parsed,
@@ -181,7 +182,7 @@ class ProxyService:
         # and select a server by least-connection (random among least-loaded).
         # The request body is forwarded unchanged (no max_tokens / model rewrite).
         context = self._selection_context(
-            record, ip_id, model, parsed, path, django_request.method, False
+            record, ip_id, model, parsed, path, django_request.method, False, headers
         )
         context.router_result = path.rstrip("/")
         candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
@@ -203,7 +204,7 @@ class ProxyService:
         # Non-chat, non-embeddings endpoints (e.g. /v1/models): no auto-routing;
         # record the endpoint path as the router_result.
         context = self._selection_context(
-            record, ip_id, model, parsed, path, django_request.method, False
+            record, ip_id, model, parsed, path, django_request.method, False, headers
         )
         context.router_result = path.rstrip("/")
         candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
@@ -237,6 +238,7 @@ class ProxyService:
         path: str,
         method: str,
         auto_model_selection: bool,
+        headers: dict | None = None,
     ) -> ServerSelectionContext:
         return ServerSelectionContext(
             request_id=record.id,
@@ -247,6 +249,7 @@ class ProxyService:
             method=method,
             is_stream=parsed.stream,
             body=parsed.body,
+            headers=headers,
             origin_model_name=parsed.model_name,
             auto_model_selection=auto_model_selection,
         )
@@ -290,6 +293,7 @@ class ProxyService:
             "reason": reason,
             "model": model.model_name if model else None,
         }, ensure_ascii=False))
+        proxy_logging.log_request_context_for(context)
         proxy_response.finish_no_candidates(record, reason, context, model)
         self._maybe_delay_opencode_failure(user_agent, 502)
         return HttpResponse(
@@ -752,6 +756,7 @@ class ProxyService:
         return _RouteAttemptResult(should_retry=retry)
 
     def _retry_failure_response(self, record, state: _RetryState, served_as_vip, model, user_agent, context):
+        proxy_logging.log_request_context_for(context)
         final_server_id = state.last_server.id if state.last_server else None
         proxy_logging.maybe_log_multi_server_route(
             record.id,
@@ -843,6 +848,7 @@ class ProxyService:
                 for chunk in upstream.iter_content(chunk_size=8192):
                     if time.monotonic() > deadline:
                         self._mark_unhealthy(server)
+                        proxy_logging.log_request_context_for(context)
                         yield timeout_sse_event()
                         proxy_response.finish_stream_total_timeout(
                             record,
@@ -877,6 +883,7 @@ class ProxyService:
                     ttft,
                 )
             except requests.exceptions.ReadTimeout:
+                proxy_logging.log_request_context_for(context)
                 self._mark_unhealthy(server)
                 yield timeout_sse_event()
                 proxy_response.finish_stream_read_timeout(
@@ -887,6 +894,7 @@ class ProxyService:
                     context,
                 )
             except requests.RequestException:
+                proxy_logging.log_request_context_for(context)
                 message = "502 Bad Gateway"
                 payload = error_payload(message, "server_error")
                 yield f"data: {json.dumps(payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
