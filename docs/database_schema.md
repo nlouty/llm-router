@@ -173,7 +173,7 @@ CREATE INDEX servers_online_model_idx
 
 `vip` and `vip_cooldown` are router-managed. The router promotes and demotes servers automatically based on VIP request load.
 
-`context_window` is an optional per-server context-window ceiling. It is not used to pre-filter candidate servers. When an upstream rejects a request with an overflow error whose message contains this value, the router retries on a larger-window server of the same model (or, for auto-selected models, the long-context `router.fallback_model`). `NULL` means unlimited.
+`context_window` is an optional per-server context-window ceiling. It is not used to pre-filter candidate servers. When an upstream rejects a request with an overflow error whose message contains this value, the router retries on a larger-window server of the same model. The router never switches to a different model on overflow. `NULL` means unlimited.
 
 `weight` is the server's capacity multiplier (default 1). Server selection compares normalized load `workload / weight`, so a server with weight 3 is chosen over a weight-1 server as long as its own workload is below three times the other's. VIP channel candidates are restricted to weight-1 servers.
 

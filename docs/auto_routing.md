@@ -37,7 +37,7 @@ router:
   auto_concurrent_limit: 6
 ```
 
-- `fallback_model` is used when the routing LLM cannot produce a unique complexity target, and for context-overflow retry from an auto-selected model.
+- `fallback_model` is used when the routing LLM cannot produce a unique complexity target.
 - `system_prompt_path` points to the classifier prompt. If it cannot be read, a built-in compact JSON classifier prompt is used.
 - `auto_concurrent_limit` is the admission-control limit base for requests whose input model is exactly `auto`.
 
@@ -142,14 +142,11 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
     Normal server selection then runs with the configured chooser. The default `PrefixCachePrebleServerChooser` chooses among candidate servers for the selected model, records `prefix_cache` and `last_match`, and caches successful responses.
 
-## Context-Overflow Fallback
+## Context-Overflow Handling
 
-The router does not pre-filter servers by an estimated request size. A request is sent to the selected server and, if that server rejects it for exceeding its context window (HTTP 400 whose error body contains the server's own `servers.context_window` value), the router retries:
+The router does not pre-filter servers by an estimated request size. A request is sent to the selected server and, if that server rejects it for exceeding its context window (HTTP 400 whose error body contains the server's own `servers.context_window` value), the router retries on a server of the **same model** whose `servers.context_window` is strictly larger (a `NULL` context window is treated as unlimited). The chooser skips servers already attempted for this request.
 
-1. First on a server of the **same model** whose `servers.context_window` is strictly larger (a `NULL` context window is treated as unlimited). The chooser skips servers already attempted for this request.
-2. Only when no larger-window same-model server exists does it fall back to `router.fallback_model`.
-
-Step 2 only applies to true auto selection. Explicit concrete model requests retry on larger-window same-model servers (step 1) but do not switch to the fallback model.
+The router never switches to a different model on a context overflow (issue #224). If no larger-window same-model server exists, the original upstream overflow error is returned to the client.
 
 ## Request Records
 
