@@ -21,6 +21,7 @@ from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.circuit_breaker import CircuitBreakerService
 from router.services.disconnect import DisconnectWatcher
 from router.services.opencode import OpencodeVersionService
+from router.services.parser import ParsedRequest
 from router.services import proxy_logging, proxy_response
 from router.services.request_logger import append_verbose_request_log
 from router.services.vip_channel import VIPChannelService
@@ -112,6 +113,13 @@ class ProxyService:
                 "is_vip_channel": is_vip_channel,
                 "user_ip_id": user_ip_id,
             }, ensure_ascii=False))
+            if isinstance(parsed, ParsedRequest):
+                append_request_log(record.id, json.dumps({
+                    "event": "tokenizer_count",
+                    "request_id": record.id,
+                    "tokens": parsed.estimated_full_body_tokens,
+                    "latency_ms": parsed.tokenizer_latency_ms,
+                }, ensure_ascii=False))
             if normalized == "chat/completions":
                 return self._forward_chat(
                     django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip

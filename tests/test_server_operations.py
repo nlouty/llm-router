@@ -101,3 +101,46 @@ def test_add_server_partial_failure():
     
     assert ServerOperation.objects.filter(status="success").count() == 1
     assert ServerOperation.objects.filter(status="failed").count() == 1
+
+
+def test_add_server_with_model_path():
+    client = Client()
+    payload = {
+        "base_url": "http://test-server/v1",
+        "model_name": "gpt-3.5-turbo",
+        "model_path": "/models/gpt-3.5-turbo",
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "gpt-3.5-turbo"}]}
+        mock_get.return_value = mock_resp
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["model_path"] == "/models/gpt-3.5-turbo"
+    model = Model.objects.get(model_name="gpt-3.5-turbo")
+    assert model.model_path == "/models/gpt-3.5-turbo"
+
+
+def test_add_server_updates_existing_model_path():
+    Model.objects.create(model_name="m1")
+    client = Client()
+    payload = {
+        "base_url": "http://s1/v1",
+        "model_name": "m1",
+        "model_path": "/models/m1",
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+        mock_get.return_value = mock_resp
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    assert Model.objects.get(model_name="m1").model_path == "/models/m1"

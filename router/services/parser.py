@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
-from router.utils.token_count import fast_estimate_tokens
+from router.repositories.models import ModelRepository
+from router.utils.tokenizer_count import count_tokens_with_latency
 
 
 @dataclass
@@ -15,6 +16,7 @@ class ParsedRequest:
     max_tokens: int | None
     is_json: bool
     estimated_full_body_tokens: int = 0
+    tokenizer_latency_ms: int = 0
 
 
 class RequestParser:
@@ -28,13 +30,7 @@ class RequestParser:
             body_str = body.decode("utf-8")
             data = json.loads(body_str)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            # For non-JSON or decode error, estimate from raw body if it's text-like
-            est_tokens = 0
-            try:
-                est_tokens = fast_estimate_tokens(body.decode("utf-8"))
-            except Exception:
-                pass
-            return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=False, estimated_full_body_tokens=est_tokens)
+            return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=False)
 
         if not isinstance(data, dict):
             return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=True)
@@ -60,16 +56,21 @@ class RequestParser:
 
         max_tokens = self._safe_int(data.get("max_tokens"))
 
-        estimated_full_body_tokens = fast_estimate_tokens(body_str)
+        model_name = data.get("model") if isinstance(data.get("model"), str) else None
+        model_path = ModelRepository.get_model_path(model_name)
+        estimated_full_body_tokens, tokenizer_latency_ms = count_tokens_with_latency(
+            model_path, body_str
+        )
 
         new_body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return ParsedRequest(
             body=new_body,
-            model_name=data.get("model") if isinstance(data.get("model"), str) else None,
+            model_name=model_name,
             stream=stream,
             max_tokens=max_tokens,
             is_json=True,
             estimated_full_body_tokens=estimated_full_body_tokens,
+            tokenizer_latency_ms=tokenizer_latency_ms,
         )
 
     @staticmethod
