@@ -48,9 +48,9 @@ class AutoRouteAlgorithm:
         is_vip_channel: bool,
         auto_model_selection: bool,
     ) -> bool:
-        return auto_model_selection or (
-            not is_vip_channel and self.should_route_small_request(parsed)
-        )
+        # Model-choice timing covers small-request routing and true auto
+        # selection; both run only for auto requests (issue #227).
+        return auto_model_selection
 
     def resolve(
         self,
@@ -131,7 +131,13 @@ class AutoRouteAlgorithm:
         is_vip_channel: bool,
         origin_model_name: str | None,
     ):
-        if is_vip_channel or not self.should_route_small_request(parsed):
+        # Small-request routing only applies to auto requests (issue #227);
+        # explicit model requests are never rewritten to the routing model.
+        if (
+            is_vip_channel
+            or not context.auto_model_selection
+            or not self.should_route_small_request(parsed)
+        ):
             return model, None
 
         routing_model = self._get_small_request_routing_model()

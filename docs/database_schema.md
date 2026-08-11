@@ -120,7 +120,7 @@ ALTER TABLE models ADD COLUMN model_path VARCHAR(500) NULL;
 
 `deprecation` is admin-managed. If it is not `NULL`, the router returns HTTP 400 with this value as the error message. This block applies to the normal port only; VIP-port requests for a concrete model are still served from that model's own servers. Deprecation does not affect auto-routing target eligibility: a deprecated model with `complexity_min`/`complexity_max` set can still serve `auto` requests.
 
-`is_routing_model` marks models that can receive internal complexity-classification requests and normal-port small-request routing.
+`is_routing_model` marks models that can receive internal complexity-classification requests and normal-port small-request routing (which applies to auto requests only).
 
 `auto` controls auto-routing entry, not target eligibility. Exact `model: auto` requests enter auto routing case-insensitively. On the normal port, requests for a concrete model with `auto = TRUE` also enter auto routing. On the VIP port, concrete model requests keep the requested model.
 
@@ -205,7 +205,7 @@ ALTER TABLE requests ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
 
 `router_result` stores auto-routing and small-request-routing decisions, prefixed by the originally requested model name. Examples: `auto:complexity:7`, `AUTO:cache_hit`, `source-model:small_request_routing`, `auto:routing_failed:missing_routing_server:no available routing server`.
 
-`estimate_tokens` stores the token count from the original request body — a real tokenizer count via the model's `model_path`, or 0 when no path is set or tokenization fails. It is used for small-request routing (only when the count is between 1 and the limit; a 0 count is never routed to the small-request model) and VIP scale-down; it is not used to pre-filter candidate servers (server context-window handling is reactionary).
+`estimate_tokens` stores the token count from the original request body — a real tokenizer count via the model's `model_path`, or 0 when no path is set or tokenization fails. It is used for small-request routing (auto requests only, and only when the count is between 1 and the limit; a 0 count is never routed to the small-request model) and VIP scale-down; it is not used to pre-filter candidate servers (server context-window handling is reactionary).
 
 `model_choosing_latency` stores elapsed milliseconds for model choosing when the request uses true auto selection or small-request routing.
 

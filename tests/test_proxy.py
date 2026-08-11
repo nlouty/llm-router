@@ -1341,7 +1341,7 @@ def test_routing_payload_requests_structured_output(monkeypatch):
 
 
 def test_small_counted_request_uses_routing_model_before_complexity(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1422,7 +1422,7 @@ def test_auto_route_without_routing_model_uses_fallback_and_records_router_resul
 
 
 def test_small_counted_request_uses_routing_model_directly(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1476,18 +1476,21 @@ def test_update_body_model_can_disable_thinking():
     assert data["chat_template_kwargs"] == {"tokenize": False, "enable_thinking": False}
 
 
-def test_small_non_auto_request_uses_routing_server_and_disables_thinking(monkeypatch):
+def test_small_non_auto_request_stays_on_requested_model(monkeypatch):
     user_model = Model.objects.create(model_name="user-model")
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=user_model.id, base_url="http://user.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("routing LLM should not be called for non-auto requests")
+
     def fake_request(self_inner, method, url, **kwargs):
         assert method == "POST"
-        assert url == "http://router.example/chat/completions"
+        assert url == "http://user.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
-        assert data["model"] == "router-model"
-        assert data["chat_template_kwargs"] == {"enable_thinking": False}
+        assert data["model"] == "user-model"
+        assert "chat_template_kwargs" not in data
         upstream = MagicMock()
         upstream.status_code = 200
         upstream.reason = "OK"
@@ -1495,6 +1498,7 @@ def test_small_non_auto_request_uses_routing_server_and_disables_thinking(monkey
         upstream.headers = {}
         return upstream
 
+    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1522,6 +1526,9 @@ def test_small_non_auto_request_uses_routing_server_and_disables_thinking(monkey
     )
 
     assert response.status_code == 200
+    record = _external_request_record()
+    assert record.model_id == user_model.id
+    assert record.router_result is None
 
 
 def test_three_thousand_token_non_auto_request_skips_unneeded_routing(monkeypatch):
@@ -1687,7 +1694,7 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
 
 
 def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1768,7 +1775,7 @@ def test_auto_route_without_routing_server_uses_fallback_and_records_router_resu
 
 
 def test_small_counted_request_succeeds_with_routing_server(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 

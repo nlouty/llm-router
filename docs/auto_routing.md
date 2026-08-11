@@ -54,7 +54,7 @@ Auto selection does not start for concrete model requests on the VIP port. Unkno
 
 ## Selection Sequence
 
-For each accepted proxy request, the router creates a `requests` row in `processing` state, then starts model-choice timing when the request is eligible for true auto selection or small-request routing.
+For each accepted proxy request, the router creates a `requests` row in `processing` state, then starts model-choice timing when the request is an auto request (eligible for true auto selection or small-request routing).
 
 1. Record the original model name.
 
@@ -62,7 +62,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
 2. Try small-request routing.
 
-   This step runs first for normal-port requests whose estimated full body token count is below `3000`.
+   This step runs first for auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port whose token count is known and between `1` and `3000`. A 0 count (counting failed or no `model_path`) is never small-routed, and explicit (non-auto) model requests are never rewritten to the routing model.
 
    The router scans `models.is_routing_model = TRUE` rows by ascending `id` and asks for non-VIP servers for each routing model. Candidate servers must be online, routable by circuit-breaker state, not soft-deleted, and have `context_window IS NULL OR context_window >= estimate_tokens`.
 
