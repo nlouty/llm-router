@@ -84,6 +84,7 @@ class Model(models.Model):
     complexity_min = models.IntegerField(blank=True, null=True)
     complexity_max = models.IntegerField(blank=True, null=True)
     multimodal = models.BooleanField(default=False)
+    model_path = models.CharField(max_length=500, blank=True, null=True)
 
     class Meta:
         managed = False

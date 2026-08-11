@@ -1,6 +1,17 @@
 import json
 
+import pytest
+
+from router.models import Model
 from router.services.parser import RequestParser
+from router.utils import tokenizer_count
+
+
+class _FakeTokenizer:
+    is_fast = True
+
+    def encode(self, text, add_special_tokens=True):
+        return [1] * len(text)
 
 
 def test_parser_injects_stream_options_and_default_max_tokens():
@@ -9,9 +20,20 @@ def test_parser_injects_stream_options_and_default_max_tokens():
     assert parsed.model_name == "m1"
     assert parsed.stream is True
     assert parsed.max_tokens == 8528
-    assert parsed.estimated_full_body_tokens > 0
+    # No model_path configured for m1: counting degrades to 0.
+    assert parsed.estimated_full_body_tokens == 0
+    assert parsed.tokenizer_latency_ms == 0
     assert data["stream_options"] == {"include_usage": True}
     assert data["max_tokens"] == 8528
+
+
+@pytest.mark.django_db
+def test_parser_counts_with_tokenizer_when_model_path_set(monkeypatch):
+    Model.objects.create(model_name="m1", model_path="/tmp/fake-path")
+    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
+    parsed = RequestParser().parse(b'{"model":"m1","messages":[{"role":"user","content":"hi"}]}')
+    assert parsed.estimated_full_body_tokens > 0
+    assert parsed.tokenizer_latency_ms >= 0
 
 
 def test_parser_leaves_non_json_unchanged():

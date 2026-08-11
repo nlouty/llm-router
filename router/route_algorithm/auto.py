@@ -14,6 +14,7 @@ from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import LeastConnectionServerChooser
 from router.services import proxy_logging, proxy_response
+from router.utils.tokenizer_count import count_tokens_with_latency
 
 
 @dataclass
@@ -110,6 +111,15 @@ class AutoRouteAlgorithm:
         prefixed = self._router_result_with_origin(origin_model_name, router_result)
         if model:
             self._apply_resolved_model(parsed, record, context, model, prefixed)
+            # The auto request was counted before any target was known (0); now
+            # that a target model is resolved, count with its tokenizer.
+            if getattr(model, "model_path", None):
+                count, _ = count_tokens_with_latency(
+                    model.model_path,
+                    parsed.body.decode("utf-8", errors="replace"),
+                )
+                record.estimate_tokens = count
+                record.save(update_fields=["estimate_tokens"])
         return model, prefixed
 
     def _resolve_small_request_routing_model(
@@ -140,10 +150,10 @@ class AutoRouteAlgorithm:
         return routing_model, prefixed
 
     def should_route_small_request(self, parsed) -> bool:
-        return (
-            int(parsed.estimated_full_body_tokens or 0)
-            < self.SMALL_REQUEST_ROUTING_TOKEN_LIMIT
-        )
+        estimated = int(parsed.estimated_full_body_tokens or 0)
+        # 0 means counting failed or no model_path: never send those requests to
+        # the small-request routing model (issue #227).
+        return 0 < estimated < self.SMALL_REQUEST_ROUTING_TOKEN_LIMIT
 
     @staticmethod
     def _get_small_request_routing_model():

@@ -55,6 +55,8 @@ def api_test_tables(django_db_setup, django_db_blocker):
                 schema_editor.add_field(Model, Model._meta.get_field("complexity_max"))
             if Model._meta.db_table in connection.introspection.table_names() and not has_column("models", "multimodal"):
                 schema_editor.add_field(Model, Model._meta.get_field("multimodal"))
+            if Model._meta.db_table in connection.introspection.table_names() and not has_column("models", "model_path"):
+                schema_editor.add_field(Model, Model._meta.get_field("model_path"))
             if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "router_result"):
                 schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("router_result"))
             if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "estimate_tokens"):

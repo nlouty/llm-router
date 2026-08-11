@@ -12,6 +12,26 @@ from router.route_algorithm.base import ServerSelectionContext
 from router.repositories.requests import LLM_CHOOSING_IP_ID
 from router.services.admission import AdmissionResult
 from router.services.proxy import ProxyService
+from router.utils import tokenizer_count
+
+
+class _FakeTokenizer:
+    """Duck-typed fast tokenizer: one token per character (small counts)."""
+
+    is_fast = True
+
+    def encode(self, text, add_special_tokens=True):
+        return [1] * len(text)
+
+
+def test_zero_token_count_is_not_small_request_routed():
+    # Issue #227: requests whose count failed (0) must never be sent to the
+    # small-request routing model; only a known small count routes there.
+    router = AutoRouteAlgorithm()
+    assert router.should_route_small_request(MagicMock(estimated_full_body_tokens=0)) is False
+    assert router.should_route_small_request(MagicMock(estimated_full_body_tokens=1)) is True
+    assert router.should_route_small_request(MagicMock(estimated_full_body_tokens=2999)) is True
+    assert router.should_route_small_request(MagicMock(estimated_full_body_tokens=3000)) is False
 
 
 def test_v1_models_routes_to_random_online_server_without_model_id(monkeypatch):
@@ -1320,14 +1340,13 @@ def test_routing_payload_requests_structured_output(monkeypatch):
     assert schema["additionalProperties"] is False
 
 
-def test_small_auto_request_uses_routing_model_before_complexity(monkeypatch):
-    target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
+def test_small_counted_request_uses_routing_model_before_complexity(monkeypatch):
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small auto requests")
+        raise AssertionError("routing LLM should not be called for small requests")
 
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
@@ -1347,10 +1366,11 @@ def test_small_auto_request_uses_routing_model_before_complexity(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
+    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),
         content_type="application/json",
     )
 
@@ -1358,7 +1378,7 @@ def test_small_auto_request_uses_routing_model_before_complexity(monkeypatch):
     record = _external_request_record()
     assert record.model_id == routing_model.id
     assert record.task_status == "success"
-    assert record.router_result == "auto:small_request_routing"
+    assert record.router_result == "user-model:small_request_routing"
 
 
 def test_auto_route_without_routing_model_uses_fallback_and_records_router_result(monkeypatch):
@@ -1401,14 +1421,13 @@ def test_auto_route_without_routing_model_uses_fallback_and_records_router_resul
     )
 
 
-def test_small_auto_request_uses_routing_model_directly(monkeypatch):
-    target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
+def test_small_counted_request_uses_routing_model_directly(monkeypatch):
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small auto requests")
+        raise AssertionError("routing LLM should not be called for small requests")
 
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
@@ -1427,10 +1446,11 @@ def test_small_auto_request_uses_routing_model_directly(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
+    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),
         content_type="application/json",
     )
 
@@ -1438,7 +1458,7 @@ def test_small_auto_request_uses_routing_model_directly(monkeypatch):
     record = _external_request_record()
     assert record.model_id == routing_model.id
     assert record.task_status == "success"
-    assert record.router_result == "auto:small_request_routing"
+    assert record.router_result == "user-model:small_request_routing"
 
 
 def test_update_body_model_can_disable_thinking():
@@ -1666,14 +1686,13 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
     assert record.model_choosing_latency == 125
 
 
-def test_small_auto_request_routes_directly_to_routing_server(monkeypatch):
-    target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
+def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small auto requests")
+        raise AssertionError("routing LLM should not be called for small requests")
 
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
@@ -1692,10 +1711,11 @@ def test_small_auto_request_routes_directly_to_routing_server(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
+    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),
         content_type="application/json",
     )
 
@@ -1703,7 +1723,7 @@ def test_small_auto_request_routes_directly_to_routing_server(monkeypatch):
     record = _external_request_record()
     assert record.model_id == routing_model.id
     assert record.task_status == "success"
-    assert record.router_result == "auto:small_request_routing"
+    assert record.router_result == "user-model:small_request_routing"
 
 
 def test_auto_route_without_routing_server_uses_fallback_and_records_router_result(monkeypatch):
@@ -1747,14 +1767,13 @@ def test_auto_route_without_routing_server_uses_fallback_and_records_router_resu
     )
 
 
-def test_small_auto_request_succeeds_with_routing_server(monkeypatch):
-    target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
+def test_small_counted_request_succeeds_with_routing_server(monkeypatch):
+    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small auto requests")
+        raise AssertionError("routing LLM should not be called for small requests")
 
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
@@ -1773,10 +1792,11 @@ def test_small_auto_request_succeeds_with_routing_server(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
+    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "messages": [{"role": "user", "content": "hello"}]}),
+        data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),
         content_type="application/json",
     )
 
@@ -1786,7 +1806,7 @@ def test_small_auto_request_succeeds_with_routing_server(monkeypatch):
     record = RequestRecord.objects.get()
     assert record.model_id == routing_model.id
     assert record.task_status == "success"
-    assert record.router_result == "auto:small_request_routing"
+    assert record.router_result == "user-model:small_request_routing"
 
 
 def test_deprecated_model_blocks_normal_user_but_serves_vip(monkeypatch):

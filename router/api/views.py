@@ -682,6 +682,7 @@ def _process_add_server_item(data, now):
     model_name = data.get("model_name", "").strip()
     role = (data.get("role") or "mixed").strip()
     group_id = (data.get("group_id") or "").strip() or None
+    model_path = (data.get("model_path") or "").strip() or None
     operation = _create_add_server_operation(data, now)
 
     validation_failure = _add_server_validation_failure(base_url, model_name, role, group_id)
@@ -693,7 +694,7 @@ def _process_add_server_item(data, now):
     if verify_error:
         return _fail_add_server_operation(operation, verify_error, base_url)
 
-    return _create_add_server_success(operation, base_url, model_name, role, group_id)
+    return _create_add_server_success(operation, base_url, model_name, role, group_id, model_path)
 
 
 def _create_add_server_operation(data, now):
@@ -748,8 +749,14 @@ def _fail_add_server_operation(operation, message: str, base_url: str | None = N
     return result
 
 
-def _create_add_server_success(operation, base_url: str, model_name: str, role: str = "mixed", group_id: str | None = None):
-    model_obj, _ = Model.objects.get_or_create(model_name=model_name)
+def _create_add_server_success(operation, base_url: str, model_name: str, role: str = "mixed", group_id: str | None = None, model_path: str | None = None):
+    model_obj, _ = Model.objects.get_or_create(
+        model_name=model_name,
+        defaults={"model_path": model_path},
+    )
+    if model_path and model_obj.model_path != model_path:
+        model_obj.model_path = model_path
+        model_obj.save(update_fields=["model_path"])
     server = Server.objects.create(
         model_id=model_obj.id,
         base_url=base_url,
@@ -767,6 +774,7 @@ def _create_add_server_success(operation, base_url: str, model_name: str, role: 
         "model_name": model_name,
         "role": role,
         "group_id": group_id,
+        "model_path": model_path,
     }
     operation.updated_at = timezone.now()
     operation.save()

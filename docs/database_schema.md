@@ -113,6 +113,7 @@ ALTER TABLE models ADD COLUMN auto BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE models ADD COLUMN complexity_min INTEGER NULL;
 ALTER TABLE models ADD COLUMN complexity_max INTEGER NULL;
 ALTER TABLE models ADD COLUMN multimodal BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE models ADD COLUMN model_path VARCHAR(500) NULL;
 ```
 
 `vip` is admin-managed. Set it to a positive integer to enable VIP routing for that model. The value is the per-active-VIP-server workload threshold above which the router promotes another normal server into the VIP pool. `NULL` or `0` disables VIP routing for the model.
@@ -126,6 +127,8 @@ ALTER TABLE models ADD COLUMN multimodal BOOLEAN NOT NULL DEFAULT FALSE;
 `complexity_min` and `complexity_max` are text auto-routing target bounds. Both must be non-NULL, between 1 and 10, and `complexity_min <= complexity_max`. A returned complexity score must match exactly one target model; otherwise the router uses `router.fallback_model` where applicable and records the reason in `requests.router_result`.
 
 `multimodal` marks the model as eligible for auto-routed requests that contain `image_url` chat parts.
+
+`model_path` is admin-managed and locates the underlying model artifact for tokenizer counting: a local directory or a Hugging Face repo id passed to `AutoTokenizer.from_pretrained`. The router uses it to count request tokens with the real tokenizer; `NULL` disables real counting for that model (the router records 0). It is set via `/api/add_server`.
 
 ## `servers` Table
 
@@ -202,7 +205,7 @@ ALTER TABLE requests ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
 
 `router_result` stores auto-routing and small-request-routing decisions, prefixed by the originally requested model name. Examples: `auto:complexity:7`, `AUTO:cache_hit`, `source-model:small_request_routing`, `auto:routing_failed:missing_routing_server:no available routing server`.
 
-`estimate_tokens` stores the fast token estimate from the original request body. It is used for small-request routing and VIP scale-down; it is not used to pre-filter candidate servers (server context-window handling is reactionary).
+`estimate_tokens` stores the token count from the original request body — a real tokenizer count via the model's `model_path`, or 0 when no path is set or tokenization fails. It is used for small-request routing (only when the count is between 1 and the limit; a 0 count is never routed to the small-request model) and VIP scale-down; it is not used to pre-filter candidate servers (server context-window handling is reactionary).
 
 `model_choosing_latency` stores elapsed milliseconds for model choosing when the request uses true auto selection or small-request routing.
 
