@@ -315,7 +315,12 @@ class RequestRepository:
     def count_distinct_ips(start: datetime, end: datetime) -> int:
         return (
             RequestRepository.external_requests()
-            .filter(send_time__gte=start, send_time__lte=end, ip_id__isnull=False)
+            .filter(
+                send_time__gte=start,
+                send_time__lte=end,
+                ip_id__isnull=False,
+                task_status="success",
+            )
             .values("ip_id")
             .distinct()
             .count()
