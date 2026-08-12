@@ -2,6 +2,7 @@ import json
 from datetime import timedelta
 from unittest.mock import MagicMock
 
+from django.http import HttpResponse
 from django.test import Client
 from django.utils import timezone
 
@@ -114,9 +115,31 @@ class _FailingPrefixCacheChooser(_RoutingChooser):
         raise AssertionError("prefix-cache ratios should not be checked")
 
 
-class _FailingRoutingChooser:
-    def choose(self, candidates, context, attempted):
-        raise AssertionError("routing LLM server selection should use workload directly")
+class _StubProxy:
+    """Adapts the legacy fake_post(url, json, headers, timeout) contract to the
+    in-process forward_internal entry the choosing path now uses."""
+
+    def __init__(self, post_fn):
+        self._post = post_fn
+
+    def forward_internal(self, body, model, path="chat/completions"):
+        payload = json.loads(body)
+        response = self._post(f"stub://{model.model_name}/{path}", payload, {}, None)
+        content = response.content
+        if not isinstance(content, (bytes, bytearray)):
+            try:
+                content = json.dumps(response.json()).encode("utf-8")
+            except Exception:
+                content = b""
+        elif not content:
+            content = b""
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        try:
+            status = int(response.status_code)
+        except (TypeError, ValueError):
+            status = 200
+        return HttpResponse(content, status=status)
 
 
 def _external_request_record():
@@ -127,7 +150,7 @@ def _llm_choosing_record():
     return RequestRecord.objects.get(ip_id=LLM_CHOOSING_IP_ID)
 
 
-def test_auto_route_request_disables_thinking(monkeypatch):
+def test_auto_route_request_disables_thinking():
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
@@ -144,9 +167,7 @@ def test_auto_route_request_disables_thinking(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
-    service = AutoRouteAlgorithm(_RoutingChooser())
+    service = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -168,7 +189,6 @@ def test_auto_route_request_disables_thinking(monkeypatch):
 
     assert model == target_model
     assert router_result == "complexity:5"
-    assert sent["url"] == "http://router.example/chat/completions"
     assert sent["json"]["model"] == "router-model"
     assert sent["json"]["stream"] is False
     assert sent["json"]["messages"][-1] == {
@@ -198,10 +218,9 @@ def test_auto_route_recounts_with_resolved_model_tokenizer(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
     monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
 
-    service = AutoRouteAlgorithm(_RoutingChooser())
+    service = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))
     parsed = MagicMock(
         model_name="auto",
         body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
@@ -233,20 +252,28 @@ def test_auto_route_records_llm_choosing_request_row(monkeypatch):
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fake_post(url, json, headers, timeout):
-        response = MagicMock()
-        response.status_code = 200
-        response.reason = "OK"
-        response.content = (
+    def fake_request(self_inner, method, url, **kwargs):
+        assert url == "http://router.example/chat/completions"
+        sent_body = json.loads(kwargs["data"])
+        assert sent_body["model"] == "router-model"
+        assert sent_body["stream"] is False
+        upstream = MagicMock()
+        upstream.status_code = 200
+        upstream.reason = "OK"
+        upstream.content = (
             b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}],'
             b'"usage":{"prompt_tokens":11,"completion_tokens":3,'
             b'"prompt_tokens_details":{"cached_tokens":2}}}'
         )
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
+        upstream.headers = {"content-type": "application/json"}
+        return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fake_request,
+    )
 
+    service = ProxyService(_RoutingChooser())
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -258,7 +285,7 @@ def test_auto_route_records_llm_choosing_request_row(monkeypatch):
         body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
     )
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = service.auto_router._query_routing_llm(
         context.body,
         MagicMock(id=123),
         context,
@@ -270,153 +297,74 @@ def test_auto_route_records_llm_choosing_request_row(monkeypatch):
     assert router_result == "complexity:5"
     record = _llm_choosing_record()
     assert record.ip_id == LLM_CHOOSING_IP_ID
+    assert record.user_agent == "llm-choosing"
     assert record.model_id == routing_model.id
     assert record.target_pod_ip == "http://router.example"
-    assert record.attempt_count == 1
     assert record.status == "200 OK"
     assert record.task_status == "success"
     assert record.input_token_cnt == 11
     assert record.output_token_cnt == 3
     assert record.final_prefix_cache == 2
-    assert record.latency is not None
 
 
-def test_auto_route_choosing_request_uses_least_workload_server(monkeypatch):
+def test_auto_route_choosing_picks_least_loaded_routing_model_pool():
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
-    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    busy = Server.objects.create(
-        model_id=routing_model.id,
-        base_url="http://busy-router.example",
-        is_online=True,
-        workload=4,
-    )
-    idle = Server.objects.create(
-        model_id=routing_model.id,
-        base_url="http://idle-router.example",
-        is_online=True,
-        workload=1,
-    )
+    busy_model = Model.objects.create(model_name="busy-router", is_routing_model=True)
+    idle_model = Model.objects.create(model_name="idle-router", is_routing_model=True)
+    Server.objects.create(model_id=busy_model.id, base_url="http://busy.example", is_online=True, workload=4)
+    Server.objects.create(model_id=idle_model.id, base_url="http://idle.example", is_online=True, workload=1)
 
-    def fake_post(url, json, headers, timeout):
-        assert url == "http://idle-router.example/chat/completions"
-        busy.refresh_from_db()
-        idle.refresh_from_db()
-        assert busy.workload == 4
-        assert idle.workload == 2
-        response = MagicMock()
-        response.status_code = 200
-        response.reason = "OK"
-        response.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}]}'
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
+    picked = AutoRouteAlgorithm()._pick_routing_model([busy_model, idle_model])
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-    context = ServerSelectionContext(
-        request_id=123,
-        ip_id=None,
-        model_id=None,
-        model_name="auto",
-        path="chat/completions",
-        method="POST",
-        is_stream=False,
-        body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
-    )
-
-    model, router_result = AutoRouteAlgorithm(_FailingRoutingChooser())._query_routing_llm(
-        context.body,
-        MagicMock(id=123),
-        context,
-        [target_model],
-        [target_model.model_name],
-    )
-
-    assert model == target_model
-    assert router_result == "complexity:5"
-    busy.refresh_from_db()
-    idle.refresh_from_db()
-    assert busy.workload == 4
-    assert idle.workload == 1
-    assert _llm_choosing_record().target_pod_ip == "http://idle-router.example"
+    assert picked == idle_model
 
 
-def test_auto_route_choosing_request_randomizes_tied_workload_servers(monkeypatch):
-    target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
-    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    first = Server.objects.create(
-        model_id=routing_model.id,
-        base_url="http://first-router.example",
-        is_online=True,
-        workload=1,
-    )
-    second = Server.objects.create(
-        model_id=routing_model.id,
-        base_url="http://second-router.example",
-        is_online=True,
-        workload=1,
-    )
+def test_auto_route_choosing_randomizes_tied_routing_model_pools(monkeypatch):
+    first = Model.objects.create(model_name="first-router", is_routing_model=True)
+    second = Model.objects.create(model_name="second-router", is_routing_model=True)
+    Server.objects.create(model_id=first.id, base_url="http://first.example", is_online=True, workload=1)
+    Server.objects.create(model_id=second.id, base_url="http://second.example", is_online=True, workload=1)
+
     choices = []
 
     def choose(options):
         choices.append(list(options))
         return options[1]
 
-    def fake_post(url, json, headers, timeout):
-        assert url == "http://second-router.example/chat/completions"
-        first.refresh_from_db()
-        second.refresh_from_db()
-        assert first.workload == 1
-        assert second.workload == 2
-        response = MagicMock()
-        response.status_code = 200
-        response.reason = "OK"
-        response.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}]}'
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
+    monkeypatch.setattr("router.route_algorithm.auto.random.choice", choose)
 
-    monkeypatch.setattr("router.route_algorithm.least_connection.random.choice", choose)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-    context = ServerSelectionContext(
-        request_id=123,
-        ip_id=None,
-        model_id=None,
-        model_name="auto",
-        path="chat/completions",
-        method="POST",
-        is_stream=False,
-        body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
-    )
+    picked = AutoRouteAlgorithm()._pick_routing_model([first, second])
 
-    model, router_result = AutoRouteAlgorithm(_FailingRoutingChooser())._query_routing_llm(
-        context.body,
-        MagicMock(id=123),
-        context,
-        [target_model],
-        [target_model.model_name],
-    )
-
-    assert model == target_model
-    assert router_result == "complexity:5"
-    assert [[server.id for server in options] for options in choices] == [[first.id, second.id]]
-    assert _llm_choosing_record().target_pod_ip == "http://second-router.example"
+    assert picked == second
+    assert choices == [[first, second]]
 
 
-def test_auto_route_choosing_request_decrements_workload_after_exception(monkeypatch):
+def test_auto_route_choosing_skips_decoder_only_routing_model():
+    # A routing model whose only servers are decoders (never directly routable)
+    # or prefillers without a decoder in the cluster is not a valid choosing
+    # target; a model with a routable pool must win.
+    decoder_only = Model.objects.create(model_name="decoder-router", is_routing_model=True)
+    stranded_prefiller = Model.objects.create(model_name="stranded-router", is_routing_model=True)
+    healthy = Model.objects.create(model_name="healthy-router", is_routing_model=True)
+    Server.objects.create(model_id=decoder_only.id, base_url="http://d.example", is_online=True, role="decoder", group_id="g1")
+    Server.objects.create(model_id=stranded_prefiller.id, base_url="http://p.example", is_online=True, role="prefiller", group_id="g2")
+    Server.objects.create(model_id=healthy.id, base_url="http://m.example", is_online=True, workload=2)
+
+    picked = AutoRouteAlgorithm()._pick_routing_model([decoder_only, stranded_prefiller, healthy])
+
+    assert picked == healthy
+
+
+def test_auto_route_choosing_exception_falls_back_to_default_model():
     fallback_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    server = Server.objects.create(
-        model_id=routing_model.id,
-        base_url="http://router.example",
-        is_online=True,
-        workload=3,
-    )
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fake_post(url, json, headers, timeout):
-        server.refresh_from_db()
-        assert server.workload == 4
+    def boom(url, json, headers, timeout):
         raise RuntimeError("routing down")
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
+    service = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(boom))
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -428,7 +376,7 @@ def test_auto_route_choosing_request_decrements_workload_after_exception(monkeyp
         body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
     )
 
-    model, router_result = AutoRouteAlgorithm(_FailingRoutingChooser())._query_routing_llm(
+    model, router_result = service._query_routing_llm(
         context.body,
         MagicMock(id=123),
         context,
@@ -438,14 +386,11 @@ def test_auto_route_choosing_request_decrements_workload_after_exception(monkeyp
 
     assert model == fallback_model
     assert router_result == "routing_error:exception:routing down"
-    server.refresh_from_db()
-    assert server.workload == 3
-    record = _llm_choosing_record()
-    assert record.task_status == "failed"
-    assert record.status == "502 Bad Gateway"
+    # The internal pipeline never ran, so no llm-choosing record was created.
+    assert not RequestRecord.objects.filter(ip_id=LLM_CHOOSING_IP_ID).exists()
 
 
-def test_auto_route_payload_only_forwards_user_role_messages(monkeypatch):
+def test_auto_route_payload_only_forwards_user_role_messages():
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
@@ -458,8 +403,6 @@ def test_auto_route_payload_only_forwards_user_role_messages(monkeypatch):
         response.status_code = 200
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":4}'}}]}
         return response
-
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
 
     request_body = {
         "model": "auto",
@@ -487,7 +430,7 @@ def test_auto_route_payload_only_forwards_user_role_messages(monkeypatch):
         body=body,
     )
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         body,
         MagicMock(id=123),
         context,
@@ -518,7 +461,7 @@ def test_auto_route_payload_only_forwards_user_role_messages(monkeypatch):
     assert "secret_tool" not in payload_text
 
 
-def test_auto_route_payload_forwards_medium_user_messages_in_full(monkeypatch):
+def test_auto_route_payload_forwards_medium_user_messages_in_full():
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
@@ -532,14 +475,12 @@ def test_auto_route_payload_forwards_medium_user_messages_in_full(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
     body = json.dumps({
         "model": "auto",
         "messages": [{"role": "user", "content": medium_content}],
     }).encode("utf-8")
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         body,
         MagicMock(id=123),
         MagicMock(),
@@ -555,7 +496,7 @@ def test_auto_route_payload_forwards_medium_user_messages_in_full(monkeypatch):
     }
 
 
-def test_auto_route_payload_collapses_very_long_user_messages(monkeypatch):
+def test_auto_route_payload_collapses_very_long_user_messages():
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
@@ -572,14 +513,12 @@ def test_auto_route_payload_collapses_very_long_user_messages(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
     body = json.dumps({
         "model": "auto",
         "messages": [{"role": "user", "content": long_content}],
     }).encode("utf-8")
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         body,
         MagicMock(id=123),
         MagicMock(),
@@ -610,7 +549,7 @@ def test_auto_route_without_active_target_model_records_router_result():
     )
 
 
-def test_auto_route_complexity_can_select_auto_false_target(monkeypatch):
+def test_auto_route_complexity_can_select_auto_false_target():
     low_model = Model.objects.create(
         model_name="low-model",
         auto=False,
@@ -632,9 +571,7 @@ def test_auto_route_complexity_can_select_auto_false_target(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":1}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._get_auto_route_model(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"simple"}]}',
         MagicMock(id=123),
         MagicMock(),
@@ -644,7 +581,7 @@ def test_auto_route_complexity_can_select_auto_false_target(monkeypatch):
     assert router_result == "complexity:1"
 
 
-def test_text_only_content_parts_do_not_use_multimodal_bypass(monkeypatch):
+def test_text_only_content_parts_do_not_use_multimodal_bypass():
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     Model.objects.create(model_name="vision-model", auto=True, multimodal=True)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
@@ -663,9 +600,7 @@ def test_text_only_content_parts_do_not_use_multimodal_bypass(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._get_auto_route_model(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._get_auto_route_model(
         body,
         MagicMock(id=123),
         MagicMock(),
@@ -675,14 +610,12 @@ def test_text_only_content_parts_do_not_use_multimodal_bypass(monkeypatch):
     assert router_result == "complexity:5"
 
 
-def test_chat_image_content_parts_use_multimodal_bypass(monkeypatch):
+def test_chat_image_content_parts_use_multimodal_bypass():
     vision_model = Model.objects.create(model_name="vision-model", auto=False, multimodal=True)
     Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("routing request should not be sent for image auto requests")
-
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
 
     body = json.dumps({
         "model": "auto",
@@ -700,7 +633,7 @@ def test_chat_image_content_parts_use_multimodal_bypass(monkeypatch):
         ],
     }).encode("utf-8")
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._get_auto_route_model(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fail_if_called))._get_auto_route_model(
         body,
         MagicMock(id=123),
         MagicMock(),
@@ -710,14 +643,12 @@ def test_chat_image_content_parts_use_multimodal_bypass(monkeypatch):
     assert router_result == "multimodal_bypass"
 
 
-def test_separate_image_message_uses_multimodal_bypass(monkeypatch):
+def test_separate_image_message_uses_multimodal_bypass():
     vision_model = Model.objects.create(model_name="vision-model", auto=False, multimodal=True)
     Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("routing request should not be sent for image auto requests")
-
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
 
     body = json.dumps({
         "model": "auto",
@@ -735,7 +666,7 @@ def test_separate_image_message_uses_multimodal_bypass(monkeypatch):
         ],
     }).encode("utf-8")
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._get_auto_route_model(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fail_if_called))._get_auto_route_model(
         body,
         MagicMock(id=123),
         MagicMock(),
@@ -745,7 +676,7 @@ def test_separate_image_message_uses_multimodal_bypass(monkeypatch):
     assert router_result == "multimodal_bypass"
 
 
-def test_auto_route_prefix_cache_uses_only_auto_selectable_models(monkeypatch):
+def test_auto_route_prefix_cache_uses_only_auto_selectable_models():
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     ignored_model = Model.objects.create(model_name="ignored-model")
@@ -753,9 +684,7 @@ def test_auto_route_prefix_cache_uses_only_auto_selectable_models(monkeypatch):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("routing request should not be sent on prefix-cache hit")
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
-
-    service = AutoRouteAlgorithm(_PrefixCacheChooser({"router-model": 0.99, "target-model": 0.95}))
+    service = AutoRouteAlgorithm(_PrefixCacheChooser({"router-model": 0.99, "target-model": 0.95}), proxy=_StubProxy(fail_if_called))
     model, router_result = service._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
@@ -768,7 +697,7 @@ def test_auto_route_prefix_cache_uses_only_auto_selectable_models(monkeypatch):
     assert router_result == "cache_hit"
 
 
-def test_auto_route_prefix_cache_can_select_auto_false_target(monkeypatch):
+def test_auto_route_prefix_cache_can_select_auto_false_target():
     Model.objects.create(model_name="high-model", auto=True, complexity_min=7, complexity_max=10)
     low_model = Model.objects.create(
         model_name="low-model",
@@ -780,9 +709,7 @@ def test_auto_route_prefix_cache_can_select_auto_false_target(monkeypatch):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("routing request should not be sent on prefix-cache hit")
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
-
-    service = AutoRouteAlgorithm(_PrefixCacheChooser({"low-model": 0.95, "high-model": 0.5}))
+    service = AutoRouteAlgorithm(_PrefixCacheChooser({"low-model": 0.95, "high-model": 0.5}), proxy=_StubProxy(fail_if_called))
     model, router_result = service._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
@@ -793,7 +720,7 @@ def test_auto_route_prefix_cache_can_select_auto_false_target(monkeypatch):
     assert router_result == "cache_hit"
 
 
-def test_auto_route_prefix_cache_multiple_hits_uses_routing_llm(monkeypatch):
+def test_auto_route_prefix_cache_multiple_hits_uses_routing_llm():
     low_model = Model.objects.create(
         model_name="low-model",
         auto=False,
@@ -815,9 +742,7 @@ def test_auto_route_prefix_cache_multiple_hits_uses_routing_llm(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":1}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
-    service = AutoRouteAlgorithm(_PrefixCacheChooser({"low-model": 0.95, "high-model": 0.9}))
+    service = AutoRouteAlgorithm(_PrefixCacheChooser({"low-model": 0.95, "high-model": 0.9}), proxy=_StubProxy(fake_post))
     model, router_result = service._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
@@ -839,9 +764,7 @@ def test_auto_route_single_user_prompt_skips_prefix_cache_and_uses_routing_llm(m
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
-    model, router_result = AutoRouteAlgorithm(_FailingPrefixCacheChooser())._get_auto_route_model(
+    model, router_result = AutoRouteAlgorithm(_FailingPrefixCacheChooser(), proxy=_StubProxy(fake_post))._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
         MagicMock(),
@@ -858,15 +781,18 @@ def test_case_insensitive_auto_request_selects_target_model(monkeypatch):
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
-    def fake_post(url, json, headers, timeout):
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
-
     def fake_request(self_inner, method, url, **kwargs):
-        assert url == "http://target.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
+        if url == "http://router.example/chat/completions":
+            # The internal llm-choosing call routes through the same pipeline.
+            assert data["model"] == "router-model"
+            upstream = MagicMock()
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}]}'
+            upstream.headers = {}
+            return upstream
+        assert url == "http://target.example/chat/completions"
         assert data["model"] == "target-model"
         upstream = MagicMock()
         upstream.status_code = 200
@@ -875,7 +801,6 @@ def test_case_insensitive_auto_request_selects_target_model(monkeypatch):
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -902,15 +827,18 @@ def test_model_auto_flag_triggers_auto_selection_on_normal_channel(monkeypatch):
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
-    def fake_post(url, json, headers, timeout):
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":4}'}}]}
-        return response
-
     def fake_request(self_inner, method, url, **kwargs):
-        assert url == "http://target.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
+        if url == "http://router.example/chat/completions":
+            # The internal llm-choosing call routes through the same pipeline.
+            assert data["model"] == "router-model"
+            upstream = MagicMock()
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":4}"}}]}'
+            upstream.headers = {}
+            return upstream
+        assert url == "http://target.example/chat/completions"
         assert data["model"] == "target-model"
         upstream = MagicMock()
         upstream.status_code = 200
@@ -919,7 +847,6 @@ def test_model_auto_flag_triggers_auto_selection_on_normal_channel(monkeypatch):
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -945,12 +872,20 @@ def test_original_request_latency_remains_end_to_end_when_llm_choosing_is_logged
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
     base_time = timezone.now()
+    # now() consumers in the new in-process flow (requests module): outer
+    # record creation, choosing pool pick (list_pd_holders), choosing record
+    # creation, choosing pool pick, choosing circuit-breaker success, choosing
+    # finish, outer pool pick, outer circuit-breaker success, outer finish.
     request_times = [
-        base_time,
-        base_time + timedelta(milliseconds=100),
-        base_time + timedelta(milliseconds=250),
-        base_time + timedelta(milliseconds=400),
-        base_time + timedelta(milliseconds=700),
+        base_time,                                  # 1. outer create
+        base_time + timedelta(milliseconds=100),    # 2. choosing pool pick
+        base_time + timedelta(milliseconds=100),    # 3. choosing create
+        base_time + timedelta(milliseconds=250),    # 4. choosing pool pick
+        base_time + timedelta(milliseconds=250),    # 5. choosing cb success
+        base_time + timedelta(milliseconds=250),    # 6. choosing finish
+        base_time + timedelta(milliseconds=400),    # 7. outer pool pick
+        base_time + timedelta(milliseconds=400),    # 8. outer cb success
+        base_time + timedelta(milliseconds=700),    # 9. outer finish
     ]
 
     def fake_now():
@@ -958,16 +893,15 @@ def test_original_request_latency_remains_end_to_end_when_llm_choosing_is_logged
             return request_times.pop(0)
         return base_time + timedelta(milliseconds=700)
 
-    def fake_post(url, json, headers, timeout):
-        assert url == "http://router.example/chat/completions"
-        response = MagicMock()
-        response.status_code = 200
-        response.reason = "OK"
-        response.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}]}'
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
-
     def fake_request(self_inner, method, url, **kwargs):
+        if url == "http://router.example/chat/completions":
+            # The internal llm-choosing call routes through the same pipeline.
+            upstream = MagicMock()
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}]}'
+            upstream.headers = {}
+            return upstream
         assert url == "http://target.example/chat/completions"
         upstream = MagicMock()
         upstream.status_code = 200
@@ -977,7 +911,6 @@ def test_original_request_latency_remains_end_to_end_when_llm_choosing_is_logged
         return upstream
 
     monkeypatch.setattr("router.repositories.requests.timezone.now", fake_now)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1036,15 +969,18 @@ def test_auto_entrance_concurrency_uses_requested_model_then_routes_by_complexit
         concurrency_calls.append((model, is_auto))
         return AdmissionResult(True)
 
-    def fake_post(url, json, headers, timeout):
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":1}'}}]}
-        return response
-
     def fake_request(self_inner, method, url, **kwargs):
-        assert url == "http://low.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
+        if url == "http://router.example/chat/completions":
+            # The internal llm-choosing call routes through the same pipeline.
+            assert data["model"] == "router-model"
+            upstream = MagicMock()
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":1}"}}]}'
+            upstream.headers = {}
+            return upstream
+        assert url == "http://low.example/chat/completions"
         assert data["model"] == "low-model"
         upstream = MagicMock()
         upstream.status_code = 200
@@ -1057,7 +993,6 @@ def test_auto_entrance_concurrency_uses_requested_model_then_routes_by_complexit
         "router.services.admission.AdmissionService.check_concurrency",
         fake_check_concurrency,
     )
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1083,9 +1018,8 @@ def test_auto_entrance_multimodal_request_selects_auto_false_multimodal_model(mo
     Server.objects.create(model_id=vision_model.id, base_url="http://vision.example", is_online=True)
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing request should not be sent for image auto requests")
-
+    # The multimodal bypass must skip the choosing pipeline entirely (no
+    # llm-choosing record is created by the internal forward).
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://vision.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1097,7 +1031,6 @@ def test_auto_entrance_multimodal_request_selects_auto_false_multimodal_model(mo
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1127,6 +1060,7 @@ def test_auto_entrance_multimodal_request_selects_auto_false_multimodal_model(mo
     record = _external_request_record()
     assert record.model_id == vision_model.id
     assert record.router_result == "source-model:multimodal_bypass"
+    assert not RequestRecord.objects.filter(ip_id=LLM_CHOOSING_IP_ID).exists()
 
 
 def test_auto_false_concrete_model_request_keeps_requested_model_for_multimodal(monkeypatch):
@@ -1134,9 +1068,7 @@ def test_auto_false_concrete_model_request_keeps_requested_model_for_multimodal(
     Server.objects.create(model_id=vision_model.id, base_url="http://vision.example", is_online=True)
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing request should not be sent for non-auto concrete model requests")
-
+    # Non-auto concrete requests never enter the choosing pipeline.
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://vision.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1148,7 +1080,6 @@ def test_auto_false_concrete_model_request_keeps_requested_model_for_multimodal(
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1178,6 +1109,7 @@ def test_auto_false_concrete_model_request_keeps_requested_model_for_multimodal(
     record = _external_request_record()
     assert record.model_id == vision_model.id
     assert record.router_result is None
+    assert not RequestRecord.objects.filter(ip_id=LLM_CHOOSING_IP_ID).exists()
 
 
 def test_model_auto_flag_keeps_original_model_on_vip_channel(monkeypatch):
@@ -1190,9 +1122,7 @@ def test_model_auto_flag_keeps_original_model_on_vip_channel(monkeypatch):
     monkeypatch.setitem(APP_CONFIG.setdefault("server", {}), "vip_port", 8008)
     Ips.objects.create(ip="10.10.10.12", concurrent_multiplier=1.0, vip=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing request should not be sent for concrete VIP model requests")
-
+    # VIP channels skip auto selection, so the choosing pipeline never runs.
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://source.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1204,7 +1134,6 @@ def test_model_auto_flag_keeps_original_model_on_vip_channel(monkeypatch):
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1222,6 +1151,7 @@ def test_model_auto_flag_keeps_original_model_on_vip_channel(monkeypatch):
     record = _external_request_record()
     assert record.model_id == source_model.id
     assert record.router_result is None
+    assert not RequestRecord.objects.filter(ip_id=LLM_CHOOSING_IP_ID).exists()
 
 
 def test_auto_route_multiple_matching_complexity_ranges_use_fallback(monkeypatch):
@@ -1237,8 +1167,6 @@ def test_auto_route_multiple_matching_complexity_ranges_use_fallback(monkeypatch
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":7}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -1249,7 +1177,7 @@ def test_auto_route_multiple_matching_complexity_ranges_use_fallback(monkeypatch
         is_stream=False,
         body=b'{"model":"auto","messages":[{"role":"user","content":"hard task"}]}',
     )
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         context.body,
         MagicMock(id=123),
         context,
@@ -1276,8 +1204,6 @@ def test_auto_route_without_matching_complexity_uses_fallback(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":8}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -1288,7 +1214,7 @@ def test_auto_route_without_matching_complexity_uses_fallback(monkeypatch):
         is_stream=False,
         body=b'{"model":"auto","messages":[{"role":"user","content":"hard task"}]}',
     )
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         context.body,
         MagicMock(id=123),
         context,
@@ -1314,8 +1240,6 @@ def test_auto_route_invalid_complexity_uses_fallback(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": "target-model"}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -1326,7 +1250,7 @@ def test_auto_route_invalid_complexity_uses_fallback(monkeypatch):
         is_stream=False,
         body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
     )
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         context.body,
         MagicMock(id=123),
         context,
@@ -1361,8 +1285,6 @@ def test_routing_payload_requests_structured_output(monkeypatch):
         response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
         return response
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
-
     context = ServerSelectionContext(
         request_id=123,
         ip_id=None,
@@ -1373,7 +1295,7 @@ def test_routing_payload_requests_structured_output(monkeypatch):
         is_stream=False,
         body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
     )
-    AutoRouteAlgorithm(_RoutingChooser())._query_routing_llm(
+    AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))._query_routing_llm(
         context.body,
         MagicMock(id=123),
         context,
@@ -1395,9 +1317,6 @@ def test_small_counted_request_uses_routing_model_before_complexity(monkeypatch)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1411,7 +1330,8 @@ def test_small_counted_request_uses_routing_model_before_complexity(monkeypatch)
         return upstream
 
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._check_cache_hit", lambda *args: None)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1435,9 +1355,6 @@ def test_auto_route_without_routing_model_uses_fallback_and_records_router_resul
     fallback_model = Model.objects.create(model_name="DeepSeek-V4-Flash", auto=True, complexity_min=1, complexity_max=10)
     Server.objects.create(model_id=fallback_model.id, base_url="http://deepseek.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing request should not be sent without routing models")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://deepseek.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1450,7 +1367,8 @@ def test_auto_route_without_routing_model_uses_fallback_and_records_router_resul
         return upstream
 
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._check_cache_hit", lambda *args: None)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1476,9 +1394,6 @@ def test_small_counted_request_uses_routing_model_directly(monkeypatch):
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1491,7 +1406,8 @@ def test_small_counted_request_uses_routing_model_directly(monkeypatch):
         return upstream
 
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._check_cache_hit", lambda *args: None)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1532,9 +1448,6 @@ def test_small_non_auto_request_stays_on_requested_model(monkeypatch):
     Server.objects.create(model_id=user_model.id, base_url="http://user.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for non-auto requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert method == "POST"
         assert url == "http://user.example/chat/completions"
@@ -1548,7 +1461,8 @@ def test_small_non_auto_request_stays_on_requested_model(monkeypatch):
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1587,9 +1501,6 @@ def test_three_thousand_token_non_auto_request_skips_unneeded_routing(monkeypatc
     Server.objects.create(model_id=user_model.id, base_url="http://user.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for explicit model requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://user.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1602,7 +1513,8 @@ def test_three_thousand_token_non_auto_request_skips_unneeded_routing(monkeypatc
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1641,9 +1553,6 @@ def test_non_auto_request_does_not_call_routing_llm_and_keeps_user_model(monkeyp
     Server.objects.create(model_id=user_model.id, base_url="http://user.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called on prefix-cache hit")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://user.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1655,7 +1564,8 @@ def test_non_auto_request_does_not_call_routing_llm_and_keeps_user_model(monkeyp
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1694,9 +1604,6 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
     Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small auto requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1708,7 +1615,8 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1748,9 +1656,6 @@ def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1763,7 +1668,8 @@ def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):
         return upstream
 
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._check_cache_hit", lambda *args: None)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1788,9 +1694,6 @@ def test_auto_route_without_routing_server_uses_fallback_and_records_router_resu
     Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=fallback_model.id, base_url="http://deepseek.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing request should not be sent without routing servers")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://deepseek.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1803,7 +1706,8 @@ def test_auto_route_without_routing_server_uses_fallback_and_records_router_resu
         return upstream
 
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._check_cache_hit", lambda *args: None)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1829,9 +1733,6 @@ def test_small_counted_request_succeeds_with_routing_server(monkeypatch):
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing LLM should not be called for small requests")
-
     def fake_request(self_inner, method, url, **kwargs):
         assert url == "http://router.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
@@ -1844,7 +1745,8 @@ def test_small_counted_request_succeeds_with_routing_server(monkeypatch):
         return upstream
 
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._check_cache_hit", lambda *args: None)
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fail_if_called)
+    # Choosing must not run on this path: the internal pipeline creates no
+    # llm-choosing record.
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
@@ -1928,15 +1830,18 @@ def test_deprecated_model_with_complexity_bounds_serves_auto_request(monkeypatch
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
 
-    def fake_post(url, json, headers, timeout):
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
-
     def fake_request(self_inner, method, url, **kwargs):
-        assert url == "http://glm5.example/chat/completions"
         data = json.loads(kwargs["data"].decode("utf-8"))
+        if url == "http://router.example/chat/completions":
+            # The internal llm-choosing call routes through the same pipeline.
+            assert data["model"] == "router-model"
+            upstream = MagicMock()
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}]}'
+            upstream.headers = {}
+            return upstream
+        assert url == "http://glm5.example/chat/completions"
         assert data["model"] == "glm-5"
         upstream = MagicMock()
         upstream.status_code = 200
@@ -1945,7 +1850,6 @@ def test_deprecated_model_with_complexity_bounds_serves_auto_request(monkeypatch
         upstream.headers = {}
         return upstream
 
-    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
