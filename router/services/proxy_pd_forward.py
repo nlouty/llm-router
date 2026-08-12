@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import traceback
 from typing import Any
 
 import requests
@@ -600,218 +601,247 @@ class PDForwardService:
                     ServerRepository.release_active_tokens(current_decoder, float(prompt_tokens or 0))
                     decoder_released = True
 
-            while True:
-                decoder = ServerRepository.pick_least_tokens_decoder(
-                    prefiller.group_id, attempted_decoder_ids
-                )
-                if decoder is None:
-                    logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
-                    message = "No routable decoder in PD cluster"
-                    append_request_log(record.id, json.dumps({
-                        "event": "pd_no_decoder",
-                        "group_id": prefiller.group_id,
-                        "attempted_decoder_ids": sorted(attempted_decoder_ids),
-                        "recompute_count": recompute_count,
-                    }, ensure_ascii=False))
-                    proxy_logging.log_request_context_for(context)
-                    yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
-                    proxy_response.finish_stream_request_exception(
-                        record, message, current_target, state.attempts, model, context
+            try:
+                while True:
+                    decoder = ServerRepository.pick_least_tokens_decoder(
+                        prefiller.group_id, attempted_decoder_ids
                     )
-                    self.proxy._after_finish(served_as_vip, model)
-                    return
-                attempted_decoder_ids.add(decoder.id)
-                append_request_log(record.id, json.dumps({
-                    "event": "pd_decoder_chosen",
-                    "decoder_id": decoder.id,
-                    "decoder_url": decoder.base_url,
-                    "active_tokens": float(getattr(decoder, "active_tokens", 0.0) or 0.0),
-                    "recompute_count": recompute_count,
-                }, ensure_ascii=False))
-                current_decoder = decoder
-                decoder_released = False
-                state.last_server = decoder
-                ServerRepository.increment_workload(decoder)
-                ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
-                record.task_status = "decoding"
-                record.save(update_fields=["task_status"])
-                current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
-                if recompute_count > 0:
-                    current_target += _KV_TRANSFER_FAIL_TAG
-                state.last_target_pod_ip = current_target
-                RequestRepository.record_attempt(
-                    record, current_target, state.attempts,
-                    getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
-                )
-                decoder_url = self.proxy._build_url(decoder.base_url, path, "")
-
-                req_headers = {**headers}
-                if getattr(decoder, "csb_token", None):
-                    req_headers["csb-token"] = decoder.csb_token
-                try:
-                    upstream = requests.request(
-                        "POST", decoder_url, headers=req_headers, data=decode_body,
-                        stream=True, timeout=self.stream_timeout,
-                    )
-                except requests.RequestException as exc:
-                    logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
-                    append_request_log(record.id, json.dumps({
-                        "event": "pd_decode_error",
-                        "error_type": "connection",
-                        "decoder_url": decoder.base_url,
-                        "reason": str(exc)[:500],
-                        "recompute_count": recompute_count,
-                    }, ensure_ascii=False))
-                    proxy_logging.log_request_context_for(context)
-                    self.circuit_breaker.record_failure(decoder)
-                    message = "502 Bad Gateway"
-                    yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
-                    proxy_response.finish_stream_request_exception(
-                        record, message, current_target, state.attempts, model, context
-                    )
-                    release_current_decoder()
-                    self.proxy._after_finish(served_as_vip, model)
-                    return
-
-                if upstream.status_code >= 400:
-                    try:
-                        content = upstream.content
-                    except Exception:
-                        content = b""
-                    append_request_log(record.id, json.dumps({
-                        "event": "pd_decode_response",
-                        "decoder_url": decoder.base_url,
-                        "status_code": upstream.status_code,
-                        "recompute_count": recompute_count,
-                        "is_error": True,
-                        "response_body": proxy_logging.decode_body_for_log(content)[:5000],
-                    }, ensure_ascii=False))
-                    proxy_logging.log_request_context_for(context)
-                    fail_reason = proxy_response.extract_fail_reason(content, upstream.reason or "")
-                    self.circuit_breaker.record_failure(decoder)
-                    if content:
-                        yield content
-                    proxy_response.finish_upstream_error(
-                        record, upstream.status_code, fail_reason, current_target, model, state.attempts, context
-                    )
-                    upstream.close()
-                    release_current_decoder()
-                    self.proxy._after_finish(served_as_vip, model)
-                    return
-
-                recomputed = False
-                chunks: list[bytes] = []
-                deadline = request_start + self.stream_total_timeout
-                try:
-                    for chunk in upstream.iter_content(chunk_size=8192):
-                        if time.monotonic() > deadline:
-                            proxy_logging.log_request_context_for(context)
-                            yield timeout_sse_event()
-                            proxy_response.finish_stream_total_timeout(record, current_target, state.attempts)
-                            release_current_decoder()
-                            self.proxy._after_finish(served_as_vip, model)
-                            return
-                        tracker = getattr(django_request, "client_disconnect_tracker", None)
-                        if tracker and tracker.client_disconnected():
-                            proxy_response.finish_stream_client_disconnected(record, current_target, state.attempts)
-                            release_current_decoder()
-                            self.proxy._after_finish(served_as_vip, model)
-                            return
-                        if chunk:
-                            if ttft is None:
-                                ttft = int((time.monotonic() - request_start) * 1000)
-                            chunks.append(chunk)
-                            generated, completion_tokens, recomputed = self._scan_chunk(
-                                chunk, generated, completion_tokens
-                            )
-                            if not recomputed:
-                                yield rewrite_sse_chunk_cached_tokens(chunk, cached_tokens)
-                        if recomputed:
-                            break
-                except requests.exceptions.ReadTimeout:
-                    upstream.close()
-                    release_current_decoder()
-                    self.circuit_breaker.record_failure(decoder)
-                    proxy_logging.log_request_context_for(context)
-                    yield timeout_sse_event()
-                    proxy_response.finish_stream_read_timeout(
-                        record, current_target, state.attempts, model, context
-                    )
-                    self.proxy._after_finish(served_as_vip, model)
-                    return
-                except requests.RequestException:
-                    upstream.close()
-                    release_current_decoder()
-                    self.circuit_breaker.record_failure(decoder)
-                    proxy_logging.log_request_context_for(context)
-                    message = "502 Bad Gateway"
-                    yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
-                    proxy_response.finish_stream_request_exception(
-                        record, message, current_target, state.attempts, model, context
-                    )
-                    self.proxy._after_finish(served_as_vip, model)
-                    return
-                finally:
-                    try:
-                        upstream.close()
-                    except Exception:
-                        pass
-
-                if recomputed:
-                    recompute_count += 1
-                    append_request_log(record.id, json.dumps({
-                        "event": "pd_recompute",
-                        "decoder_url": decoder.base_url,
-                        "recompute_count": recompute_count,
-                        "recompute_max": self.recompute_max,
-                    }, ensure_ascii=False))
-                    release_current_decoder()
-                    record.task_status = "processing"
-                    record.save(update_fields=["task_status"])
-                    if recompute_count > self.recompute_max:
-                        logger.error("PD recompute limit (%s) exceeded for request %s", self.recompute_max, record.id)
+                    if decoder is None:
+                        logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
+                        message = "No routable decoder in PD cluster"
                         append_request_log(record.id, json.dumps({
-                            "event": "pd_recompute_limit_exceeded",
+                            "event": "pd_no_decoder",
+                            "group_id": prefiller.group_id,
+                            "attempted_decoder_ids": sorted(attempted_decoder_ids),
                             "recompute_count": recompute_count,
-                            "recompute_max": self.recompute_max,
                         }, ensure_ascii=False))
                         proxy_logging.log_request_context_for(context)
-                        message = "PD recompute limit exceeded"
                         yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
                         proxy_response.finish_stream_request_exception(
                             record, message, current_target, state.attempts, model, context
                         )
                         self.proxy._after_finish(served_as_vip, model)
                         return
-                    decode_body = self._extend_for_recompute(
-                        body, generated, origin_max_tokens, completion_tokens, recompute_count
+                    attempted_decoder_ids.add(decoder.id)
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_decoder_chosen",
+                        "decoder_id": decoder.id,
+                        "decoder_url": decoder.base_url,
+                        "active_tokens": float(getattr(decoder, "active_tokens", 0.0) or 0.0),
+                        "recompute_count": recompute_count,
+                    }, ensure_ascii=False))
+                    current_decoder = decoder
+                    decoder_released = False
+                    state.last_server = decoder
+                    ServerRepository.increment_workload(decoder)
+                    ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
+                    record.task_status = "decoding"
+                    record.save(update_fields=["task_status"])
+                    current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
+                    if recompute_count > 0:
+                        current_target += _KV_TRANSFER_FAIL_TAG
+                    state.last_target_pod_ip = current_target
+                    RequestRepository.record_attempt(
+                        record, current_target, state.attempts,
+                        getattr(context, "prefix_cache", None), getattr(context, "last_match", None),
                     )
-                    continue
+                    decoder_url = self.proxy._build_url(decoder.base_url, path, "")
 
-                # Terminal success: final_prefix_cache from the prefiller.
-                self.circuit_breaker.record_success(decoder)
-                self.proxy._notify_chooser_response(prefiller, context, 200)
-                append_request_log(record.id, json.dumps({
-                    "event": "pd_decode_success",
-                    "decoder_url": decoder.base_url,
-                    "status_code": 200,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "cached_tokens": cached_tokens,
-                    "recompute_count": recompute_count,
-                    "ttft_ms": ttft,
-                }, ensure_ascii=False))
-                proxy_response.finish_stream_success(
-                    record, 200, "OK", chunks, current_target, context.model_name,
-                    state.attempts, context, ttft,
-                )
-                record.refresh_from_db()
-                if record.final_prefix_cache != cached_tokens:
-                    record.final_prefix_cache = cached_tokens
-                    record.save(update_fields=["final_prefix_cache"])
+                    req_headers = {**headers}
+                    if getattr(decoder, "csb_token", None):
+                        req_headers["csb-token"] = decoder.csb_token
+                    try:
+                        upstream = requests.request(
+                            "POST", decoder_url, headers=req_headers, data=decode_body,
+                            stream=True, timeout=self.stream_timeout,
+                        )
+                    except requests.RequestException as exc:
+                        logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
+                        append_request_log(record.id, json.dumps({
+                            "event": "pd_decode_error",
+                            "error_type": "connection",
+                            "decoder_url": decoder.base_url,
+                            "reason": str(exc)[:500],
+                            "recompute_count": recompute_count,
+                        }, ensure_ascii=False))
+                        proxy_logging.log_request_context_for(context)
+                        self.circuit_breaker.record_failure(decoder)
+                        message = "502 Bad Gateway"
+                        yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
+                        proxy_response.finish_stream_request_exception(
+                            record, message, current_target, state.attempts, model, context
+                        )
+                        release_current_decoder()
+                        self.proxy._after_finish(served_as_vip, model)
+                        return
+
+                    if upstream.status_code >= 400:
+                        try:
+                            content = upstream.content
+                        except Exception:
+                            content = b""
+                        append_request_log(record.id, json.dumps({
+                            "event": "pd_decode_response",
+                            "decoder_url": decoder.base_url,
+                            "status_code": upstream.status_code,
+                            "recompute_count": recompute_count,
+                            "is_error": True,
+                            "response_body": proxy_logging.decode_body_for_log(content)[:5000],
+                        }, ensure_ascii=False))
+                        proxy_logging.log_request_context_for(context)
+                        fail_reason = proxy_response.extract_fail_reason(content, upstream.reason or "")
+                        self.circuit_breaker.record_failure(decoder)
+                        if content:
+                            yield content
+                        proxy_response.finish_upstream_error(
+                            record, upstream.status_code, fail_reason, current_target, model, state.attempts, context
+                        )
+                        upstream.close()
+                        release_current_decoder()
+                        self.proxy._after_finish(served_as_vip, model)
+                        return
+
+                    recomputed = False
+                    chunks: list[bytes] = []
+                    deadline = request_start + self.stream_total_timeout
+                    try:
+                        for chunk in upstream.iter_content(chunk_size=8192):
+                            if time.monotonic() > deadline:
+                                proxy_logging.log_request_context_for(context)
+                                yield timeout_sse_event()
+                                proxy_response.finish_stream_total_timeout(record, current_target, state.attempts)
+                                release_current_decoder()
+                                self.proxy._after_finish(served_as_vip, model)
+                                return
+                            tracker = getattr(django_request, "client_disconnect_tracker", None)
+                            if tracker and tracker.client_disconnected():
+                                proxy_response.finish_stream_client_disconnected(record, current_target, state.attempts)
+                                release_current_decoder()
+                                self.proxy._after_finish(served_as_vip, model)
+                                return
+                            if chunk:
+                                if ttft is None:
+                                    ttft = int((time.monotonic() - request_start) * 1000)
+                                chunks.append(chunk)
+                                generated, completion_tokens, recomputed = self._scan_chunk(
+                                    chunk, generated, completion_tokens
+                                )
+                                if not recomputed:
+                                    yield rewrite_sse_chunk_cached_tokens(chunk, cached_tokens)
+                            if recomputed:
+                                break
+                    except requests.exceptions.ReadTimeout:
+                        upstream.close()
+                        release_current_decoder()
+                        self.circuit_breaker.record_failure(decoder)
+                        proxy_logging.log_request_context_for(context)
+                        yield timeout_sse_event()
+                        proxy_response.finish_stream_read_timeout(
+                            record, current_target, state.attempts, model, context
+                        )
+                        self.proxy._after_finish(served_as_vip, model)
+                        return
+                    except requests.RequestException:
+                        upstream.close()
+                        release_current_decoder()
+                        self.circuit_breaker.record_failure(decoder)
+                        proxy_logging.log_request_context_for(context)
+                        message = "502 Bad Gateway"
+                        yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
+                        proxy_response.finish_stream_request_exception(
+                            record, message, current_target, state.attempts, model, context
+                        )
+                        self.proxy._after_finish(served_as_vip, model)
+                        return
+                    finally:
+                        try:
+                            upstream.close()
+                        except Exception:
+                            pass
+
+                    if recomputed:
+                        recompute_count += 1
+                        append_request_log(record.id, json.dumps({
+                            "event": "pd_recompute",
+                            "decoder_url": decoder.base_url,
+                            "recompute_count": recompute_count,
+                            "recompute_max": self.recompute_max,
+                        }, ensure_ascii=False))
+                        release_current_decoder()
+                        record.task_status = "processing"
+                        record.save(update_fields=["task_status"])
+                        if recompute_count > self.recompute_max:
+                            logger.error("PD recompute limit (%s) exceeded for request %s", self.recompute_max, record.id)
+                            append_request_log(record.id, json.dumps({
+                                "event": "pd_recompute_limit_exceeded",
+                                "recompute_count": recompute_count,
+                                "recompute_max": self.recompute_max,
+                            }, ensure_ascii=False))
+                            proxy_logging.log_request_context_for(context)
+                            message = "PD recompute limit exceeded"
+                            yield f"data: {json.dumps(error_payload(message, 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
+                            proxy_response.finish_stream_request_exception(
+                                record, message, current_target, state.attempts, model, context
+                            )
+                            self.proxy._after_finish(served_as_vip, model)
+                            return
+                        decode_body = self._extend_for_recompute(
+                            body, generated, origin_max_tokens, completion_tokens, recompute_count
+                        )
+                        continue
+
+                    # Terminal success: final_prefix_cache from the prefiller.
+                    self.circuit_breaker.record_success(decoder)
+                    self.proxy._notify_chooser_response(prefiller, context, 200)
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_decode_success",
+                        "decoder_url": decoder.base_url,
+                        "status_code": 200,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "cached_tokens": cached_tokens,
+                        "recompute_count": recompute_count,
+                        "ttft_ms": ttft,
+                    }, ensure_ascii=False))
+                    proxy_response.finish_stream_success(
+                        record, 200, "OK", chunks, current_target, context.model_name,
+                        state.attempts, context, ttft,
+                    )
+                    record.refresh_from_db()
+                    if record.final_prefix_cache != cached_tokens:
+                        record.final_prefix_cache = cached_tokens
+                        record.save(update_fields=["final_prefix_cache"])
+                    release_current_decoder()
+                    self.proxy._after_finish(served_as_vip, model)
+                    return
+
+            except Exception as exc:
+                # Scenario-2 guard: any non-requests exception during PD
+                # streaming (e.g. a client disconnect surfacing as OSError on a
+                # yield, or a DB error inside finish_*/record.save). Finish the
+                # record, log the full traceback to its per-request log, release
+                # the decoder, and emit a terminal error. Best-effort; never raise.
+                fail_reason = f"unhandled pd stream {type(exc).__name__}: {exc}"[:200]
+                logger.error("PD stream unhandled %s request_id=%s: %s", type(exc).__name__, record.id, str(exc)[:200])
+                try:
+                    proxy_logging.safe_append_request_log(
+                        record.id,
+                        f"PD stream unhandled exception: {fail_reason}\n{traceback.format_exc()}",
+                    )
+                except Exception:
+                    pass
+                try:
+                    proxy_response.finish_stream_request_exception(
+                        record, "502 Bad Gateway", current_target, state.attempts, model, context
+                    )
+                except Exception:
+                    logger.exception("failed to finish PD streaming record %s after unhandled exception", record.id)
+                try:
+                    yield f"data: {json.dumps(error_payload('502 Bad Gateway', 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
+                except Exception:
+                    pass
+            finally:
                 release_current_decoder()
-                self.proxy._after_finish(served_as_vip, model)
-                return
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
