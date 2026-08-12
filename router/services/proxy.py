@@ -114,15 +114,12 @@ class ProxyService:
                 "user_ip_id": user_ip_id,
             }, ensure_ascii=False))
             if isinstance(parsed, ParsedRequest):
-                tokenizer_event = {
+                append_request_log(record.id, json.dumps({
                     "event": "tokenizer_count",
                     "request_id": record.id,
                     "tokens": parsed.estimated_full_body_tokens,
                     "latency_ms": parsed.tokenizer_latency_ms,
-                }
-                if parsed.tokenizer_error:
-                    tokenizer_event["error"] = parsed.tokenizer_error
-                append_request_log(record.id, json.dumps(tokenizer_event, ensure_ascii=False))
+                }, ensure_ascii=False))
             if normalized == "chat/completions":
                 return self._forward_chat(
                     django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
