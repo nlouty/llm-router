@@ -11,7 +11,9 @@ from router.utils.tokenizer_count import count_tokens_with_latency
 def _reset_tokenizer_state():
     tokenizer_count._tokenizers.clear()
     tokenizer_count._failed_paths.clear()
+    tokenizer_count._load_errors.clear()
     tokenizer_count._import_failed = False
+    tokenizer_count._import_error = None
     yield
 
 
@@ -27,26 +29,57 @@ class FakeTokenizer:
         return list(self.tokens) * len(text)
 
 
-def test_empty_path_or_text_counts_zero():
-    assert count_tokens_with_latency(None, "hi") == (0, 0)
-    assert count_tokens_with_latency("path", "") == (0, 0)
+def test_empty_path_or_text_counts_zero_with_reason():
+    count, latency, reason = count_tokens_with_latency(None, "hi")
+    assert (count, latency) == (0, 0)
+    assert reason == "no model_path configured for model"
+
+    count, latency, reason = count_tokens_with_latency("path", "")
+    assert (count, latency) == (0, 0)
+    assert reason == "empty request body"
 
 
 def test_counts_text_and_reports_latency(monkeypatch):
     monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: FakeTokenizer())
-    count, latency = count_tokens_with_latency("p", "hello")
+    count, latency, reason = count_tokens_with_latency("p", "hello")
     assert count == 5
     assert latency >= 0
+    assert reason is None
 
 
-def test_encode_failure_counts_zero(monkeypatch):
+def test_encode_failure_counts_zero_with_reason(monkeypatch):
     monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: FakeTokenizer())
-    assert count_tokens_with_latency("p", "boom") == (0, 0)
+    count, latency, reason = count_tokens_with_latency("p", "boom")
+    assert (count, latency) == (0, 0)
+    assert reason == "tokenizer encode failed for model_path=p: encode failed"
 
 
-def test_unloadable_path_counts_zero(monkeypatch):
+def test_unloadable_path_counts_zero_with_reason(monkeypatch):
     monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: None)
-    assert count_tokens_with_latency("p", "hello") == (0, 0)
+    count, latency, reason = count_tokens_with_latency("p", "hello")
+    assert (count, latency) == (0, 0)
+    assert reason == "tokenizer load failed for model_path=p: unknown error"
+
+
+def test_failed_load_captures_error_message(monkeypatch):
+    def from_pretrained(path, use_fast):
+        raise OSError("repo not found")
+
+    transformers = SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=from_pretrained))
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    count, latency, reason = count_tokens_with_latency("p", "hello")
+    assert (count, latency) == (0, 0)
+    assert reason == "tokenizer load failed for model_path=p: repo not found"
+    # Subsequent requests reuse the cached failure reason without reloading.
+    assert count_tokens_with_latency("p", "hello")[2] == reason
+
+
+def test_missing_transformers_reports_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    count, latency, reason = count_tokens_with_latency("p", "hello")
+    assert (count, latency) == (0, 0)
+    assert reason.startswith("transformers unavailable:")
 
 
 def test_tokenizer_loaded_once_per_path(monkeypatch):
@@ -91,11 +124,13 @@ def test_failed_path_not_retried(monkeypatch):
     assert tokenizer_count._get_tokenizer("p") is None
     # fast+slow once per path, never retried on subsequent calls
     assert len(calls) == 2
+    assert tokenizer_count._load_errors["p"] == "always fails"
 
 
 def test_missing_transformers_disables_counting(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", None)
     assert tokenizer_count._get_tokenizer("p") is None
     assert tokenizer_count._import_failed is True
+    assert tokenizer_count._import_error is not None
     # Short-circuits without retrying the import
     assert tokenizer_count._get_tokenizer("p") is None
