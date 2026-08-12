@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import random
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,8 +30,11 @@ from router.services.vip_channel import VIPChannelService
 from router.route_algorithm.auto import AutoRouteAlgorithm
 from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import LeastConnectionServerChooser
-from router.utils.errors import error_payload, timeout_sse_event
+from router.utils.errors import error_payload, error_response, timeout_sse_event
 from router.utils.headers import filter_request_headers
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -134,8 +139,38 @@ class ProxyService:
             return self._forward_default(
                 django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
             )
+        except Exception as exc:
+            # Any unhandled exception inside routing/forwarding must finish the
+            # processing record this method created (exactly one row per
+            # request) and record the full traceback in that record's
+            # per-request log, rather than propagating to views.py, which would
+            # create a second record and orphan this one.
+            return self._finish_unhandled(record, exc)
         finally:
             clear_request_id()
+
+    def _finish_unhandled(self, record, exc: BaseException):
+        """Finish the processing record after an otherwise-unhandled exception.
+
+        Guarantees one terminal row per request: finishes the record forward()
+        created (instead of leaving it orphaned), writes the exception and full
+        traceback to that record's per-request log, and returns a generic 502.
+        Must never raise, so the response still goes out.
+        """
+        fail_reason = f"unhandled {type(exc).__name__}: {exc}"[:200]
+        logger.error("proxy unhandled %s request_id=%s: %s", type(exc).__name__, record.id, str(exc)[:200])
+        try:
+            proxy_logging.safe_append_request_log(
+                record.id,
+                f"proxy unhandled exception: {fail_reason}\n{traceback.format_exc()}",
+            )
+        except Exception:
+            pass
+        try:
+            RequestRepository.finish(record, 502, fail_reason)
+        except Exception:
+            logger.exception("failed to finish processing record %s after unhandled exception", record.id)
+        return error_response(502, "502 Bad Gateway", "server_error")
 
     def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False):
         auto_model_selection = self.auto_router.should_auto_select(
@@ -918,6 +953,31 @@ class ProxyService:
                     model,
                     context,
                 )
+            except Exception as exc:
+                # Scenario-2 guard: any non-requests exception during streaming
+                # (e.g. a client disconnect surfacing as OSError on yield, or a
+                # failure inside finish_*). Finish the record, log the full
+                # traceback to its per-request log, and emit a terminal error.
+                # The finally below still runs cleanup; this must not raise.
+                fail_reason = f"unhandled stream {type(exc).__name__}: {exc}"[:200]
+                logger.error("proxy stream unhandled %s request_id=%s: %s", type(exc).__name__, record.id, str(exc)[:200])
+                try:
+                    proxy_logging.safe_append_request_log(
+                        record.id,
+                        f"proxy stream unhandled exception: {fail_reason}\n{traceback.format_exc()}",
+                    )
+                except Exception:
+                    pass
+                try:
+                    proxy_response.finish_stream_request_exception(
+                        record, "502 Bad Gateway", target_pod_ip, attempts, model, context
+                    )
+                except Exception:
+                    logger.exception("failed to finish streaming record %s after unhandled exception", record.id)
+                try:
+                    yield f"data: {json.dumps(error_payload('502 Bad Gateway', 'server_error'))}\n\ndata: [DONE]\n\n".encode("utf-8")
+                except Exception:
+                    pass
             finally:
                 # Decrement workload before closing the upstream: a close() that
                 # raises on a broken connection must not skip the decrement, and
