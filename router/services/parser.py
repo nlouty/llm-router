@@ -17,6 +17,7 @@ class ParsedRequest:
     is_json: bool
     estimated_full_body_tokens: int = 0
     tokenizer_latency_ms: int = 0
+    tokenizer_error: str | None = None
 
 
 class RequestParser:
@@ -58,7 +59,7 @@ class RequestParser:
 
         model_name = data.get("model") if isinstance(data.get("model"), str) else None
         model_path = ModelRepository.get_model_path(model_name)
-        estimated_full_body_tokens, tokenizer_latency_ms = count_tokens_with_latency(
+        estimated_full_body_tokens, tokenizer_latency_ms, tokenizer_error = count_tokens_with_latency(
             model_path, body_str
         )
 
@@ -71,6 +72,7 @@ class RequestParser:
             is_json=True,
             estimated_full_body_tokens=estimated_full_body_tokens,
             tokenizer_latency_ms=tokenizer_latency_ms,
+            tokenizer_error=tokenizer_error,
         )
 
     @staticmethod

@@ -178,6 +178,56 @@ def test_auto_route_request_disables_thinking(monkeypatch):
     assert sent["json"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_auto_route_recounts_with_resolved_model_tokenizer(monkeypatch):
+    # Regression: _resolve_auto_model re-counts tokens with the resolved target
+    # model's tokenizer. count_tokens_with_latency returns a 3-tuple; this path
+    # must unpack all three or raise ValueError and orphan the processing record.
+    target_model = Model.objects.create(
+        model_name="target-model",
+        auto=True,
+        complexity_min=1,
+        complexity_max=10,
+        model_path="/tmp/fake-path",
+    )
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+
+    def fake_post(url, json, headers, timeout):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
+        return response
+
+    monkeypatch.setattr("router.route_algorithm.auto.requests.post", fake_post)
+    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
+
+    service = AutoRouteAlgorithm(_RoutingChooser())
+    parsed = MagicMock(
+        model_name="auto",
+        body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
+        estimated_full_body_tokens=0,
+    )
+    context = ServerSelectionContext(
+        request_id=123,
+        ip_id=None,
+        model_id=None,
+        model_name="auto",
+        path="chat/completions",
+        method="POST",
+        is_stream=False,
+        body=parsed.body,
+        auto_model_selection=True,
+    )
+    record = MagicMock(id=123)
+
+    decision = service.resolve(parsed, record, context, None, is_vip_channel=False)
+
+    assert decision.model == target_model
+    # The resolved model has a tokenizer; estimate_tokens must be recounted (>0),
+    # not left at 0 and not raise.
+    assert record.estimate_tokens > 0
+
+
 def test_auto_route_records_llm_choosing_request_row(monkeypatch):
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)

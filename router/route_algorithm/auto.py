@@ -114,7 +114,7 @@ class AutoRouteAlgorithm:
             # The auto request was counted before any target was known (0); now
             # that a target model is resolved, count with its tokenizer.
             if getattr(model, "model_path", None):
-                count, _ = count_tokens_with_latency(
+                count, _, _ = count_tokens_with_latency(
                     model.model_path,
                     parsed.body.decode("utf-8", errors="replace"),
                 )
