@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 from dataclasses import dataclass
 from typing import Any
 
-import requests
-
 from router.config import APP_CONFIG
 from router.repositories.models import ModelRepository
-from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
-from router.route_algorithm.least_connection import LeastConnectionServerChooser
+from router.route_algorithm.least_connection import (
+    LeastConnectionServerChooser,
+    effective_weight,
+)
 from router.services import proxy_logging, proxy_response
 from router.utils.tokenizer_count import count_tokens_with_latency
 
@@ -30,8 +31,9 @@ class AutoRouteAlgorithm:
     ROUTING_USER_PROMPT_COLLAPSE_MULTIPLIER = 3
     ROUTING_USER_PROMPT_MESSAGE_LIMIT = 20
 
-    def __init__(self, chooser=None):
+    def __init__(self, chooser=None, proxy=None):
         self.chooser = chooser
+        self.proxy = proxy
         self.workload_chooser = LeastConnectionServerChooser.for_server_workload()
         self._router_system_prompt = None
 
@@ -164,7 +166,7 @@ class AutoRouteAlgorithm:
     @staticmethod
     def _get_small_request_routing_model():
         for routing_model in ModelRepository.get_routing_models():
-            if ServerRepository.list_by_model_id(routing_model.id, vip=False):
+            if ServerRepository.list_pd_holders(routing_model.id, vip=False):
                 return routing_model
         return None
 
@@ -328,136 +330,85 @@ class AutoRouteAlgorithm:
                 "no routing model configured",
             )
 
-        routing_servers = []
-        model_id_to_name = {model.id: model.model_name for model in routing_models}
-        for routing_model in routing_models:
-            routing_servers.extend(
-                ServerRepository.list_by_model_id(
-                    routing_model.id,
-                    vip=False,
-                )
-            )
-
-        if not routing_servers:
+        routing_model = self._pick_routing_model(routing_models)
+        if routing_model is None:
             return None, self._routing_unavailable_result()
 
-        server = self._choose_routing_server(routing_servers, context)
-
         self._ensure_system_prompt(model_names)
-        routing_model_name = model_id_to_name.get(server.model_id, "router")
-
-        payload = self._build_routing_payload(routing_model_name, body)
+        payload = self._build_routing_payload(routing_model.model_name, body)
         if len(payload.get("messages", [])) <= 1:
             return None, "no_user_query"
 
-        choosing_record = self._create_routing_request_record(server)
-        url = self._build_url(server.base_url, "chat/completions", "")
-        headers = {"Content-Type": "application/json"}
-        csb_token = getattr(server, "csb_token", None)
-        if csb_token:
-            headers["csb-token"] = csb_token
-
-        ServerRepository.increment_workload(server)
+        # Re-enter the router's own pipeline instead of calling the routing
+        # server directly: the choosing request then follows the same PD-aware
+        # logic as any client request (candidate filter, cluster-aware chooser,
+        # two-phase prefill -> decode dispatch, retries) and is recorded with
+        # the llm-choosing conventions (ip_id=0, user_agent="llm-choosing").
         try:
-            try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=10)
-            except Exception as exc:
-                self._finish_routing_request_record(
-                    choosing_record,
-                    502,
-                    str(exc),
-                    server,
-                )
-                router_result = self._routing_exception_result(exc)
-                proxy_logging.safe_append_request_log(
-                    record.id,
-                    f"Routing LLM error: {str(exc)}",
-                )
-                return None, router_result
+            response = self.proxy.forward_internal(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                routing_model,
+            )
+        except Exception as exc:
+            router_result = self._routing_exception_result(exc)
+            proxy_logging.safe_append_request_log(
+                record.id,
+                f"Routing LLM error: {str(exc)}",
+            )
+            return None, router_result
 
-            if resp.status_code != 200:
-                self._finish_routing_response_record(choosing_record, resp, server)
-                return None, self._routing_response_error_result(resp)
+        if response.status_code != 200:
+            return None, self._routing_response_error_result(response)
 
-            try:
-                self._finish_routing_response_record(choosing_record, resp, server)
-                result = (
-                    resp.json()
-                    .get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-            except Exception as exc:
-                router_result = self._routing_exception_result(
-                    exc,
-                    status_code=resp.status_code,
-                )
-                proxy_logging.safe_append_request_log(
-                    record.id,
-                    f"Routing LLM error: {str(exc)}",
-                )
-                return None, router_result
+        try:
+            result = (
+                json.loads(proxy_response.response_content_bytes(response).decode("utf-8"))
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+        except Exception as exc:
+            router_result = self._routing_exception_result(
+                exc,
+                status_code=response.status_code,
+            )
+            proxy_logging.safe_append_request_log(
+                record.id,
+                f"Routing LLM error: {str(exc)}",
+            )
+            return None, router_result
 
-            complexity = self._routing_complexity(result)
-            if complexity is None:
-                return None, self._invalid_routing_result(result)
+        complexity = self._routing_complexity(result)
+        if complexity is None:
+            return None, self._invalid_routing_result(result)
 
-            return complexity, self._complexity_routing_result(complexity)
-        finally:
-            ServerRepository.decrement_workload(server)
+        return complexity, self._complexity_routing_result(complexity)
 
-    @staticmethod
-    def _create_routing_request_record(server) -> Any:
-        return RequestRepository.create_llm_choosing(
-            model_id=server.model_id or 0,
-            target_pod_ip=getattr(server, "base_url", None),
-        )
+    def _pick_routing_model(self, routing_models: list[Any]) -> Any | None:
+        """Pick the routing model with the least-loaded PD-aware candidate pool.
 
-    @staticmethod
-    def _finish_routing_response_record(record, response, server) -> None:
-        content = proxy_response.response_content_bytes(response)
-        reason = proxy_response.response_reason(response)
-        status_code = int(getattr(response, "status_code", 502) or 502)
-        fail_reason = proxy_response.extract_fail_reason(
-            content,
-            reason or "routing request failed",
-        )
-        input_tokens, output_tokens, cached_tokens = proxy_response.parse_json_usage(
-            content
-        )
-        RequestRepository.finish(
-            record,
-            status_code,
-            fail_reason,
-            input_tokens,
-            output_tokens,
-            getattr(server, "base_url", None),
-            getattr(server, "model_id", None),
-            attempt_count=1,
-            final_prefix_cache=cached_tokens,
-        )
-
-    @staticmethod
-    def _finish_routing_request_record(
-        record,
-        status_code: int,
-        reason: str,
-        server,
-        task_status: str | None = None,
-    ) -> None:
-        RequestRepository.finish(
-            record,
-            status_code,
-            reason,
-            target_pod_ip=getattr(server, "base_url", None),
-            model_id=getattr(server, "model_id", None),
-            task_status=task_status,
-            attempt_count=1,
-        )
-
-    def _choose_routing_server(self, routing_servers: list[Any], context):
-        return self.workload_chooser.choose(routing_servers, context, set())
+        The old server-level pick chose the globally least-workload routing
+        server and used its model; the winning pool's minimum equals that
+        global minimum, so the same model is chosen while the actual server is
+        picked inside forward_internal (cluster-aware). Decoders and
+        decoder-less prefillers are excluded by list_pd_holders.
+        """
+        best_models: list[Any] = []
+        best_load: float | None = None
+        for routing_model in routing_models:
+            servers = ServerRepository.list_pd_holders(routing_model.id, vip=False)
+            if not servers:
+                continue
+            load = min(
+                int(getattr(server, "workload", 0) or 0) / effective_weight(server)
+                for server in servers
+            )
+            if best_load is None or load < best_load:
+                best_models, best_load = [routing_model], load
+            elif load == best_load:
+                best_models.append(routing_model)
+        return random.choice(best_models) if best_models else None
 
     def _routing_response_error_result(self, response) -> str:
         status_code = getattr(response, "status_code", None)
@@ -737,11 +688,3 @@ class AutoRouteAlgorithm:
             chat_template_kwargs = {}
         chat_template_kwargs["enable_thinking"] = False
         body_data["chat_template_kwargs"] = chat_template_kwargs
-
-    @staticmethod
-    def _build_url(base_url: str, path: str, query_string: str) -> str:
-        url = base_url.rstrip("/") + "/" + path
-        if query_string:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}{query_string}"
-        return url

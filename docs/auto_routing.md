@@ -102,7 +102,9 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
 6. Query the routing LLM.
 
-   Routing servers are all non-VIP servers for models with `is_routing_model = TRUE`, filtered by online state, circuit-breaker state, and soft delete. The original request's context-window estimate is not applied to this classifier-server lookup because the classifier payload is bounded to a small prompt. Among those servers, the router chooses by `servers.workload`, with random tie breaking.
+   The routing model is the model with `is_routing_model = TRUE` whose PD-aware candidate pool is the least loaded. The pool is built like any request's: `list_pd_holders` returns only `role = 'mixed'` servers and prefiller servers whose cluster still has a routable decoder; decoders are never candidates. Within each model the pool's load is its minimum `servers.workload / weight`, with random tie breaking across models. The original request's context-window estimate is not applied to this classifier lookup because the classifier payload is bounded to a small prompt.
+
+   The choosing request is not sent to an upstream directly. It re-enters the router's own pipeline in-process (`ProxyService.forward_internal`), so it follows the exact same logic as a client request: the active chooser (cluster-aware for prefillers) picks the server, and a chosen prefiller is served through the two-phase prefill → decode PD path. Auto selection is skipped for the internal call, so a routing model with `auto = TRUE` cannot recurse into the choosing algorithm.
 
    The routing request is a non-streaming `/chat/completions` call with:
 
@@ -114,7 +116,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
    - `response_format` requiring JSON schema `{"complexity": <integer 1-10>}`
    - `chat_template_kwargs.enable_thinking = false`
 
-   The routing call is logged as its own `requests` row with `ip_id = 0`, `user_agent = "llm-choosing"`, `is_stream = FALSE`, `attempt_count = 1`, and the routing server in `target_pod_ip`.
+   The routing call is logged as its own `requests` row with `ip_id = 0`, `user_agent = "llm-choosing"`, and `is_stream = FALSE`. `target_pod_ip` follows the normal convention: the mixed server's base URL, or `P: <prefiller> -- D: <decoder>` when the choosing request was served by a PD cluster.
 
 7. Parse complexity.
 

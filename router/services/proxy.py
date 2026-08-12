@@ -10,20 +10,24 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
-from django.http import HttpResponse, StreamingHttpResponse
+from django.http import HttpRequest, HttpResponse, StreamingHttpResponse
 import requests
 
-from router.services.request_context import set_request_id, clear_request_id
+from router.services.request_context import get_request_id, set_request_id, clear_request_id
 from router.services.request_logger import append_request_log
 
 from router.config import APP_CONFIG
-from router.repositories.requests import RequestRepository
+from router.repositories.requests import (
+    LLM_CHOOSING_IP_ID,
+    LLM_CHOOSING_USER_AGENT,
+    RequestRepository,
+)
 from router.repositories.servers import ServerRepository
 from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.circuit_breaker import CircuitBreakerService
 from router.services.disconnect import DisconnectWatcher
 from router.services.opencode import OpencodeVersionService
-from router.services.parser import ParsedRequest
+from router.services.parser import ParsedRequest, RequestParser
 from router.services import proxy_logging, proxy_response
 from router.services.request_logger import append_verbose_request_log
 from router.services.vip_channel import VIPChannelService
@@ -81,7 +85,7 @@ class ProxyService:
         lb_config = APP_CONFIG.get("load_balancer", {})
         self.max_attempts_per_request = int(lb_config.get("max_attempts_per_request", 3))
         self.chooser = chooser or self._load_chooser(str(lb_config.get("chooser_class", "router.route_algorithm.least_connection.LeastConnectionServerChooser")))
-        self.auto_router = AutoRouteAlgorithm(self.chooser)
+        self.auto_router = AutoRouteAlgorithm(self.chooser, proxy=self)
         self.stream_timeout = (
             float(proxy_config.get("stream_connect_timeout_seconds", 30)),
             float(proxy_config.get("stream_read_timeout_seconds", 900)),
@@ -98,7 +102,7 @@ class ProxyService:
         self.vip_port = int(APP_CONFIG.get("server", {}).get("vip_port", 8008))
         self._active_chooser = None
 
-    def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False):
+    def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False, skip_auto_selection: bool = False):
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
         record = self._create_processing_record(ip_id, model, parsed, user_agent, user_ip_id=user_ip_id)
         append_verbose_request_log(record.id, django_request.body)
@@ -130,7 +134,7 @@ class ProxyService:
                 append_request_log(record.id, json.dumps(tokenizer_event, ensure_ascii=False))
             if normalized == "chat/completions":
                 return self._forward_chat(
-                    django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip
+                    django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip, skip_auto_selection
                 )
             if normalized == "embeddings":
                 return self._forward_embeddings(
@@ -148,6 +152,50 @@ class ProxyService:
             return self._finish_unhandled(record, exc)
         finally:
             clear_request_id()
+
+    def forward_internal(self, body: bytes, model, path: str = "chat/completions") -> HttpResponse:
+        """Route an internal (llm-choosing) request through the normal pipeline.
+
+        Called from AutoRouteAlgorithm._query_routing_complexity instead of a
+        direct upstream POST: the choosing call gets the exact same handling as
+        a client request (PD-aware candidates via list_pd_holders, cluster-aware
+        chooser, two-phase PD dispatch, retries, circuit breaker, one terminal
+        record) while keeping the llm-choosing record conventions (ip_id = 0,
+        user_agent = "llm-choosing"). Auto selection is skipped so a routing
+        model with auto = TRUE can never re-enter the choosing algorithm.
+        """
+        parsed = RequestParser(
+            int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 28528))
+        ).parse(body, path, is_vip=False)
+        internal_request = HttpRequest()
+        internal_request.method = "POST"
+        internal_request.path = f"/v1/{path.rstrip('/')}"
+        # Django 4.2's HttpRequest.body is read-only; set the backing field.
+        internal_request._body = body
+        internal_request.META = {
+            "QUERY_STRING": "",
+            "HTTP_CONTENT_TYPE": "application/json",
+            "HTTP_USER_AGENT": LLM_CHOOSING_USER_AGENT,
+        }
+        # forward() sets/clears the request-id context; restore the outer
+        # request's id afterwards so the caller's own PD-aware candidate
+        # selection keeps logging under the outer record.
+        previous_request_id = get_request_id()
+        try:
+            return self.forward(
+                internal_request,
+                path,
+                parsed,
+                LLM_CHOOSING_IP_ID,
+                model,
+                LLM_CHOOSING_USER_AGENT,
+                skip_auto_selection=True,
+            )
+        finally:
+            if previous_request_id is not None:
+                set_request_id(previous_request_id)
+            else:
+                clear_request_id()
 
     def _finish_unhandled(self, record, exc: BaseException):
         """Finish the processing record after an otherwise-unhandled exception.
@@ -172,12 +220,14 @@ class ProxyService:
             logger.exception("failed to finish processing record %s after unhandled exception", record.id)
         return error_response(502, "502 Bad Gateway", "server_error")
 
-    def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False):
-        auto_model_selection = self.auto_router.should_auto_select(
-            parsed,
-            model,
-            is_vip_channel,
-        )
+    def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False, skip_auto_selection: bool = False):
+        auto_model_selection = False
+        if not skip_auto_selection:
+            auto_model_selection = self.auto_router.should_auto_select(
+                parsed,
+                model,
+                is_vip_channel,
+            )
         context = self._selection_context(
             record,
             ip_id,
