@@ -66,6 +66,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "block_max_version": "1.2.26",
     },
     "admission": {"allow_when_user_info_missing": True},
+    "tokenizer": {"enabled": False},
     "cmdb": {"enabled": False, "dummy": True, "refresh_interval_between_ips_seconds": 1},
     "database": {
         "host": "localhost",

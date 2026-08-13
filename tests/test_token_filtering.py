@@ -2,14 +2,6 @@ import pytest
 from router.models import Server, Model
 from router.repositories.servers import ServerRepository
 from router.services.parser import RequestParser
-from router.utils import tokenizer_count
-
-
-class _FakeTokenizer:
-    is_fast = True
-
-    def encode(self, text, add_special_tokens=True):
-        return [1] * len(text)
 
 
 @pytest.mark.django_db
@@ -62,13 +54,11 @@ def test_unlimited_context_window_always_eligible_for_retry():
 
 
 @pytest.mark.django_db
-def test_parser_estimates_tokens_and_storage(monkeypatch):
-    Model.objects.create(model_name="test-model", model_path="/tmp/fake-path")
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
+def test_parser_estimates_tokens_and_storage():
     parser = RequestParser()
     body = b'{"model":"test-model","prompt":"Hello world, this is a test prompt to estimate tokens."}'
     parsed = parser.parse(body)
 
     assert parsed.estimated_full_body_tokens > 0
-    # The fake tokenizer counts characters; any real body must count > 5
+    # Estimate is prompt-bytes // 4, which is well above 5 for this body.
     assert parsed.estimated_full_body_tokens > 5

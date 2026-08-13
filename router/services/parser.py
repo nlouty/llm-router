@@ -4,8 +4,7 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
-from router.repositories.models import ModelRepository
-from router.utils.tokenizer_count import count_tokens_with_latency
+from router.utils.token_count import fast_estimate_tokens
 
 
 @dataclass
@@ -58,10 +57,11 @@ class RequestParser:
         max_tokens = self._safe_int(data.get("max_tokens"))
 
         model_name = data.get("model") if isinstance(data.get("model"), str) else None
-        model_path = ModelRepository.get_model_path(model_name)
-        estimated_full_body_tokens, tokenizer_latency_ms, tokenizer_error = count_tokens_with_latency(
-            model_path, body_str
-        )
+        # Fast estimate (no model needed) gives a value for the estimate_tokens
+        # column and small-request routing at parse time. The slow, real
+        # tokenizer runs later in ProxyService after a model is selected and only
+        # when tokenizer.enabled is on.
+        estimated_full_body_tokens = fast_estimate_tokens(body_str)
 
         new_body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return ParsedRequest(
@@ -71,8 +71,6 @@ class RequestParser:
             max_tokens=max_tokens,
             is_json=True,
             estimated_full_body_tokens=estimated_full_body_tokens,
-            tokenizer_latency_ms=tokenizer_latency_ms,
-            tokenizer_error=tokenizer_error,
         )
 
     @staticmethod

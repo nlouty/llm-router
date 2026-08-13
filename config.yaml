@@ -59,6 +59,9 @@ opencode:
 admission:
   allow_when_user_info_missing: true
 
+tokenizer:
+  enabled: false
+
 cmdb:
   enabled: false
   dummy: true
