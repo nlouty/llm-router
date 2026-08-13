@@ -15,6 +15,12 @@ class ModelRepository:
         return Model.objects.filter(model_name=model_name).first()
 
     @staticmethod
+    def get_by_id(model_id: int | None) -> Model | None:
+        if not model_id:
+            return None
+        return Model.objects.filter(id=model_id).first()
+
+    @staticmethod
     def is_auto_model_name(model_name: str | None) -> bool:
         return isinstance(model_name, str) and model_name.casefold() == "auto"
 

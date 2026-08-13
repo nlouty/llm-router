@@ -4,10 +4,14 @@ import json
 import random
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
+
+from django.utils import timezone
 
 from router.config import APP_CONFIG
 from router.repositories.models import ModelRepository
+from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import (
@@ -29,6 +33,7 @@ class AutoRouteAlgorithm:
     ROUTING_USER_PROMPT_CHAR_LIMIT = 500
     ROUTING_USER_PROMPT_COLLAPSE_MULTIPLIER = 3
     ROUTING_USER_PROMPT_MESSAGE_LIMIT = 20
+    STICKY_SESSION_WINDOW_SECONDS = 3600
 
     def __init__(self, chooser=None, proxy=None):
         self.chooser = chooser
@@ -204,6 +209,10 @@ class AutoRouteAlgorithm:
 
         model_names = [model.model_name for model in auto_models]
 
+        sticky_model = self._resolve_sticky_model(context)
+        if sticky_model is not None:
+            return sticky_model, "session-sticky"
+
         cached_model = self._check_cache_hit(body, auto_models, model_names)
         if cached_model:
             return cached_model, "cache_hit"
@@ -258,6 +267,32 @@ class AutoRouteAlgorithm:
                 if len(cache_hits) == 1:
                     return cache_hits[0]
         return None
+
+    def _resolve_sticky_model(self, context: ServerSelectionContext) -> Any | None:
+        session = getattr(context, "session", None)
+        if not isinstance(session, str) or not session:
+            return None
+
+        since = timezone.now() - timedelta(seconds=self.STICKY_SESSION_WINDOW_SECONDS)
+        choices = RequestRepository.list_recent_session_choices(session, since)
+        for choice in choices:
+            if not self.is_sticky_anchor_result(choice.get("router_result")):
+                continue
+            model = ModelRepository.get_by_id(choice.get("model_id"))
+            if model is not None and ServerRepository.list_pd_holders(model.id, vip=False):
+                return model
+        return None
+
+    @staticmethod
+    def is_sticky_anchor_result(router_result: str | None) -> bool:
+        # router_result is "{origin_model}:{decision}..." so the decision token
+        # is never at the start; use substring membership, not a prefix check.
+        if not router_result:
+            return False
+        return (
+            "small_request_routing" not in router_result
+            and "multimodal_bypass" not in router_result
+        )
 
     @staticmethod
     def _user_prompt_count_from_body(body: bytes) -> int:

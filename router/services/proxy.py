@@ -37,6 +37,7 @@ from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import LeastConnectionServerChooser
 from router.utils.errors import error_payload, error_response, timeout_sse_event
 from router.utils.headers import filter_request_headers
+from router.utils.session import extract_session_id
 
 
 logger = logging.getLogger(__name__)
@@ -106,9 +107,10 @@ class ProxyService:
 
     def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False, skip_auto_selection: bool = False):
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
-        record = self._create_processing_record(ip_id, model, parsed, user_agent, user_ip_id=user_ip_id)
-        append_verbose_request_log(record.id, django_request.body)
         normalized = path.rstrip("/")
+        session = extract_session_id(dict(django_request.headers)) if normalized == "chat/completions" else None
+        record = self._create_processing_record(ip_id, model, parsed, user_agent, user_ip_id=user_ip_id, session=session)
+        append_verbose_request_log(record.id, django_request.body)
         # Open the per-request log for every proxied request, not only when a
         # server is chosen in _route_with_retry: failures before that point
         # (e.g. no candidates -> synthetic 502) would otherwise leave the DB
@@ -309,7 +311,7 @@ class ProxyService:
         )
 
     @staticmethod
-    def _create_processing_record(ip_id: int | None, model, parsed, user_agent: str | None, user_ip_id: int = 0):
+    def _create_processing_record(ip_id: int | None, model, parsed, user_agent: str | None, user_ip_id: int = 0, session: str | None = None):
         return RequestRepository.create_processing(
             ip_id,
             model.id if model else 0,
@@ -317,6 +319,7 @@ class ProxyService:
             user_agent,
             user_ip_id=user_ip_id,
             estimate_tokens=parsed.estimated_full_body_tokens,
+            session=session,
         )
 
     def _count_tokens_after_selection(self, parsed, record, model):
@@ -375,6 +378,7 @@ class ProxyService:
             headers=headers,
             origin_model_name=parsed.model_name,
             auto_model_selection=auto_model_selection,
+            session=getattr(record, "session", None),
         )
 
     def _build_url(self, base_url: str, path: str, query_string: str) -> str:
