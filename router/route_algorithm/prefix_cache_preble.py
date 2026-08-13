@@ -12,7 +12,10 @@ import redis
 
 from router.config import APP_CONFIG
 from router.route_algorithm.base import ServerSelectionContext
-from router.route_algorithm.least_connection import LeastConnectionServerChooser
+from router.route_algorithm.least_connection import (
+    LeastConnectionServerChooser,
+    effective_weight,
+)
 from router.services.request_log_handler import install_pd_handler
 from router.services.request_logger import append_request_log
 
@@ -284,16 +287,41 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
         load_counts = self._load_counts(available)
         cached = self._pick_least_loaded(cached_matches, load_counts)
-        cached_norm = self._normalized_load(cached, load_counts)
-        min_norm = min(self._normalized_load(server, load_counts) for server in available)
-        if self._is_overloaded(cached_norm, min_norm):
+        if self._is_cached_overloaded(cached, available, load_counts):
             logger.info(
-                "[PrefixCachePreble] cached server_id=%s normalized_load=%.2f exceeds min=%.2f; "
+                "[PrefixCachePreble] cached server_id=%s overloaded; "
                 "falling back to least loaded server",
-                cached.id, cached_norm, min_norm,
+                cached.id,
             )
             return self._pick_least_loaded(available, load_counts)
         return cached
+
+    def _is_cached_overloaded(
+        self,
+        cached: Any,
+        available: Sequence[Any],
+        load_counts: dict[int, float],
+    ) -> bool:
+        cached_norm = self._normalized_load(cached, load_counts)
+        min_norm = min(self._normalized_load(server, load_counts) for server in available)
+        if self._is_overloaded(cached_norm, min_norm):
+            return True
+
+        if getattr(cached, "role", "mixed") != "prefiller":
+            return False
+        siblings = [
+            server
+            for server in available
+            if getattr(server, "role", "mixed") == "prefiller"
+            and getattr(server, "group_id", None) == getattr(cached, "group_id", None)
+        ]
+        if len(siblings) <= 1:
+            return False
+        own_loads = {
+            server.id: int(getattr(server, "workload", 0) or 0) / effective_weight(server)
+            for server in siblings
+        }
+        return self._is_overloaded(own_loads[cached.id], min(own_loads.values()))
 
     def _is_overloaded(self, normalized_load: float, minimum_normalized: float) -> bool:
         return (
@@ -361,31 +389,31 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 server.id, server.base_url, count,
             )
 
-    def _load_counts(self, available: Sequence[Any]) -> dict[int, int]:
-        """Workload per server, with PD prefillers reporting cluster bottleneck.
+    def _load_counts(self, available: Sequence[Any]) -> dict[int, float]:
+        """Workload per server, with PD prefillers reporting node + cluster load.
 
-        Mixed servers report their own workload. A prefiller reports its
-        cluster's bottleneck load (``max(min(P workload), min(D workload))``) so
-        the overload guard and least-loaded selection account for the whole
-        cluster rather than the prefiller node alone. Decoders are never in the
+        Mixed servers report their own workload. A prefiller reports
+        ``max(own workload, min decoder workload)`` so least-loaded selection
+        still prefers an idle prefiller within the cluster while a decoder-bound
+        cluster is never mistaken for an idle node. Decoders are never in the
         candidate set (they hold no prefix cache and are chosen later).
         """
         load_counts = super()._load_counts(available)
         prefillers = [s for s in available if getattr(s, "role", "mixed") == "prefiller"]
         if not prefillers:
             return load_counts
-        bottlenecks = self._cluster_bottlenecks()
+        decoder_mins = self._cluster_decoder_mins()
         for server in prefillers:
-            group_id = getattr(server, "group_id", None)
-            if group_id in bottlenecks:
-                load_counts[server.id] = bottlenecks[group_id]
+            own = int(getattr(server, "workload", 0) or 0)
+            floor = decoder_mins.get(getattr(server, "group_id", None), 0)
+            load_counts[server.id] = max(own, floor)
         return load_counts
 
     @staticmethod
-    def _cluster_bottlenecks() -> dict[str, float]:
+    def _cluster_decoder_mins() -> dict[str, float]:
         from router.repositories.servers import ServerRepository
 
-        return ServerRepository.cluster_bottleneck_load(ServerRepository.list_all_online())
+        return ServerRepository.cluster_decoder_min_load(ServerRepository.list_all_online())
 
     def _prefix_chars_from_body(self, body: bytes) -> str:
         text = self._text_from_body(body)

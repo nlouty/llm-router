@@ -83,9 +83,9 @@ def mock_redis():
         PrefixCachePrebleServerChooser._redis_client = None
 
 
-def _chooser_with_workload(server_workloads: dict[int, int], bottlenecks: dict[str, float] | None = None):
+def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[str, float] | None = None):
     """Build a chooser where each server reports a fixed workload, and PD
-    cluster bottlenecks are stubbed (no DB needed)."""
+    decoder-min loads are stubbed (no DB needed)."""
     c = PrefixCachePrebleServerChooser.__new__(PrefixCachePrebleServerChooser)
     # minimal init skipping redis/APP_CONFIG
     c.primary_match_threshold = 0.9
@@ -99,20 +99,20 @@ def _chooser_with_workload(server_workloads: dict[int, int], bottlenecks: dict[s
         s.id: server_workloads.get(s.id, getattr(s, "workload", 0)) for s in servers
     }
     c._ensure_redis = lambda: None
-    if bottlenecks is not None:
-        c._cluster_bottlenecks = staticmethod(lambda: bottlenecks)
+    if decoder_mins is not None:
+        c._cluster_decoder_mins = staticmethod(lambda: decoder_mins)
     return c
 
 
-class TestPrefillerLoadUsesClusterBottleneck:
-    def test_no_prefix_hit_prefiller_reports_cluster_bottleneck(self, mock_redis):
-        # cluster g1: min(P)=5, min(D)=1 -> bottleneck max(5,1)=5
+class TestPrefillerLoadUsesDecoderFloor:
+    def test_no_prefix_hit_prefiller_reports_decoder_floor(self, mock_redis):
+        # cluster g1: min(D)=1; prefiller own workload=5 -> effective max(5,1)=5
         # mixed m1: workload 0 -> should win (0 < 5)
         candidates = [
             make_server(1, "http://m1", role="mixed", workload=0),
             make_server(2, "http://p1", role="prefiller", group_id="g1", workload=5),
         ]
-        chooser = _chooser_with_workload({}, bottlenecks={"g1": 5.0})
+        chooser = _chooser_with_workload({}, decoder_mins={"g1": 1.0})
         ctx = make_context(make_body("a fresh prompt with no cached match"))
         selected = chooser.choose(candidates, ctx, set())
         assert selected.id == 1  # mixed wins; prefiller's load is 5 not 0
@@ -121,21 +121,49 @@ class TestPrefillerLoadUsesClusterBottleneck:
         # Seed Redis: prefix maps to prefiller (id=2), ratio 1.0
         _, storage = mock_redis
         body = make_body("shared prefix content")
-        # Capture what the real instance hashes, by calling on_response once
-        chooser = _chooser_with_workload({}, bottlenecks={"g1": 100.0})
+        chooser = _chooser_with_workload({}, decoder_mins={"g1": 100.0})
         prefiller = make_server(2, "http://p1", role="prefiller", group_id="g1")
         chooser.on_response(prefiller, make_context(body, request_id=42), 200)
         assert storage, "on_response should have written prefix entries"
 
-        # Now: a fresh mixed server is idle (load 0); prefiller cluster bottleneck=100.
+        # A fresh mixed server is idle (load 0); prefiller decoder floor=100.
         # Overload guard (gap>=4 and ratio>=2.0) must fall back to the mixed server.
         candidates = [
             make_server(1, "http://m1", role="mixed", workload=0),
             prefiller,
         ]
-        chooser2 = _chooser_with_workload({}, bottlenecks={"g1": 100.0})
+        chooser2 = _chooser_with_workload({}, decoder_mins={"g1": 100.0})
         selected = chooser2.choose(candidates, make_context(body), set())
         assert selected.id == 1
+
+
+class TestPrefillerBalancingWithinCluster:
+    def test_no_prefix_hit_prefers_idle_prefiller_over_busy_sibling(self, mock_redis):
+        candidates = [
+            make_server(1, "http://p1", role="prefiller", group_id="g1", workload=7),
+            make_server(2, "http://p2", role="prefiller", group_id="g1", workload=0),
+            make_server(3, "http://p3", role="prefiller", group_id="g1", workload=0),
+        ]
+        chooser = _chooser_with_workload({}, decoder_mins={"g1": 0.0})
+        ctx = make_context(make_body("a fresh prompt with no cached match"))
+        selected = chooser.choose(candidates, ctx, set())
+        assert selected.id in (2, 3)
+
+    def test_prefix_hit_on_busy_prefiller_falls_back_within_cluster(self, mock_redis):
+        _, storage = mock_redis
+        body = make_body("shared prefix content")
+        busy = make_server(1, "http://p1", role="prefiller", group_id="g1", workload=7)
+        idle = make_server(2, "http://p2", role="prefiller", group_id="g1", workload=0)
+        chooser = _chooser_with_workload({}, decoder_mins={"g1": 5.0})
+        chooser.on_response(busy, make_context(body, request_id=42), 200)
+        assert storage, "on_response should have written prefix entries"
+
+        candidates = [busy, idle]
+        selected = chooser.choose(candidates, make_context(body), set())
+        # busy effective = max(7,5)=7; idle = max(0,5)=5.
+        # Cross-cluster guard: 7 vs 5 not overloaded (gap 2 < 4).
+        # Within-cluster guard: own workload 7 vs 0 overloaded -> fall back to idle.
+        assert selected.id == 2
 
 
 class TestOnResponseRecordsPrefiller:
