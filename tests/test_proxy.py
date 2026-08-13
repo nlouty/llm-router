@@ -2,6 +2,8 @@ import json
 from datetime import timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
 from django.http import HttpResponse
 from django.test import Client
 from django.utils import timezone
@@ -13,7 +15,7 @@ from router.route_algorithm.base import ServerSelectionContext
 from router.repositories.requests import LLM_CHOOSING_IP_ID
 from router.services.admission import AdmissionResult
 from router.services.proxy import ProxyService
-from router.utils import tokenizer_count
+from router.utils import token_count
 
 
 class _FakeTokenizer:
@@ -25,9 +27,9 @@ class _FakeTokenizer:
         return [1] * len(text)
 
 
-def test_zero_token_count_is_not_small_request_routed():
-    # Issue #227: requests whose count failed (0) must never be sent to the
-    # small-request routing model; only a known small count routes there.
+def test_small_request_routing_uses_fast_estimate():
+    # Small-request routing is gated on the fast token estimate (no model needed
+    # because no tokenizer is selected yet). 0 means no countable body.
     router = AutoRouteAlgorithm()
     assert router.should_route_small_request(MagicMock(estimated_full_body_tokens=0)) is False
     assert router.should_route_small_request(MagicMock(estimated_full_body_tokens=1)) is True
@@ -198,53 +200,62 @@ def test_auto_route_request_disables_thinking():
     assert sent["json"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_auto_route_recounts_with_resolved_model_tokenizer(monkeypatch):
-    # Regression: _resolve_auto_model re-counts tokens with the resolved target
-    # model's tokenizer. count_tokens_with_latency returns a 3-tuple; this path
-    # must unpack all three or raise ValueError and orphan the processing record.
-    target_model = Model.objects.create(
-        model_name="target-model",
-        auto=True,
-        complexity_min=1,
-        complexity_max=10,
-        model_path="/tmp/fake-path",
+@pytest.mark.django_db
+def test_count_tokens_after_selection_respects_toggle(monkeypatch):
+    # Tokenization runs only when the toggle is on AND the resolved model has a
+    # model_path. With it off (the default) no tokenizer is loaded at all.
+    from router.repositories.requests import RequestRepository
+    from router.services.parser import ParsedRequest
+
+    model = Model.objects.create(model_name="m", model_path="/tmp/fake-path")
+    record = RequestRepository.create_processing(None, model.id, False, None)
+    parsed = ParsedRequest(
+        body=b'{"model":"m","messages":[{"role":"user","content":"hello"}]}',
+        model_name="m",
+        stream=False,
+        max_tokens=None,
+        is_json=True,
     )
-    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
-    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+    calls = []
 
-    def fake_post(url, json, headers, timeout):
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":5}'}}]}
-        return response
+    def fake_get_tokenizer(path):
+        calls.append(path)
+        return _FakeTokenizer()
 
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
+    monkeypatch.setattr(token_count, "_get_tokenizer", fake_get_tokenizer)
+    service = ProxyService()
 
-    service = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fake_post))
-    parsed = MagicMock(
-        model_name="auto",
-        body=b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
-        estimated_full_body_tokens=0,
-    )
-    context = ServerSelectionContext(
-        request_id=123,
-        ip_id=None,
-        model_id=None,
-        model_name="auto",
-        path="chat/completions",
-        method="POST",
-        is_stream=False,
-        body=parsed.body,
-        auto_model_selection=True,
-    )
-    record = MagicMock(id=123)
+    service.tokenizer_enabled = False
+    service._count_tokens_after_selection(parsed, record, model)
+    assert record.estimate_tokens == 0
+    assert calls == []
 
-    decision = service.resolve(parsed, record, context, None, is_vip_channel=False)
-
-    assert decision.model == target_model
-    # The resolved model has a tokenizer; estimate_tokens must be recounted (>0),
-    # not left at 0 and not raise.
+    service.tokenizer_enabled = True
+    service._count_tokens_after_selection(parsed, record, model)
     assert record.estimate_tokens > 0
+    assert calls == ["/tmp/fake-path"]
+
+
+@pytest.mark.django_db
+def test_count_tokens_after_selection_skips_model_without_path(monkeypatch):
+    from router.repositories.requests import RequestRepository
+    from router.services.parser import ParsedRequest
+
+    model = Model.objects.create(model_name="m")  # no model_path
+    record = RequestRepository.create_processing(None, model.id, False, None)
+    parsed = ParsedRequest(
+        body=b'{"model":"m","messages":[{"role":"user","content":"hello"}]}',
+        model_name="m",
+        stream=False,
+        max_tokens=None,
+        is_json=True,
+    )
+    monkeypatch.setattr(token_count, "_get_tokenizer", lambda path: _FakeTokenizer())
+    service = ProxyService()
+    service.tokenizer_enabled = True
+    service._count_tokens_after_selection(parsed, record, model)
+    # No model_path -> nothing counted, no "no model_path" noise logged.
+    assert record.estimate_tokens == 0
 
 
 def test_auto_route_records_llm_choosing_request_row(monkeypatch):
@@ -1313,7 +1324,7 @@ def test_routing_payload_requests_structured_output(monkeypatch):
 
 
 def test_small_counted_request_uses_routing_model_before_complexity(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
+    Model.objects.create(model_name="user-model", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1336,7 +1347,6 @@ def test_small_counted_request_uses_routing_model_before_complexity(monkeypatch)
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
 
     response = Client().post(
         "/v1/chat/completions",
@@ -1390,7 +1400,7 @@ def test_auto_route_without_routing_model_uses_fallback_and_records_router_resul
 
 
 def test_small_counted_request_uses_routing_model_directly(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
+    Model.objects.create(model_name="user-model", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1412,8 +1422,6 @@ def test_small_counted_request_uses_routing_model_directly(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
-
     response = Client().post(
         "/v1/chat/completions",
         data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),
@@ -1652,7 +1660,7 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
 
 
 def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
+    Model.objects.create(model_name="user-model", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1674,8 +1682,6 @@ def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
-
     response = Client().post(
         "/v1/chat/completions",
         data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),
@@ -1729,7 +1735,7 @@ def test_auto_route_without_routing_server_uses_fallback_and_records_router_resu
 
 
 def test_small_counted_request_succeeds_with_routing_server(monkeypatch):
-    Model.objects.create(model_name="user-model", model_path="/fake-path", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
+    Model.objects.create(model_name="user-model", max_tokens=30000, auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
@@ -1751,8 +1757,6 @@ def test_small_counted_request_succeeds_with_routing_server(monkeypatch):
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
         fake_request,
     )
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: _FakeTokenizer())
-
     response = Client().post(
         "/v1/chat/completions",
         data=json.dumps({"model": "user-model", "messages": [{"role": "user", "content": "hello"}]}),

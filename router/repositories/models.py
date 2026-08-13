@@ -15,24 +15,6 @@ class ModelRepository:
         return Model.objects.filter(model_name=model_name).first()
 
     @staticmethod
-    def get_model_path(model_name: str | None) -> str | None:
-        """Lightweight lookup of ``models.model_path`` for tokenizer counting.
-
-        Returns None when the model is unknown or the lookup fails, so counting
-        degrades to 0 rather than raising in the request path.
-        """
-        if not model_name:
-            return None
-        try:
-            return (
-                Model.objects.filter(model_name=model_name)
-                .values_list("model_path", flat=True)
-                .first()
-            )
-        except Exception:
-            return None
-
-    @staticmethod
     def is_auto_model_name(model_name: str | None) -> bool:
         return isinstance(model_name, str) and model_name.casefold() == "auto"
 

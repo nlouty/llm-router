@@ -30,6 +30,7 @@ from router.services.opencode import OpencodeVersionService
 from router.services.parser import ParsedRequest, RequestParser
 from router.services import proxy_logging, proxy_response
 from router.services.request_logger import append_verbose_request_log
+from router.utils.token_count import count_tokens_with_latency
 from router.services.vip_channel import VIPChannelService
 from router.route_algorithm.auto import AutoRouteAlgorithm
 from router.route_algorithm.base import ServerSelectionContext
@@ -100,6 +101,7 @@ class ProxyService:
         self.circuit_breaker = CircuitBreakerService()
         self.vip_service = VIPChannelService()
         self.vip_port = int(APP_CONFIG.get("server", {}).get("vip_port", 8008))
+        self.tokenizer_enabled = bool(APP_CONFIG.get("tokenizer", {}).get("enabled", False))
         self._active_chooser = None
 
     def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False, skip_auto_selection: bool = False):
@@ -122,16 +124,6 @@ class ProxyService:
                 "is_vip_channel": is_vip_channel,
                 "user_ip_id": user_ip_id,
             }, ensure_ascii=False))
-            if isinstance(parsed, ParsedRequest):
-                tokenizer_event = {
-                    "event": "tokenizer_count",
-                    "request_id": record.id,
-                    "tokens": parsed.estimated_full_body_tokens,
-                    "latency_ms": parsed.tokenizer_latency_ms,
-                }
-                if parsed.tokenizer_error:
-                    tokenizer_event["error"] = parsed.tokenizer_error
-                append_request_log(record.id, json.dumps(tokenizer_event, ensure_ascii=False))
             if normalized == "chat/completions":
                 return self._forward_chat(
                     django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip, skip_auto_selection
@@ -260,6 +252,8 @@ class ProxyService:
                     int((time.monotonic() - model_choice_started) * 1000),
                 )
 
+        self._count_tokens_after_selection(parsed, record, model)
+
         candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
         if served_as_vip:
             record.vip = True
@@ -324,6 +318,39 @@ class ProxyService:
             user_ip_id=user_ip_id,
             estimate_tokens=parsed.estimated_full_body_tokens,
         )
+
+    def _count_tokens_after_selection(self, parsed, record, model):
+        """Count tokens with the resolved model's tokenizer when enabled.
+
+        Runs after model selection so a real tokenizer path is always known,
+        avoiding the chicken-and-egg of needing a model to tokenize before one
+        is selected. Skipped entirely when the toggle is off (default) or the
+        resolved model has no ``model_path``.
+        """
+        if not self.tokenizer_enabled:
+            return
+        if model is None or not getattr(model, "model_path", None):
+            return
+        if not isinstance(parsed, ParsedRequest):
+            return
+        count, latency_ms, error = count_tokens_with_latency(
+            model.model_path,
+            parsed.body.decode("utf-8", errors="replace"),
+        )
+        parsed.estimated_full_body_tokens = count
+        parsed.tokenizer_latency_ms = latency_ms
+        parsed.tokenizer_error = error
+        record.estimate_tokens = count
+        record.save(update_fields=["estimate_tokens"])
+        tokenizer_event = {
+            "event": "tokenizer_count",
+            "request_id": record.id,
+            "tokens": count,
+            "latency_ms": latency_ms,
+        }
+        if error:
+            tokenizer_event["error"] = error
+        append_request_log(record.id, json.dumps(tokenizer_event, ensure_ascii=False))
 
     @staticmethod
     def _selection_context(

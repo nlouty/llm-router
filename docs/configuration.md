@@ -59,6 +59,9 @@ opencode:
 admission:
   allow_when_user_info_missing: true
 
+tokenizer:
+  enabled: false
+
 cmdb:
   enabled: false
   dummy: true
@@ -137,3 +140,5 @@ Prefix cache blocks are measured in Python Unicode characters, not LLM tokenizer
 `prefix_cache.primary_match_threshold` chooses among cached servers when the best per-server match is above the threshold. `secondary_match_threshold` chooses among partially matching servers before falling back to all candidates. `max_prefix_chars` caps the prefix text stored and checked per request. `prefix_block_chars` controls the character block size used to build Redis prefix hashes.
 
 `router.fallback_model` is used by auto routing when the classifier cannot produce a unique target. `router.system_prompt_path` points to the complexity-classifier prompt. `router.auto_concurrent_limit` is the base concurrency limit for exact `model: auto` requests before multiplying by `ips.concurrent_multiplier`.
+
+`tokenizer.enabled` toggles real tokenizer counting. It is **off by default**: the router always computes a fast heuristic estimate (`fast_estimate_tokens`, a char/byte heuristic in `router/utils/token_count.py` that needs no model) at parse time, which feeds `requests.estimate_tokens` and small-request routing. When enabled, after a model is selected the router counts the request again with that model's tokenizer (loaded from `models.model_path` via `AutoTokenizer.from_pretrained`, fast with slow fallback, cached per worker) and overwrites `estimate_tokens` with the real count, logging a `tokenizer_count` event (tokens, latency_ms) to the per-request log. Small-request routing always uses the fast heuristic, because no model is resolved yet.

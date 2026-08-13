@@ -5,7 +5,7 @@
 There are two related behaviors:
 
 - True auto model selection: requests whose input model is `auto`, or normal-port requests for a concrete model whose `models.auto = TRUE`, can be rewritten to another model.
-- Small-request routing: normal-port requests with an estimated full body size below `3000` tokens can be sent to a configured routing model before true auto selection runs.
+- Small-request routing: normal-port auto requests whose fast token estimate is below `3000` can be sent to a configured routing model before true auto selection runs. The estimate is a cheap char/byte heuristic (`fast_estimate_tokens`) that needs no model, so it is available before one is selected.
 
 ## Database Setup
 
@@ -62,7 +62,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
 2. Try small-request routing.
 
-   This step runs first for auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port whose token count is known and between `1` and `3000`. A 0 count (counting failed or no `model_path`) is never small-routed, and explicit (non-auto) model requests are never rewritten to the routing model.
+   This step runs first for auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port whose fast token estimate is between `1` and `3000`. The estimate is `fast_estimate_tokens` (a char/byte heuristic that needs no model), so it works before any model is selected. Explicit (non-auto) model requests are never rewritten to the routing model.
 
    The router scans `models.is_routing_model = TRUE` rows by ascending `id` and asks for non-VIP servers for each routing model. Candidate servers must be online, routable by circuit-breaker state, not soft-deleted, and have `context_window IS NULL OR context_window >= estimate_tokens`.
 
@@ -156,7 +156,7 @@ The original client request row records:
 
 - `model_id`: updated to the selected concrete model when one is chosen.
 - `router_result`: original model prefix plus the route decision, capped at 300 characters. This is persisted during processing (together with `model_id`) as soon as a model is resolved, not only at request finish. `AdmissionService.check_concurrency` reads the prefix (everything before the first `:`) to bucket in-flight requests by their entrance model, so the origin prefix must not be removed or reordered.
-- `estimate_tokens`: fast estimate from the original body.
+- `estimate_tokens`: fast heuristic estimate (`fast_estimate_tokens`) before model selection, replaced by a real tokenizer count after model selection when `tokenizer.enabled` is on.
 - `model_choosing_latency`: elapsed milliseconds for small-request routing or true auto selection.
 - `prefix_cache` and `last_match`: server-selection prefix-cache data for the final upstream attempt.
 

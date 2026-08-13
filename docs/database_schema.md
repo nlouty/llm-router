@@ -128,7 +128,7 @@ ALTER TABLE models ADD COLUMN model_path VARCHAR(500) NULL;
 
 `multimodal` marks the model as eligible for auto-routed requests that contain `image_url` chat parts.
 
-`model_path` is admin-managed and locates the underlying model artifact for tokenizer counting: a local directory or a Hugging Face repo id passed to `AutoTokenizer.from_pretrained`. The router uses it to count request tokens with the real tokenizer; `NULL` disables real counting for that model (the router records 0). It is set via `/api/add_server`.
+`model_path` is admin-managed and locates the underlying model artifact for tokenizer counting: a local directory or a Hugging Face repo id passed to `AutoTokenizer.from_pretrained`. It is used only when `tokenizer.enabled` is on; counting runs after a model is selected. `NULL` (or the toggle off) leaves `estimate_tokens` at the fast heuristic value. It is set via `/api/add_server`.
 
 ## `servers` Table
 
@@ -205,7 +205,7 @@ ALTER TABLE requests ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
 
 `router_result` stores auto-routing and small-request-routing decisions, prefixed by the originally requested model name. Examples: `auto:complexity:7`, `AUTO:cache_hit`, `source-model:small_request_routing`, `auto:routing_failed:missing_routing_server:no available routing server`.
 
-`estimate_tokens` stores the token count from the original request body — a real tokenizer count via the model's `model_path`, or 0 when no path is set or tokenization fails. It is used for small-request routing (auto requests only, and only when the count is between 1 and the limit; a 0 count is never routed to the small-request model) and VIP scale-down; it is not used to pre-filter candidate servers (server context-window handling is reactionary).
+`estimate_tokens` stores a token estimate of the original request body. At parse time it holds the fast heuristic estimate (`fast_estimate_tokens`, a char/byte heuristic that needs no model). When `tokenizer.enabled` is on and the resolved model has a `model_path`, it is overwritten with a real tokenizer count after model selection; otherwise it stays at the heuristic value. It is used for small-request routing (auto requests only, gated by this estimate) and VIP scale-down; it is not used to pre-filter candidate servers (server context-window handling is reactionary).
 
 `model_choosing_latency` stores elapsed milliseconds for model choosing when the request uses true auto selection or small-request routing.
 

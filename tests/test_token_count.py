@@ -3,17 +3,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from router.utils import tokenizer_count
-from router.utils.tokenizer_count import count_tokens_with_latency
+from router.utils import token_count
+from router.utils.token_count import count_tokens_with_latency
 
 
 @pytest.fixture(autouse=True)
 def _reset_tokenizer_state():
-    tokenizer_count._tokenizers.clear()
-    tokenizer_count._failed_paths.clear()
-    tokenizer_count._load_errors.clear()
-    tokenizer_count._import_failed = False
-    tokenizer_count._import_error = None
+    token_count._tokenizers.clear()
+    token_count._failed_paths.clear()
+    token_count._load_errors.clear()
+    token_count._import_failed = False
+    token_count._import_error = None
     yield
 
 
@@ -40,7 +40,7 @@ def test_empty_path_or_text_counts_zero_with_reason():
 
 
 def test_counts_text_and_reports_latency(monkeypatch):
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: FakeTokenizer())
+    monkeypatch.setattr(token_count, "_get_tokenizer", lambda path: FakeTokenizer())
     count, latency, reason = count_tokens_with_latency("p", "hello")
     assert count == 5
     assert latency >= 0
@@ -48,14 +48,14 @@ def test_counts_text_and_reports_latency(monkeypatch):
 
 
 def test_encode_failure_counts_zero_with_reason(monkeypatch):
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: FakeTokenizer())
+    monkeypatch.setattr(token_count, "_get_tokenizer", lambda path: FakeTokenizer())
     count, latency, reason = count_tokens_with_latency("p", "boom")
     assert (count, latency) == (0, 0)
     assert reason == "tokenizer encode failed for model_path=p: encode failed"
 
 
 def test_unloadable_path_counts_zero_with_reason(monkeypatch):
-    monkeypatch.setattr(tokenizer_count, "_get_tokenizer", lambda path: None)
+    monkeypatch.setattr(token_count, "_get_tokenizer", lambda path: None)
     count, latency, reason = count_tokens_with_latency("p", "hello")
     assert (count, latency) == (0, 0)
     assert reason == "tokenizer load failed for model_path=p: unknown error"
@@ -90,8 +90,8 @@ def test_tokenizer_loaded_once_per_path(monkeypatch):
         )
     )
     monkeypatch.setitem(sys.modules, "transformers", transformers)
-    first = tokenizer_count._get_tokenizer("p")
-    second = tokenizer_count._get_tokenizer("p")
+    first = token_count._get_tokenizer("p")
+    second = token_count._get_tokenizer("p")
     assert first is second
     assert calls == ["p"]
 
@@ -107,7 +107,7 @@ def test_fast_then_slow_fallback(monkeypatch):
 
     transformers = SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=from_pretrained))
     monkeypatch.setitem(sys.modules, "transformers", transformers)
-    assert tokenizer_count._get_tokenizer("p") is not None
+    assert token_count._get_tokenizer("p") is not None
     assert calls == [True, False]
 
 
@@ -120,17 +120,17 @@ def test_failed_path_not_retried(monkeypatch):
 
     transformers = SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=from_pretrained))
     monkeypatch.setitem(sys.modules, "transformers", transformers)
-    assert tokenizer_count._get_tokenizer("p") is None
-    assert tokenizer_count._get_tokenizer("p") is None
+    assert token_count._get_tokenizer("p") is None
+    assert token_count._get_tokenizer("p") is None
     # fast+slow once per path, never retried on subsequent calls
     assert len(calls) == 2
-    assert tokenizer_count._load_errors["p"] == "always fails"
+    assert token_count._load_errors["p"] == "always fails"
 
 
 def test_missing_transformers_disables_counting(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", None)
-    assert tokenizer_count._get_tokenizer("p") is None
-    assert tokenizer_count._import_failed is True
-    assert tokenizer_count._import_error is not None
+    assert token_count._get_tokenizer("p") is None
+    assert token_count._import_failed is True
+    assert token_count._import_error is not None
     # Short-circuits without retrying the import
-    assert tokenizer_count._get_tokenizer("p") is None
+    assert token_count._get_tokenizer("p") is None
