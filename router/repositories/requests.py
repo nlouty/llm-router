@@ -47,6 +47,7 @@ class RequestRepository:
         user_ip_id: int = 0,
         vip: bool = False,
         estimate_tokens: int = 0,
+        session: str | None = None,
     ) -> RequestRecord:
         return RequestRecord.objects.create(
             user_ip_id=user_ip_id,
@@ -64,6 +65,7 @@ class RequestRepository:
             final_prefix_cache=0,
             last_match=None,
             estimate_tokens=estimate_tokens,
+            session=(session or "")[:255] or None,
         )
 
     @staticmethod
@@ -292,6 +294,26 @@ class RequestRepository:
             RequestRecord.objects.filter(ip_id=ip_id).filter(is_processing_q())
             .exclude(vip=True)
             .values("model_id", "router_result")
+        )
+
+    @staticmethod
+    def list_recent_session_choices(session: str, since, limit: int = 10) -> list[dict]:
+        """Recent committed model choices for one session, newest first.
+
+        Only rows that already carry a concrete model and a router_result are
+        returned; callers decide which of those results count as sticky anchors.
+        """
+        if not session:
+            return []
+        return list(
+            RequestRecord.objects.filter(
+                session=session,
+                send_time__gte=since,
+                model_id__gt=0,
+                router_result__isnull=False,
+            )
+            .order_by("-send_time", "-id")
+            .values("id", "model_id", "router_result")[:limit]
         )
 
     @staticmethod

@@ -67,6 +67,8 @@ def api_test_tables(django_db_setup, django_db_blocker):
                 schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("ttft"))
             if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "vip"):
                 schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("vip"))
+            if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "session"):
+                schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("session"))
             if Server._meta.db_table in connection.introspection.table_names() and not has_column("servers", "context_window"):
                 schema_editor.add_field(Server, Server._meta.get_field("context_window"))
             # PD disaggregation columns

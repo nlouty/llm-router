@@ -142,6 +142,7 @@ class RequestRecord(TimestampedSoftDeleteModel):
     router_result = models.CharField(max_length=300, blank=True, null=True)
     estimate_tokens = models.IntegerField(default=0)
     model_choosing_latency = models.BigIntegerField(blank=True, null=True)
+    session = models.CharField(max_length=255, blank=True, null=True)
 
     class Meta:
         managed = False
@@ -181,6 +182,10 @@ class RequestRecord(TimestampedSoftDeleteModel):
                 name="idx_requests_model_send_ip",
                 fields=["model_id", "send_time", "ip_id"],
                 condition=Q(ip_id__isnull=False),
+            ),
+            models.Index(
+                name="idx_requests_session_send",
+                fields=["session", "send_time"],
             ),
         ]
 
