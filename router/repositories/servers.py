@@ -238,32 +238,27 @@ class ServerRepository:
         return result
 
     @staticmethod
-    def cluster_bottleneck_load(servers: list[Server]) -> dict[str, float]:
-        """Per-cluster bottleneck load: ``max(min(P workload), min(D workload))``.
+    def cluster_decoder_min_load(servers: list[Server]) -> dict[str, float]:
+        """Per-cluster minimum decoder workload.
 
-        A cluster is represented by the more loaded of its two sides; whichever
-        side (prefillers or decoders) has the higher least-loaded node decides
-        the cluster's effective load. Mixed servers are ignored here.
+        The decoder side of a PD cluster's load: the fewest in-flight decode
+        requests among its decoders. The chooser uses this to floor each
+        prefiller's effective load so a decoder-bound cluster is never mistaken
+        for an idle prefiller. Mixed servers are ignored here.
 
-        Returns a mapping of ``group_id`` -> bottleneck load. Clusters missing a
-        routable side are omitted (they were already filtered out by
-        ``list_pd_holders``).
+        Returns a mapping of ``group_id`` -> min decoder workload. Clusters with
+        no decoder are omitted.
         """
-        prefillers: dict[str, list[int]] = {}
         decoders: dict[str, list[int]] = {}
         for server in servers:
             role = getattr(server, "role", "mixed") or "mixed"
-            if role not in ("prefiller", "decoder") or not server.group_id:
+            if role != "decoder" or not server.group_id:
                 continue
-            workload = int(getattr(server, "workload", 0) or 0)
-            if role == "prefiller":
-                prefillers.setdefault(server.group_id, []).append(workload)
-            else:
-                decoders.setdefault(server.group_id, []).append(workload)
-        bottleneck: dict[str, float] = {}
-        for group_id in prefillers.keys() & decoders.keys():
-            bottleneck[group_id] = float(max(min(prefillers[group_id]), min(decoders[group_id])))
-        return bottleneck
+            decoders.setdefault(server.group_id, []).append(int(getattr(server, "workload", 0) or 0))
+        return {
+            group_id: float(min(workloads))
+            for group_id, workloads in decoders.items()
+        }
 
     @staticmethod
     def pick_least_tokens_decoder(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:

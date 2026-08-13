@@ -58,8 +58,8 @@ class TestListPdHolders:
         assert holders == []
 
 
-class TestClusterBottleneckLoad:
-    def test_bottleneck_is_max_of_min_per_side(self):
+class TestClusterDecoderMinLoad:
+    def test_decoder_min_is_min_workload_per_cluster(self):
         servers = [
             _server("http://p1", role="prefiller", group_id="g1", workload=2),
             _server("http://p2", role="prefiller", group_id="g1", workload=5),
@@ -67,18 +67,17 @@ class TestClusterBottleneckLoad:
             _server("http://d2", role="decoder", group_id="g1", workload=8),
             _server("http://m1", role="mixed"),
         ]
-        bottleneck = ServerRepository.cluster_bottleneck_load(servers)
-        # min(P)=2, min(D)=3 -> max=3
-        assert bottleneck == {"g1": 3.0}
+        decoder_mins = ServerRepository.cluster_decoder_min_load(servers)
+        assert decoder_mins == {"g1": 3.0}
 
-    def test_cluster_missing_side_is_omitted(self):
+    def test_cluster_without_decoder_is_omitted(self):
         servers = [
             _server("http://p1", role="prefiller", group_id="g1", workload=2),
             _server("http://d1", role="decoder", group_id="g2", workload=1),
         ]
-        bottleneck = ServerRepository.cluster_bottleneck_load(servers)
-        # g1 has no decoder, g2 has no prefiller -> both omitted
-        assert bottleneck == {}
+        decoder_mins = ServerRepository.cluster_decoder_min_load(servers)
+        # g1 has no decoder -> omitted
+        assert decoder_mins == {"g2": 1.0}
 
 
 class TestPickDecoder:
