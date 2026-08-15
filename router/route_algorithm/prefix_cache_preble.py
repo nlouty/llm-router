@@ -435,6 +435,28 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         if not isinstance(data, dict):
             return text
 
+        # Section order mirrors how serving-side chat templates lay out the
+        # rendered prompt (GLM-5.2 / DeepSeek-V4-Flash / Qwen3.6): generation
+        # options, then tool definitions, then the messages. vLLM prefix-cache
+        # blocks are chained from token 0, so any drift the template renders
+        # but this text omits produces a false high match ratio.
+        sections = []
+        options = {
+            key: data[key]
+            for key in ("reasoning_effort", "response_format", "chat_template_kwargs")
+            if key in data
+        }
+        if options:
+            sections.append("options: " + json.dumps(options, ensure_ascii=False))
+
+        tools = data.get("tools")
+        if isinstance(tools, list) and tools:
+            tool_lines = [
+                json.dumps(tool, ensure_ascii=False) if isinstance(tool, dict) else str(tool)
+                for tool in tools
+            ]
+            sections.append("tools:\n" + "\n".join(tool_lines))
+
         messages = data.get("messages")
         if isinstance(messages, list):
             parts = []
@@ -443,10 +465,15 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                     continue
                 role = message.get("role") or ""
                 content = PrefixCachePrebleServerChooser._message_content_text(message.get("content"))
-                if content:
-                    parts.append(f"{role}: {content}" if role else content)
+                tool_calls = PrefixCachePrebleServerChooser._tool_calls_text(message.get("tool_calls"))
+                turn_text = content + tool_calls
+                if turn_text:
+                    parts.append(f"{role}: {turn_text}" if role else turn_text)
             if parts:
-                return "\n".join(parts)
+                sections.append("\n".join(parts))
+
+        if sections:
+            return "\n".join(sections)
 
         prompt = data.get("prompt")
         if isinstance(prompt, str):
@@ -466,8 +493,35 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                     parts.append(item["text"])
                 elif isinstance(item, str):
                     parts.append(item)
+                elif isinstance(item, dict) and item.get("type"):
+                    # Non-text parts (images, audio, ...) still change the
+                    # rendered prompt via template placeholders or reminders.
+                    parts.append(f"<part:{item['type']}>")
             return "\n".join(parts)
         return ""
+
+    @staticmethod
+    def _tool_calls_text(tool_calls: Any) -> str:
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return ""
+        parts = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                function = tool_call
+            name = function.get("name") or ""
+            arguments = function.get("arguments")
+            if isinstance(arguments, dict):
+                args_text = json.dumps(arguments, ensure_ascii=False)
+            elif isinstance(arguments, str):
+                args_text = arguments
+            else:
+                args_text = ""
+            if name or args_text:
+                parts.append(f"<tool_call>{name}({args_text})")
+        return "".join(parts)
 
     @staticmethod
     def _float_setting(*values) -> float:
