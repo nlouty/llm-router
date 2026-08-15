@@ -1,9 +1,12 @@
 """
 测试API耗时记录中间件
 """
+from unittest.mock import MagicMock
+
 import pytest
 from django.test import Client
-from unittest.mock import patch
+
+from router.models import Server
 
 
 class TestAPITimingMiddleware:
@@ -37,6 +40,35 @@ class TestAPITimingMiddleware:
             assert '/healthy' in timing_log
             assert '200' in timing_log
             assert 'ms' in timing_log
+
+    def test_api_timing_skips_v1_paths(self, client, caplog, monkeypatch):
+        """测试 /v1/* 请求不输出中间件日志（issue #232）"""
+        Server.objects.create(model_id=None, base_url="http://shared.example", is_online=True)
+
+        def fake_request(self_inner, method, url, **kwargs):
+            upstream = MagicMock()
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"data":[]}'
+            upstream.headers = {"content-type": "application/json"}
+            return upstream
+
+        monkeypatch.setattr(
+            "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+            fake_request,
+        )
+
+        with caplog.at_level('INFO'):
+            response = client.get('/v1/models')
+
+            assert response.status_code == 200
+
+            middleware_logs = [
+                record.message
+                for record in caplog.records
+                if record.name == 'router.middleware'
+            ]
+            assert not any('/v1/models' in msg for msg in middleware_logs)
 
     def test_api_timing_format(self, client, caplog):
         """测试日志格式是否正确"""
