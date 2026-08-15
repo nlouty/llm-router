@@ -22,6 +22,10 @@ class APITimingMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
+        # /v1/* 请求量大且有独立的请求日志，跳过中间件日志（issue #232）
+        if request.path.startswith("/v1/"):
+            return self.get_response(request)
+
         # 记录请求开始时间
         start_time = time.time()
 
