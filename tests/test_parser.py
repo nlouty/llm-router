@@ -77,3 +77,44 @@ def test_parser_does_not_bump_up_when_max_tokens_equal_default():
     data = json.loads(parsed.body.decode())
     assert parsed.max_tokens == 28528
     assert data["max_tokens"] == 28528
+
+
+def test_parser_uses_max_completion_tokens_as_effective_limit():
+    # vLLM honors max_completion_tokens over max_tokens, so the effective
+    # limit (and the admission check) must follow it, even above the default.
+    parsed = RequestParser(default_max_tokens=28528).parse(
+        b'{"model":"m1","max_completion_tokens":100000}', "chat/completions"
+    )
+    data = json.loads(parsed.body.decode())
+    assert parsed.max_tokens == 100000
+    assert data["max_completion_tokens"] == 100000
+    assert "max_tokens" not in data
+
+
+def test_parser_max_completion_tokens_overrides_max_tokens():
+    parsed = RequestParser(default_max_tokens=28528).parse(
+        b'{"model":"m1","max_tokens":5000,"max_completion_tokens":100000}', "chat/completions"
+    )
+    data = json.loads(parsed.body.decode())
+    assert parsed.max_tokens == 100000
+    # The overridden alias is left untouched; the server ignores it anyway.
+    assert data["max_tokens"] == 5000
+    assert data["max_completion_tokens"] == 100000
+
+
+def test_parser_bumps_up_max_completion_tokens_when_below_default():
+    parsed = RequestParser(default_max_tokens=28528).parse(
+        b'{"model":"m1","max_completion_tokens":1000}', "chat/completions"
+    )
+    data = json.loads(parsed.body.decode())
+    assert parsed.max_tokens == 28528
+    assert data["max_completion_tokens"] == 28528
+
+
+def test_parser_does_not_bump_up_max_completion_tokens_for_vip():
+    parsed = RequestParser(default_max_tokens=28528).parse(
+        b'{"model":"m1","max_completion_tokens":1000}', "chat/completions", is_vip=True
+    )
+    data = json.loads(parsed.body.decode())
+    assert parsed.max_tokens == 1000
+    assert data["max_completion_tokens"] == 1000

@@ -117,6 +117,40 @@ def test_auto_flagged_model_over_global_limit_returns_400():
 
 
 @pytest.mark.django_db
+def test_auto_request_over_global_limit_via_max_completion_tokens_returns_400():
+    # vLLM gives max_completion_tokens precedence, so it must trigger the
+    # same admission rejection as an oversized max_tokens.
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "auto", "max_completion_tokens": 100000}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    data = response.json()
+    assert data["error"]["type"] == "invalid_request_error"
+    assert "Max allowed is 40000" in data["error"]["message"]
+
+    from router.models import RequestRecord
+    record = RequestRecord.objects.last()
+    assert record.fail_reason == data["error"]["message"]
+
+
+@pytest.mark.django_db
+def test_model_request_over_model_limit_via_max_completion_tokens_returns_400():
+    Model.objects.create(model_name="capped-model", max_tokens=65536)
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "capped-model", "max_completion_tokens": 100000}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert "Max allowed is 65536" in response.json()["error"]["message"]
+
+
+@pytest.mark.django_db
 def test_unknown_model_returns_400():
     input_model_name = "user-requested-unknown-model"
     client = Client()

@@ -174,6 +174,9 @@ def _origin_max_tokens(body: bytes) -> int | None:
     if not isinstance(data, dict):
         return None
     try:
+        # vLLM: max_completion_tokens takes precedence over max_tokens.
+        if data.get("max_completion_tokens") is not None:
+            return int(data.get("max_completion_tokens"))
         return int(data.get("max_tokens"))
     except (TypeError, ValueError):
         return None
@@ -936,7 +939,13 @@ class PDForwardService:
         if not isinstance(data, dict):
             return body
         if origin_max_tokens is not None:
-            data["max_tokens"] = max(1, origin_max_tokens - completion_tokens + recompute_count)
+            # vLLM: adjust the field the decoder will actually honor.
+            token_key = (
+                "max_completion_tokens"
+                if data.get("max_completion_tokens") is not None
+                else "max_tokens"
+            )
+            data[token_key] = max(1, origin_max_tokens - completion_tokens + recompute_count)
         return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     def _release_prefiller(self, prefiller) -> None:

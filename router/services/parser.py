@@ -37,6 +37,16 @@ class RequestParser:
 
         stream = bool(data.get("stream"))
 
+        # vLLM resolves max_tokens and max_completion_tokens into one effective
+        # generation limit, with max_completion_tokens taking precedence. The
+        # router must govern the same field the server will actually honor, so
+        # admission, body defaults and PD decode budgets all follow vLLM.
+        effective_token_key = (
+            "max_completion_tokens"
+            if self._safe_int(data.get("max_completion_tokens")) is not None
+            else "max_tokens"
+        )
+
         # max_tokens and stream_options are chat-completions parameters, so only
         # inject these defaults there.
         if self._is_chat_completions_path(path):
@@ -47,14 +57,14 @@ class RequestParser:
                 options["include_usage"] = True
                 data["stream_options"] = options
 
-            if data.get("max_tokens") is None:
-                data["max_tokens"] = self.default_max_tokens
+            if data.get(effective_token_key) is None:
+                data[effective_token_key] = self.default_max_tokens
             elif not is_vip:
-                existing = self._safe_int(data.get("max_tokens"))
+                existing = self._safe_int(data.get(effective_token_key))
                 if existing is not None and existing < self.default_max_tokens:
-                    data["max_tokens"] = self.default_max_tokens
+                    data[effective_token_key] = self.default_max_tokens
 
-        max_tokens = self._safe_int(data.get("max_tokens"))
+        max_tokens = self._safe_int(data.get(effective_token_key))
 
         model_name = data.get("model") if isinstance(data.get("model"), str) else None
         # Fast estimate (no model needed) gives a value for the estimate_tokens
