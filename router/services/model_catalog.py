@@ -23,8 +23,15 @@ class ModelCatalogService:
       VIP port, where the concurrency check is skipped.
 
     A synthetic ``auto`` entry reports the auto-routing entrance: the global
-    ``auto_max_tokens`` cap, the largest context window reachable by auto
-    routing, and the auto concurrency ceiling.
+    ``auto_max_tokens`` cap, a context ceiling every possible auto target can
+    honor, and the auto concurrency ceiling. Because auto picks its target at
+    request time, advertising one target's window could mislead users when
+    another target is chosen, so the entry advertises the smallest max-context
+    among all models auto may redirect to.
+
+    The payload exposes only the model list, the caller's IP, and per-model
+    capabilities — gateway internals (port, VIP channel state, multiplier,
+    boost window) are intentionally not included.
     """
 
     def __init__(self):
@@ -38,7 +45,6 @@ class ModelCatalogService:
         self,
         ip: Ips,
         is_vip_channel: bool,
-        port: int,
         employee_no: str | None = None,
     ) -> dict:
         # Deprecation is an access-control word on the normal port: deprecated
@@ -55,10 +61,6 @@ class ModelCatalogService:
             "object": "list",
             "data": data,
             "ip": ip.ip,
-            "port": port,
-            "vip_channel": is_vip_channel,
-            "concurrent_multiplier": ip.concurrent_multiplier or 1.0,
-            "concurrent_boost_active": AdmissionService.off_peak_boost_active(),
         }
         if employee_no:
             payload["employee_no"] = employee_no
@@ -83,12 +85,32 @@ class ModelCatalogService:
             "object": "model",
             "created": 0,
             "owned_by": "gateway",
-            "max_context": self._max_context(ServerRepository.list_all_online()),
+            "max_context": self._auto_max_context(),
             "max_output_tokens": self.auto_max_tokens,
             "concurrent_limit": None
             if is_vip_channel
             else AdmissionService.compute_concurrent_limit(ip, self.auto_concurrent_limit),
         }
+
+    def _auto_max_context(self) -> int | None:
+        """Smallest max-context among models auto routing may redirect to.
+
+        Auto picks its target at request time from the auto-selectable models
+        (``complexity_min``/``complexity_max`` set) or the multimodal model
+        for image requests, so the advertised ceiling is the minimum of their
+        per-model maxima — a value every possible target can honor. ``None``
+        when every target is unlimited or there are no targets.
+        """
+        targets = list(ModelRepository.list_auto_selectable_models())
+        multimodal = ModelRepository.get_multimodal_model()
+        if multimodal is not None:
+            targets.append(multimodal)
+        maxima = [
+            self._max_context(ServerRepository.list_by_model_id(model.id))
+            for model in targets
+        ]
+        finite = [value for value in maxima if value is not None]
+        return min(finite) if finite else None
 
     @staticmethod
     def _max_context(servers) -> int | None:
