@@ -58,7 +58,7 @@ If `match_ratio > prefix_cache.primary_match_threshold` (`0.9` by default), the 
 
 Prefix cache blocks are measured in Unicode characters with `prefix_cache.prefix_block_chars` (`128` by default). Prefix cache metadata is written only after a successful upstream response.
 
-Candidate servers are filtered by model, VIP pool, online state, soft delete, circuit-breaker state, and optional `servers.context_window >= requests.estimate_tokens`.
+Candidate servers are filtered by model, VIP pool, online state, soft delete, and circuit-breaker state (never by estimated request size; `servers.context_window` only gates the context-overflow retry).
 
 ## Statistics APIs
 

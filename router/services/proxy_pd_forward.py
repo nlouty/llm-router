@@ -320,13 +320,43 @@ class PDForwardService:
             }, ensure_ascii=False))
             proxy_logging.log_request_context_for(context)
             self._release_prefiller(prefiller)
-            self.circuit_breaker.record_failure(prefiller)
             fail_reason = proxy_response.extract_fail_reason(exc.content, exc.reason)
             state.last_status = exc.status_code
             state.last_reason = exc.reason
             state.last_upstream = exc.response
             state.last_content = exc.content
             state.last_fail_reason = fail_reason
+
+            # On a real context overflow, retry on a same-model server with a
+            # strictly larger context window (the chooser excludes already-tried
+            # servers). The window only ever gates the prefill tier: candidates
+            # come from list_pd_holders (mixed/prefiller roles only), so
+            # decoders are never selected here (issue #248).
+            failed_context_window = getattr(prefiller, "context_window", None)
+            if (
+                self.proxy.auto_router.check_context_overflow(exc.status_code, failed_context_window, fail_reason)
+                and failed_context_window
+            ):
+                higher_candidates = self.proxy.larger_window_candidates(
+                    path, model, served_as_vip, failed_context_window,
+                )
+                if higher_candidates:
+                    record.task_status = "processing"
+                    record.save(update_fields=["task_status"])
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_prefill_context_overflow_retry",
+                        "prefiller_url": prefiller.base_url,
+                        "failed_context_window": failed_context_window,
+                        "candidate_ids": [s.id for s in higher_candidates],
+                    }, ensure_ascii=False))
+                    return _RouteAttemptResult(
+                        should_retry=True,
+                        candidates=higher_candidates,
+                        model=model,
+                        body=body,
+                    )
+
+            self.circuit_breaker.record_failure(prefiller)
             proxy_response.finish_upstream_error(
                 record, exc.status_code, fail_reason, target_pod_ip, model, state.attempts, context
             )
