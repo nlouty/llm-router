@@ -97,19 +97,7 @@ class AdmissionService:
             RequestRepository.cleanup_stale(model_id=model_id_for_cleanup, threshold_minutes=self.stale_minutes)
             self._last_cleanup[model_id_for_cleanup] = now
 
-        limit = max(1, math.ceil(limit_base * (ip.concurrent_multiplier or 1.0)))
-
-        # 4x concurrency 23:00–08:00 Beijing time every day,
-        # Saturdays from 18:00, or all day Sunday
-        beijing_time = timezone.localtime()
-        wd = beijing_time.weekday()  # Monday=0 ... Sunday=6
-        if (
-            beijing_time.hour < 8
-            or beijing_time.hour >= 23
-            or (wd == 5 and beijing_time.hour >= 18)
-            or wd == 6
-        ):
-            limit *= 4
+        limit = self.compute_concurrent_limit(ip, limit_base)
 
         current = self._count_inflight(ip.id, matches_entrance)
 
@@ -128,6 +116,41 @@ class AdmissionService:
                 limit,
             )
         return AdmissionResult(True)
+
+    @staticmethod
+    def off_peak_boost_active(beijing_time=None) -> bool:
+        """True during the 4x concurrency boost window.
+
+        23:00–08:00 Beijing time every day, Saturdays from 18:00, or all day
+        Sunday. ``beijing_time`` defaults to the current local time (the
+        project timezone) so callers can pin the clock in tests.
+        """
+        if beijing_time is None:
+            beijing_time = timezone.localtime()
+        wd = beijing_time.weekday()  # Monday=0 ... Sunday=6
+        return (
+            beijing_time.hour < 8
+            or beijing_time.hour >= 23
+            or (wd == 5 and beijing_time.hour >= 18)
+            or wd == 6
+        )
+
+    @staticmethod
+    def compute_concurrent_limit(ip: Ips, limit_base: int | None, beijing_time=None) -> int | None:
+        """Effective per-IP concurrency ceiling for a model with ``limit_base``.
+
+        The exact formula enforced by :meth:`check_concurrency`: the base
+        limit scaled by the IP's ``concurrent_multiplier``, multiplied by 4
+        during the off-peak boost window. ``None`` when no base limit is set
+        (no ceiling). Shared with the capability endpoint so the advertised
+        limit can never drift from what admission actually enforces.
+        """
+        if limit_base is None:
+            return None
+        limit = max(1, math.ceil(limit_base * (ip.concurrent_multiplier or 1.0)))
+        if AdmissionService.off_peak_boost_active(beijing_time):
+            limit *= 4
+        return limit
 
     @staticmethod
     def _count_inflight(ip_id: int, predicate) -> int:

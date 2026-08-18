@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -61,29 +61,42 @@ def test_v1_models_routes_to_random_online_server_without_model_id(monkeypatch):
     assert deleted_server not in choices[0]
 
 
-def test_v1_models_endpoint_allows_missing_model_name(monkeypatch):
+def test_v1_models_endpoint_answered_locally_without_upstream(monkeypatch):
+    """GET /v1/models is answered by the gateway itself (issue #246): no
+    upstream request is made and the payload is the capability list."""
+    monkeypatch.setattr(
+        "router.services.admission.timezone.localtime",
+        lambda *args: datetime(2026, 6, 1, 12, 0, 0),  # Monday noon -> no boost
+    )
     Server.objects.create(model_id=None, base_url="http://shared.example", is_online=True)
 
-    def fake_request(self_inner, method, url, **kwargs):
-        assert method == "GET"
-        assert url == "http://shared.example/models"
-        assert kwargs["data"] is None
-        upstream = MagicMock()
-        upstream.status_code = 200
-        upstream.reason = "OK"
-        upstream.content = b'{"data":[]}'
-        upstream.headers = {"content-type": "application/json"}
-        return upstream
+    def fail_if_called(self_inner, method, url, **kwargs):
+        raise AssertionError(f"upstream should not be called for GET /v1/models, got {url}")
 
     monkeypatch.setattr(
         "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
-        fake_request,
+        fail_if_called,
     )
 
-    response = Client().get("/v1/models")
+    response = Client().get("/v1/models", SERVER_PORT="8001")
 
     assert response.status_code == 200
-    assert response.content == b'{"data":[]}'
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert payload["data"] == [
+        {
+            "id": "auto",
+            "object": "model",
+            "created": 0,
+            "owned_by": "gateway",
+            "max_context": None,
+            "max_output_tokens": 40000,
+            "concurrent_limit": 6,
+        }
+    ]
+    assert payload["port"] == 8001
+    assert payload["vip_channel"] is False
+    assert payload["concurrent_boost_active"] is False
 
 
 def test_non_models_request_without_model_id_uses_null_model_servers():

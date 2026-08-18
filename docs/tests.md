@@ -27,6 +27,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_manage.py` | `manage.py prod`/`test` argument parsing and DB port selection |
 | `test_management_api.py` | Whitelist upsert messages and `refresh_user_info` thread launch |
 | `test_model_online_list.py` | Online model catalog excludes deprecated models |
+| `test_model_capability.py` | `/v1/models` per-user, per-port capability payload: port/identity differentiation, deprecation filtering, concurrency multiplier + boost window, no request record |
 | `test_mr_live_review.py` | MR live review create, update, skip, and validation |
 | `test_mr_live_review_list.py` | MR review list filters, pagination, and validation |
 | `test_mr_live_review_stats.py` | MR review branch and confidence aggregations |

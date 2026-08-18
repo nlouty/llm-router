@@ -43,7 +43,50 @@ curl -i http://localhost:8001/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"Summarize this design risk"}]}'
 ```
 
-`GET /v1/models` is special-cased: when no concrete model is present, the router chooses a random online routable server and forwards the request there.
+`GET /v1/models` is answered locally by the gateway with the per-user, per-port model capability payload (issue #246). It reflects the caller's client IP, identity (Bearer apikey when present), and the port used (`8001` normal / `8008` VIP):
+
+- `data[].id`: model name (plus a synthetic `auto` entry for the auto-routing entrance)
+- `data[].max_context`: largest `servers.context_window` among the model's online servers (`null` = unlimited)
+- `data[].max_output_tokens`: output-token ceiling enforced by admission (`models.max_tokens`; `auto_max_tokens` for `auto`)
+- `data[].concurrent_limit`: effective per-IP concurrency ceiling (base `concurrent_limit` × `ips.concurrent_multiplier`, ×4 during the off-peak boost window); `null` on the VIP port where the concurrency check is skipped
+- top-level `port`, `vip_channel`, `ip`, `concurrent_multiplier`, `concurrent_boost_active`, and `employee_no` when the identity resolved
+
+Deprecated models (`models.deprecation` set) are hidden on the normal port but listed on the VIP port. The response is OpenAI-compatible (`object: "list"`) so existing clients keep working. Other methods on `/v1/models` keep the legacy behavior: the request is proxied to a random online routable server.
+
+```bash
+curl -i http://localhost:8001/v1/models
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "model-a",
+      "object": "model",
+      "created": 0,
+      "owned_by": "gateway",
+      "max_context": 200000,
+      "max_output_tokens": 20480,
+      "concurrent_limit": 3
+    },
+    {
+      "id": "auto",
+      "object": "model",
+      "created": 0,
+      "owned_by": "gateway",
+      "max_context": 200000,
+      "max_output_tokens": 40000,
+      "concurrent_limit": 6
+    }
+  ],
+  "ip": "10.0.0.1",
+  "port": 8001,
+  "vip_channel": false,
+  "concurrent_multiplier": 1.0,
+  "concurrent_boost_active": false
+}
+```
 
 ## Load-Balancer Metadata
 
