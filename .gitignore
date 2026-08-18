@@ -78,3 +78,5 @@ config.local.yml
 # OS files
 .DS_Store
 Thumbs.db
+.uv-cache/
+.uv-python/

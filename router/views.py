@@ -98,6 +98,12 @@ def proxy(request, path: str):
             RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
             return error_response(403, message, "version_too_old")
 
+        # GET /v1/models is answered locally with the per-user, per-port model
+        # capability payload instead of being proxied to a random upstream
+        # (issue #246). Other methods keep the legacy proxy behavior.
+        if normalized_path == "models" and request.method == "GET":
+            return _models_capability_response(request, ip, identity, is_vip_channel)
+
         parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 28528)))
         parsed = parser.parse(body, path, is_vip=is_vip_channel)
         input_model_name = parsed.model_name
@@ -199,6 +205,18 @@ def refresh_user_info(request):
         return JsonResponse({"code": 403, "error": "CMDB is not enabled"}, status=403)
     threading.Thread(target=CMDBService().fetch_all_users, daemon=True).start()
     return JsonResponse({"code": 200, "message": "用户信息刷新任务已启动"})
+
+
+def _models_capability_response(request, ip, identity, is_vip_channel):
+    from router.services.model_catalog import ModelCatalogService
+
+    payload = ModelCatalogService().capabilities(
+        ip=ip,
+        is_vip_channel=is_vip_channel,
+        port=_request_port(request) or _configured_normal_port(),
+        employee_no=identity.employee_no if identity.has_employee else None,
+    )
+    return JsonResponse(payload)
 
 
 def _request_data(request) -> dict:
