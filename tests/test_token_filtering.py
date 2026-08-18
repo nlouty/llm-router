@@ -54,6 +54,40 @@ def test_unlimited_context_window_always_eligible_for_retry():
 
 
 @pytest.mark.django_db
+def test_list_pd_holders_min_context_window_gates_prefill_tier_only():
+    # Issue #248: the overflow retry's larger-window query keeps larger
+    # prefillers and mixed servers, drops smaller prefillers, and never
+    # returns decoders regardless of their window.
+    model = Model.objects.create(model_name="pd-model")
+    p_small = Server.objects.create(
+        model_id=model.id, base_url="http://p1.example", is_online=True,
+        role="prefiller", group_id="g1", context_window=1000,
+    )
+    Server.objects.create(
+        model_id=model.id, base_url="http://d1.example", is_online=True,
+        role="decoder", group_id="g1", context_window=None,
+    )
+    p_large = Server.objects.create(
+        model_id=model.id, base_url="http://p2.example", is_online=True,
+        role="prefiller", group_id="g2", context_window=100000,
+    )
+    Server.objects.create(
+        model_id=model.id, base_url="http://d2.example", is_online=True,
+        role="decoder", group_id="g2", context_window=None,
+    )
+    mixed = Server.objects.create(
+        model_id=model.id, base_url="http://m.example", is_online=True,
+        context_window=200000,
+    )
+
+    servers = ServerRepository.list_pd_holders(model.id, min_context_window=1000)
+    assert p_large in servers
+    assert mixed in servers
+    assert p_small not in servers
+    assert not any((s.role or "mixed") == "decoder" for s in servers)
+
+
+@pytest.mark.django_db
 def test_parser_estimates_tokens_and_storage():
     parser = RequestParser()
     body = b'{"model":"test-model","prompt":"Hello world, this is a test prompt to estimate tokens."}'

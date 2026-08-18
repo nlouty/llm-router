@@ -28,8 +28,8 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - Pluggable `ServerChooser` protocol with `ServerSelectionContext`
   - `PrefixCachePrebleServerChooser` (default): Redis-backed character-prefix cache, primary/secondary match thresholds, least-loaded-among-matches selection, per-server `cache_time` eviction
   - `LeastConnectionServerChooser`: picks server with fewest in-flight `processing` requests
-  - Candidate servers are filtered by online state, circuit-breaker state, soft delete, VIP pool, model id, and optional `servers.context_window >= request estimate`
-  - Retry to another server **only** on a connection failure (request never reached the upstream); read timeouts, HTTP errors (incl. 5xx), and PD logic failures do not retry, to preserve POST idempotency. The single exception is context-overflow, retried once to a larger-context server/model. Bounded by `max_attempts_per_request`
+  - Candidate servers are filtered by online state, circuit-breaker state, soft delete, VIP pool, and model id (never by estimated request size)
+  - Retry to another server **only** on a connection failure (request never reached the upstream) or a context overflow (HTTP 400 naming the server's `context_window`, retried on a same-model server with a strictly larger window — single-node path and PD prefill phase); read timeouts, other HTTP errors, and PD logic failures do not retry, to preserve POST idempotency. Bounded by `max_attempts_per_request`
   - Per-attempt logging of `server_attempt` and `multi_server_route` events
   - `servers.workload` counter incremented before send and decremented after (or by stale cleanup)
 

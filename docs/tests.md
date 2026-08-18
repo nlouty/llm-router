@@ -20,7 +20,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_circuit_breaker.py` | Failure counting, threshold, open/half_open transitions, exponential cooldown |
 | `test_codehub_review.py` | CodeHub review create, duplicate skip, required hash, and invalid-field validation |
 | `test_config.py` | `PREFIX_CACHE_*` env overrides applied by `load_config` |
-| `test_context_overflow.py` | Auto-selected context-overflow retry to fallback model |
+| `test_context_overflow.py` | Context-overflow retry to a same-model larger-window server; no model switch; real error surfaces when exhausted |
 | `test_disconnect.py` | `DisconnectWatcher` event/callback semantics |
 | `test_errors.py` | Error payload shape and SSE timeout event format |
 | `test_headers.py` | Request-header filtering (hop-by-hop + bodyless `Content-Type`) |
@@ -33,6 +33,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_mr_live_review_stats_by_date.py` | MR review date-series counts and accept-rate stats |
 | `test_opencode.py` | Opencode UA blocking and 400-delay version comparisons |
 | `test_parser.py` | JSON body rewriting, stream options, default max tokens, non-JSON passthrough |
+| `test_pd_context_overflow.py` | PD prefill context-overflow retry to a larger-window prefiller (sync and streaming); real error and breaker behavior when no candidate exists |
 | `test_proxy.py` | Proxy flow, auto routing, routing LLM calls, router results, retries, and `/v1/models` routing |
 | `test_proxy_unhandled_exception.py` | View catch-all: 502 + self-describing `fail_reason`, one-line main log, full traceback in per-request log file |
 | `test_proxy_usage.py` | JSON usage parsing, including cached token counts |

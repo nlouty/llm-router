@@ -176,7 +176,7 @@ CREATE INDEX servers_online_model_idx
 
 `vip` and `vip_cooldown` are router-managed. The router promotes and demotes servers automatically based on VIP request load.
 
-`context_window` is an optional per-server context-window ceiling. It is not used to pre-filter candidate servers. When an upstream rejects a request with an overflow error whose message contains this value, the router retries on a larger-window server of the same model. The router never switches to a different model on overflow. `NULL` means unlimited.
+`context_window` is an optional per-server context-window ceiling that must be maintained manually (set it to the server's real limit, e.g. vLLM's `--max-model-len`). It is not used to pre-filter candidate servers. When an upstream rejects a request with an overflow error whose message contains this value, the router retries on a larger-window server of the same model — for single-node servers on the main proxy path, and for PD clusters on the prefill phase (the prefill probe is the first upstream call, so overflow always surfaces there). The router never switches to a different model on overflow. `NULL` means unlimited (and disables the overflow retry for that server). Keep decoder windows `NULL` or strictly larger than their prefiller's: the larger-window candidate query drops any server — including a cluster's decoders — whose `context_window` is not larger than the failed prefiller's.
 
 `weight` is the server's capacity multiplier (default 1). Server selection compares normalized load `workload / weight`, so a server with weight 3 is chosen over a weight-1 server as long as its own workload is below three times the other's. VIP channel candidates are restricted to weight-1 servers.
 

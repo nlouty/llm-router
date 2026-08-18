@@ -406,6 +406,15 @@ class ProxyService:
             return self.vip_service.select_candidates(model)
         return self._candidates_for_request(path, model_id, vip=False, min_context_window=min_context_window), False
 
+    def larger_window_candidates(self, path, model, served_as_vip, failed_context_window: int) -> list:
+        """Same-model candidates whose context window is strictly larger than
+        failed_context_window (NULL context_window counts as unlimited). Shared
+        by the single-node and PD-prefill context-overflow retries."""
+        candidates, _ = self._select_candidates(
+            path, model, served_as_vip, min_context_window=failed_context_window,
+        )
+        return candidates
+
     def _after_finish(self, served_as_vip: bool, model) -> None:
         if served_as_vip and model is not None:
             self.vip_service.maybe_scale_down(model)
@@ -792,11 +801,8 @@ class ProxyService:
             self.auto_router.check_context_overflow(status_code, failed_context_window, fail_reason)
             and failed_context_window
         ):
-            higher_candidates, _ = self._select_candidates(
-                context.path,
-                model,
-                served_as_vip,
-                min_context_window=failed_context_window,
+            higher_candidates = self.larger_window_candidates(
+                context.path, model, served_as_vip, failed_context_window,
             )
             if higher_candidates:
                 return _RouteAttemptResult(
