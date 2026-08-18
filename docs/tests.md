@@ -33,6 +33,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_mr_live_review_stats_by_date.py` | MR review date-series counts and accept-rate stats |
 | `test_opencode.py` | Opencode UA blocking and 400-delay version comparisons |
 | `test_parser.py` | JSON body rewriting, stream options, default max tokens, non-JSON passthrough |
+| `test_pd_context_overflow.py` | PD prefiller context-overflow switch to larger-window servers and circuit-breaker ticks |
 | `test_proxy.py` | Proxy flow, auto routing, routing LLM calls, router results, retries, and `/v1/models` routing |
 | `test_proxy_unhandled_exception.py` | View catch-all: 502 + self-describing `fail_reason`, one-line main log, full traceback in per-request log file |
 | `test_proxy_usage.py` | JSON usage parsing, including cached token counts |

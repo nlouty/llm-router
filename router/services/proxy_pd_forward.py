@@ -12,6 +12,7 @@ from django.http import StreamingHttpResponse
 from router.config import APP_CONFIG
 from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
+from router.route_algorithm.auto import AutoRouteAlgorithm
 from router.services import proxy_logging, proxy_response
 from router.services.request_context import get_request_id
 from router.services.request_log_handler import install_pd_handler
@@ -320,13 +321,49 @@ class PDForwardService:
             }, ensure_ascii=False))
             proxy_logging.log_request_context_for(context)
             self._release_prefiller(prefiller)
-            self.circuit_breaker.record_failure(prefiller)
             fail_reason = proxy_response.extract_fail_reason(exc.content, exc.reason)
             state.last_status = exc.status_code
             state.last_reason = exc.reason
             state.last_upstream = exc.response
             state.last_content = exc.content
             state.last_fail_reason = fail_reason
+
+            # Issue #248: a real context overflow on the prefiller must switch
+            # to a same-model server with a strictly larger context window (the
+            # chooser excludes already-tried servers, so the failed prefiller is
+            # never re-proposed). Only prefiller/mixed windows are compared —
+            # decoders are never candidates — which is safe because the
+            # deployment guarantees
+            # prefiller.context_window + max_completion_tokens < decoder.context_window.
+            # A client-caused 400 is not a health failure, so the prefiller's
+            # circuit breaker is never ticked for this error; other 400s still
+            # count (consecutive non-overflow 400s indicate a sick server).
+            failed_context_window = getattr(prefiller, "context_window", None)
+            if AutoRouteAlgorithm.check_context_overflow(
+                exc.status_code, failed_context_window, fail_reason
+            ):
+                higher_candidates, _ = self.proxy._select_candidates(
+                    path, model, served_as_vip, min_context_window=failed_context_window
+                )
+                if higher_candidates:
+                    record.task_status = "processing"
+                    record.save(update_fields=["task_status"])
+                    append_request_log(record.id, json.dumps({
+                        "event": "pd_prefill_overflow_retry",
+                        "prefiller_url": prefiller.base_url,
+                        "context_window": failed_context_window,
+                        "candidate_ids": [candidate.id for candidate in higher_candidates],
+                        "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+                    }, ensure_ascii=False))
+                    return _RouteAttemptResult(
+                        should_retry=True,
+                        candidates=higher_candidates,
+                        model=model,
+                        body=body,
+                    )
+            else:
+                self.circuit_breaker.record_failure(prefiller)
+
             proxy_response.finish_upstream_error(
                 record, exc.status_code, fail_reason, target_pod_ip, model, state.attempts, context
             )
