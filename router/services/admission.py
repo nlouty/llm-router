@@ -63,7 +63,8 @@ class AdmissionService:
                 False,
                 400,
                 "invalid_request_error",
-                f"The request generates too many tokens. Max allowed is {maximum}.",
+                f"The request tries to generate too many tokens: requested {requested}, Max allowed is {maximum}. "
+                "Please lower max_completion_tokens, max_tokens, or Max Output Tokens in your client.",
             )
         return AdmissionResult(True)
 
