@@ -42,9 +42,14 @@ def _entry_by_id(payload, model_id):
 
 
 def test_normal_port_capabilities():
-    model_a = Model.objects.create(model_name="model-a", concurrent_limit=3, max_tokens=20480)
+    # model-a is an auto-routing target (complexity bounds set).
+    model_a = Model.objects.create(
+        model_name="model-a", concurrent_limit=3, max_tokens=20480,
+        complexity_min=1, complexity_max=10,
+    )
     _make_server(model_a, context_window=1000)
     _make_server(model_a, context_window=200000)
+    # model-b is not an auto target (no complexity bounds).
     model_b = Model.objects.create(model_name="model-b", concurrent_limit=10, max_tokens=8192)
     _make_server(model_b, context_window=None)  # unlimited
 
@@ -54,11 +59,11 @@ def test_normal_port_capabilities():
     payload = response.json()
     assert payload["object"] == "list"
     assert payload["ip"] == "10.0.0.1"
-    assert payload["port"] == 8001
-    assert payload["vip_channel"] is False
-    assert payload["concurrent_multiplier"] == 1.0
-    assert payload["concurrent_boost_active"] is False
     assert "employee_no" not in payload
+    # Gateway internals (port, vip channel, multiplier, boost window) are
+    # intentionally not exposed to users.
+    for hidden in ("port", "vip_channel", "concurrent_multiplier", "concurrent_boost_active"):
+        assert hidden not in payload
 
     entry_a = _entry_by_id(payload, "model-a")
     assert entry_a["max_context"] == 200000  # max over all online servers
@@ -72,8 +77,60 @@ def test_normal_port_capabilities():
 
     auto = _entry_by_id(payload, "auto")
     assert auto["max_output_tokens"] == 40000
-    assert auto["max_context"] == 200000  # largest window reachable by auto
+    assert auto["max_context"] == 200000  # min over auto targets (only model-a)
     assert auto["concurrent_limit"] == 6
+
+
+def test_auto_max_context_is_min_of_redirect_targets():
+    # Two text targets and one multimodal target: auto advertises the
+    # smallest max-context so users are never misled by a larger target's
+    # window when auto picks a smaller one.
+    model_a = Model.objects.create(
+        model_name="model-a", concurrent_limit=3, max_tokens=20480,
+        complexity_min=1, complexity_max=10,
+    )
+    _make_server(model_a, context_window=200000)
+    model_b = Model.objects.create(
+        model_name="model-b", concurrent_limit=3, max_tokens=20480,
+        complexity_min=1, complexity_max=10,
+    )
+    _make_server(model_b, context_window=50000)
+    model_c = Model.objects.create(
+        model_name="model-c", concurrent_limit=3, max_tokens=20480, multimodal=True
+    )
+    _make_server(model_c, context_window=10000)
+
+    payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.9").json()
+
+    assert _entry_by_id(payload, "auto")["max_context"] == 10000
+
+
+def test_auto_max_context_skips_unlimited_targets():
+    # A target with an unlimited (NULL) window never drags the advertised
+    # ceiling down; the min is over the finite windows only.
+    model_a = Model.objects.create(
+        model_name="model-a", concurrent_limit=3, max_tokens=20480,
+        complexity_min=1, complexity_max=10,
+    )
+    _make_server(model_a, context_window=200000)
+    model_b = Model.objects.create(
+        model_name="model-b", concurrent_limit=3, max_tokens=20480,
+        complexity_min=1, complexity_max=10,
+    )
+    _make_server(model_b, context_window=None)  # unlimited
+
+    payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.10").json()
+
+    assert _entry_by_id(payload, "auto")["max_context"] == 200000
+
+
+def test_auto_max_context_none_without_targets():
+    model = Model.objects.create(model_name="model-a", concurrent_limit=3, max_tokens=20480)
+    _make_server(model, context_window=200000)
+
+    payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.11").json()
+
+    assert _entry_by_id(payload, "auto")["max_context"] is None
 
 
 def test_deprecated_model_hidden_on_normal_port_but_visible_on_vip_port():
@@ -100,8 +157,6 @@ def test_vip_port_reports_unlimited_concurrency_and_skips_multiplier():
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["vip_channel"] is True
-    assert payload["port"] == 8008
     assert _entry_by_id(payload, "model-a")["concurrent_limit"] is None
     assert _entry_by_id(payload, "auto")["concurrent_limit"] is None
 
@@ -124,7 +179,6 @@ def test_concurrent_multiplier_scales_limit():
     payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.5").json()
 
     assert _entry_by_id(payload, "model-a")["concurrent_limit"] == 8  # ceil(3 * 2.5)
-    assert payload["concurrent_multiplier"] == 2.5
 
 
 def test_off_peak_boost_window_quadruples_limit(_fixed_clock):
@@ -136,7 +190,6 @@ def test_off_peak_boost_window_quadruples_limit(_fixed_clock):
 
     payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.6").json()
 
-    assert payload["concurrent_boost_active"] is True
     assert _entry_by_id(payload, "model-a")["concurrent_limit"] == 12
     assert _entry_by_id(payload, "auto")["concurrent_limit"] == 24
 

@@ -94,9 +94,9 @@ def test_v1_models_endpoint_answered_locally_without_upstream(monkeypatch):
             "concurrent_limit": 6,
         }
     ]
-    assert payload["port"] == 8001
-    assert payload["vip_channel"] is False
-    assert payload["concurrent_boost_active"] is False
+    # Gateway internals are not exposed to users.
+    for hidden in ("port", "vip_channel", "concurrent_multiplier", "concurrent_boost_active"):
+        assert hidden not in payload
 
 
 def test_non_models_request_without_model_id_uses_null_model_servers():

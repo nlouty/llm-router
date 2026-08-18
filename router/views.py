@@ -213,7 +213,6 @@ def _models_capability_response(request, ip, identity, is_vip_channel):
     payload = ModelCatalogService().capabilities(
         ip=ip,
         is_vip_channel=is_vip_channel,
-        port=_request_port(request) or _configured_normal_port(),
         employee_no=identity.employee_no if identity.has_employee else None,
     )
     return JsonResponse(payload)
