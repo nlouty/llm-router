@@ -90,8 +90,6 @@ def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[
     # minimal init skipping redis/APP_CONFIG
     c.primary_match_threshold = 0.9
     c.secondary_match_threshold = 0.5
-    c.overload_workload_gap = 4
-    c.overload_workload_ratio = 2.0
     c.max_prefix_chars = 1000000
     c.prefix_block_chars = 128
     c.count_provider = None
@@ -127,7 +125,8 @@ class TestPrefillerLoadUsesDecoderFloor:
         assert storage, "on_response should have written prefix entries"
 
         # A fresh mixed server is idle (load 0); prefiller decoder floor=100.
-        # Overload guard (gap>=4 and ratio>=2.0) must fall back to the mixed server.
+        # Overload guard (load >= weight and load > 2x min) must fall back to
+        # the mixed server.
         candidates = [
             make_server(1, "http://m1", role="mixed", workload=0),
             prefiller,
@@ -154,15 +153,14 @@ class TestPrefillerBalancingWithinCluster:
         body = make_body("shared prefix content")
         busy = make_server(1, "http://p1", role="prefiller", group_id="g1", workload=7)
         idle = make_server(2, "http://p2", role="prefiller", group_id="g1", workload=0)
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 5.0})
+        chooser = _chooser_with_workload({}, decoder_mins={"g1": 3.0})
         chooser.on_response(busy, make_context(body, request_id=42), 200)
         assert storage, "on_response should have written prefix entries"
 
         candidates = [busy, idle]
         selected = chooser.choose(candidates, make_context(body), set())
-        # busy effective = max(7,5)=7; idle = max(0,5)=5.
-        # Cross-cluster guard: 7 vs 5 not overloaded (gap 2 < 4).
-        # Within-cluster guard: own workload 7 vs 0 overloaded -> fall back to idle.
+        # busy effective = max(7,3)=7 >= weight 1 and 7 > 2*min(3)=6 -> escape
+        # to least loaded: idle effective = max(0,3)=3.
         assert selected.id == 2
 
 
