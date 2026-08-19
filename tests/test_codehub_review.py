@@ -1,61 +1,84 @@
 import pytest
 import json
 from django.test import Client
-from router.models import DailyMrReview
+from router.models import CodehubReview
+
 
 @pytest.mark.django_db
 def test_create_codehub_review():
     client = Client()
     data = {
         "project_id": 1,
-        "branch": "main",
-        "issue_hash": "hash1",
-        "mr_hash": "mr1",
-        "file_path": "path/to/file",
+        "project_name": "demo-project",
+        "branch_name": "main",
+        "scan_commit_id": "abc123",
+        "scan_date": "2026-01-01 10:00:00",
+        "completion_date": "2026-01-02 10:00:00",
+        "relative_path": "path/to/file",
         "line": 10,
-        "body": "body text",
-        "review_comment": "comment",
+        "issue_description": "body text",
         "severity": "high",
-        "categories": "bug",
-        "fix_suggestion": "fix it",
-        "created_at": "2023-01-01",
-        "confidence_score": "0.9",
-        "issue_url": "http://example.com"
+        "issue_category": "bug",
+        "module": "core",
     }
-    
-    # First creation
+
     response = client.post("/api/codehub_review", data=json.dumps(data), content_type="application/json")
     assert response.status_code == 200
     assert response.json()["message"] == "created"
-    assert DailyMrReview.objects.filter(issue_hash="hash1").count() == 1
-    
-    # Duplicate hash creation
-    response = client.post("/api/codehub_review", data=json.dumps(data), content_type="application/json")
-    assert response.status_code == 200
-    assert response.json()["message"] == "skipped"
-    assert DailyMrReview.objects.filter(issue_hash="hash1").count() == 1
 
-@pytest.mark.django_db
-def test_create_codehub_review_missing_hash():
-    client = Client()
-    data = {
-        "project_id": 1,
-        "branch": "main"
-        # missing issue_hash
-    }
-    response = client.post("/api/codehub_review", data=json.dumps(data), content_type="application/json")
-    assert response.status_code == 400
-    assert "issue_hash is required" in response.json()["error"]
+    review_id = response.json()["data"]["id"]
+    review = CodehubReview.objects.get(id=review_id)
+    assert review.project_id == 1
+    assert review.project_name == "demo-project"
+    assert review.branch_name == "main"
+    assert review.scan_commit_id == "abc123"
+    assert review.scan_date.strftime("%Y-%m-%d %H:%M:%S") == "2026-01-01 10:00:00"
+    assert review.completion_date.strftime("%Y-%m-%d %H:%M:%S") == "2026-01-02 10:00:00"
+    assert review.relative_path == "path/to/file"
+    assert review.line == 10
+    assert review.issue_description == "body text"
+    assert review.severity == "high"
+    assert review.issue_category == "bug"
+    assert review.module == "core"
+    # Timestamps and default applied by the view
+    assert review.created_at is not None
+    assert review.updated_at is not None
+    assert review.is_modified_completed is False
+
+    assert CodehubReview.objects.count() == 1
+
 
 @pytest.mark.django_db
 def test_create_codehub_review_invalid_fields():
     client = Client()
     data = {
         "project_id": 1,
-        "issue_hash": "hash_invalid",
+        "branch_name": "main",
         "unknown_field": "some value"
     }
     response = client.post("/api/codehub_review", data=json.dumps(data), content_type="application/json")
     assert response.status_code == 400
     assert "invalid fields: unknown_field" in response.json()["error"]
-    assert DailyMrReview.objects.filter(issue_hash="hash_invalid").count() == 0
+    assert CodehubReview.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_create_codehub_review_invalid_date_format():
+    client = Client()
+    data = {
+        "project_id": 1,
+        "project_name": "demo-project",
+        "branch_name": "main",
+        "scan_commit_id": "abc123",
+        "scan_date": "01/01/2026",
+        "relative_path": "path/to/file",
+        "line": 10,
+        "issue_description": "body text",
+        "severity": "high",
+        "issue_category": "bug",
+        "module": "core",
+    }
+    response = client.post("/api/codehub_review", data=json.dumps(data), content_type="application/json")
+    assert response.status_code == 400
+    assert "scan_date format invalid" in response.json()["error"]
+    assert CodehubReview.objects.count() == 0

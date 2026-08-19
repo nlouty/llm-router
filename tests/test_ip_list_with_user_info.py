@@ -112,13 +112,13 @@ class TestIPListWithUserInfo:
         assert len(data) == 5
 
     def test_filter_by_ip(self, sample_data):
-        """测试按IP地址筛选"""
-        # 精确匹配
+        """测试按IP地址筛选（部分匹配）"""
+        # "192.168.1.1" 是 "192.168.1.1" 和 "192.168.1.10" 的子串
         data, total = IPRepository.list_with_user_info(ip="192.168.1.1")
 
-        assert total == 1
-        assert len(data) == 1
-        assert data[0]["ip"] == "192.168.1.1"
+        assert total == 2
+        assert len(data) == 2
+        assert {item["ip"] for item in data} == {"192.168.1.1", "192.168.1.10"}
 
         # 模糊匹配
         data, total = IPRepository.list_with_user_info(ip="192.168.1")
@@ -130,11 +130,11 @@ class TestIPListWithUserInfo:
         """测试组合筛选"""
         data, total = IPRepository.list_with_user_info(
             employee_no="EMP001",
-            ip="192.168.1.1"
+            ip="192.168.1.2"
         )
 
         assert total == 1
-        assert data[0]["ip"] == "192.168.1.1"
+        assert data[0]["ip"] == "192.168.1.2"
         assert data[0]["employee_no"] == "EMP001"
 
     def test_data_with_department_info(self, sample_data):
@@ -170,14 +170,12 @@ class TestIPListWithUserInfo:
         assert item["dept2"] == ""
 
     def test_concurrent_multiplier_values(self, sample_data):
-        """测试并发数返回正确"""
+        """测试并发数返回正确（按并发数降序）"""
         data, total = IPRepository.list_with_user_info()
 
-        # 验证第一个IP的并发数
-        assert data[0]["concurrent_multiplier"] == 1.0
-
-        # 验证第二个IP的并发数
-        assert data[1]["concurrent_multiplier"] == 1.5
+        # 并发数从高到低：1.0 + i * 0.5, i = 9..0
+        expected = [round(1.0 + i * 0.5, 1) for i in range(9, -1, -1)]
+        assert [item["concurrent_multiplier"] for item in data] == expected
 
     def test_vip_flag(self, sample_data):
         """测试VIP标志"""

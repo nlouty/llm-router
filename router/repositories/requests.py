@@ -564,8 +564,10 @@ class RequestRepository:
             model_id: Optional model ID to filter by. If None, returns sum for all models.
 
         Returns:
-            Dict mapping bucket to total output tokens
+            Dict mapping formatted bucket string to total output tokens
         """
+        from router.api.stats import format_bucket
+
         qs = RequestRepository.external_requests().filter(
             send_time__gte=start,
             send_time__lte=end,
@@ -573,8 +575,16 @@ class RequestRepository:
         )
         if model_id is not None:
             qs = qs.filter(model_id=model_id)
+
+        # Determine granularity from bucket_expr type
+        granularity = "hour"
+        if "Day" in str(type(bucket_expr)):
+            granularity = "day"
+        elif "Month" in str(type(bucket_expr)):
+            granularity = "month"
+
         return {
-            row["bucket"]: row["total_output"]
+            format_bucket(row["bucket"], granularity): row["total_output"]
             for row in qs.annotate(bucket=bucket_expr)
             .values("bucket")
             .annotate(total_output=models.Sum("output_token_cnt"))
