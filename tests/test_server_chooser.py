@@ -182,7 +182,7 @@ def test_least_connection_chooser_ties_on_normalized_load(monkeypatch):
 
 def test_prefix_cache_high_match_chooses_least_loaded_cached_server():
     chooser = PrefixCachePrebleServerChooser(
-        lambda targets: {"http://10.0.0.1:8000": 3, "http://10.0.0.2:8000": 1, "http://10.0.0.3:8000": 0},
+        lambda targets: {"http://10.0.0.1:8000": 2, "http://10.0.0.2:8000": 0, "http://10.0.0.3:8000": 0},
         prefix_block_chars=1,
     )
     candidates = [
@@ -218,7 +218,7 @@ def test_prefix_cache_overloaded_cached_server_falls_back_to_least_loaded():
     context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
     selected = chooser.choose(candidates, context, set())
 
-    # Cached server 1 (workload 8) is overloaded vs min 0 (gap 8 >= 4 and 8 >= 0*2),
+    # Cached server 1 (workload 8 >= weight 1) is overloaded,
     # so fall back to the least loaded server 2.
     assert selected.id == 2
 
@@ -245,41 +245,17 @@ def test_prefix_cache_ratio_zero_on_overload_fallback_to_uncached_server():
     assert context.last_match is None
 
 
-def test_prefix_cache_keeps_cached_server_when_workload_gap_below_threshold():
-    # gap >= threshold but ratio below threshold: keep cached server.
-    chooser = PrefixCachePrebleServerChooser(
-        lambda targets: {"http://10.0.0.1:8000": 10, "http://10.0.0.2:8000": 6, "http://10.0.0.3:8000": 7},
-        prefix_block_chars=1,
-        overload_workload_gap=4,
-        overload_workload_ratio=2.0,
-    )
-    candidates = [
-        make_server(1, "http://10.0.0.1:8000"),
-        make_server(2, "http://10.0.0.2:8000"),
-        make_server(3, "http://10.0.0.3:8000"),
-    ]
-    cached_body = make_body([str(i) for i in range(100)])
-    chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
-
-    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
-    selected = chooser.choose(candidates, context, set())
-
-    # Cached server 1 (workload 10) vs min 6: gap 4 >= 4 but 10 < 6*2 -> not overloaded.
-    assert selected.id == 1
-
-
-def test_prefix_cache_keeps_cached_server_when_workload_ratio_below_threshold():
-    # ratio >= threshold but gap below threshold: keep cached server.
+def test_prefix_cache_keeps_cached_server_below_suggested_workload():
+    # All weight 4 (e.g. 910C): cached server 1 at workload 3 < 4 keeps affinity
+    # even though a lighter server exists.
     chooser = PrefixCachePrebleServerChooser(
         lambda targets: {"http://10.0.0.1:8000": 3, "http://10.0.0.2:8000": 1, "http://10.0.0.3:8000": 2},
         prefix_block_chars=1,
-        overload_workload_gap=4,
-        overload_workload_ratio=2.0,
     )
     candidates = [
-        make_server(1, "http://10.0.0.1:8000"),
-        make_server(2, "http://10.0.0.2:8000"),
-        make_server(3, "http://10.0.0.3:8000"),
+        make_server(1, "http://10.0.0.1:8000", weight=4),
+        make_server(2, "http://10.0.0.2:8000", weight=4),
+        make_server(3, "http://10.0.0.3:8000", weight=4),
     ]
     cached_body = make_body([str(i) for i in range(100)])
     chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
@@ -287,24 +263,20 @@ def test_prefix_cache_keeps_cached_server_when_workload_ratio_below_threshold():
     context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
     selected = chooser.choose(candidates, context, set())
 
-    # Cached server 1 (workload 3) vs min 1: 3 >= 1*2 but gap 2 < 4 -> not overloaded.
     assert selected.id == 1
 
 
-def test_prefix_cache_overload_uses_normalized_load_with_weight():
-    # Cached server 1: weight 3, workload 9 -> normalized 3.0
-    # Server 2:        weight 1, workload 0 -> normalized 0.0
-    # gap 3.0 >= 4? No. But ratio 3.0 >= 0*2 trivially. Not overloaded by gap alone.
-    # Use workload 12 -> normalized 4.0; gap 4.0 >= 4 and 4.0 >= 0 -> overloaded -> fallback to 2.
+def test_prefix_cache_escapes_cached_server_at_suggested_workload():
+    # All weight 2 (e.g. 910B4, issue #247): cached server 1 at workload 2 >= 2
+    # falls back to the least loaded server.
     chooser = PrefixCachePrebleServerChooser(
-        lambda targets: {"http://10.0.0.1:8000": 12, "http://10.0.0.2:8000": 0},
+        lambda targets: {"http://10.0.0.1:8000": 2, "http://10.0.0.2:8000": 0, "http://10.0.0.3:8000": 1},
         prefix_block_chars=1,
-        overload_workload_gap=4,
-        overload_workload_ratio=2.0,
     )
     candidates = [
-        make_server(1, "http://10.0.0.1:8000", weight=3),
-        make_server(2, "http://10.0.0.2:8000", weight=1),
+        make_server(1, "http://10.0.0.1:8000", weight=2),
+        make_server(2, "http://10.0.0.2:8000", weight=2),
+        make_server(3, "http://10.0.0.3:8000", weight=2),
     ]
     cached_body = make_body([str(i) for i in range(100)])
     chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
@@ -312,22 +284,37 @@ def test_prefix_cache_overload_uses_normalized_load_with_weight():
     context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
     selected = chooser.choose(candidates, context, set())
 
-    # normalized 4.0 vs 0.0 -> overloaded, fall back to server 2.
     assert selected.id == 2
 
 
-def test_prefix_cache_keeps_high_weight_cached_server_when_normalized_low():
-    # Cached server 1: weight 3, workload 5 -> normalized 1.67
-    # Server 2:        weight 1, workload 0 -> normalized 0.0
-    # gap 1.67 < 4 -> not overloaded -> keep cached server 1 despite higher raw workload.
+def test_prefix_cache_high_weight_cached_server_escapes_at_own_weight():
+    # Cached server 1: weight 4, workload 4 -> 4 >= 4 -> escape to idle server 2.
     chooser = PrefixCachePrebleServerChooser(
-        lambda targets: {"http://10.0.0.1:8000": 5, "http://10.0.0.2:8000": 0},
+        lambda targets: {"http://10.0.0.1:8000": 4, "http://10.0.0.2:8000": 0},
         prefix_block_chars=1,
-        overload_workload_gap=4,
-        overload_workload_ratio=2.0,
     )
     candidates = [
-        make_server(1, "http://10.0.0.1:8000", weight=3),
+        make_server(1, "http://10.0.0.1:8000", weight=4),
+        make_server(2, "http://10.0.0.2:8000", weight=1),
+    ]
+    cached_body = make_body([str(i) for i in range(100)])
+    chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
+
+    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
+    selected = chooser.choose(candidates, context, set())
+
+    assert selected.id == 2
+
+
+def test_prefix_cache_high_weight_cached_server_kept_below_own_weight():
+    # Cached server 1: weight 4, workload 3 -> 3 < 4 -> keep cache affinity
+    # despite the idle weight-1 server.
+    chooser = PrefixCachePrebleServerChooser(
+        lambda targets: {"http://10.0.0.1:8000": 3, "http://10.0.0.2:8000": 0},
+        prefix_block_chars=1,
+    )
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000", weight=4),
         make_server(2, "http://10.0.0.2:8000", weight=1),
     ]
     cached_body = make_body([str(i) for i in range(100)])
@@ -339,15 +326,38 @@ def test_prefix_cache_keeps_high_weight_cached_server_when_normalized_low():
     assert selected.id == 1
 
 
-def test_prefix_cache_medium_match_chooses_least_loaded_overall_server():
+def test_prefix_cache_keeps_cached_server_without_materially_lighter_server():
+    # Cached server 1: weight 4, workload 4 -> at its suggested workload, but the
+    # lightest candidate is 2 and 4 > 2*2 is false -> keep cache affinity.
+    chooser = PrefixCachePrebleServerChooser(
+        lambda targets: {"http://10.0.0.1:8000": 4, "http://10.0.0.2:8000": 2, "http://10.0.0.3:8000": 3},
+        prefix_block_chars=1,
+    )
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000", weight=4),
+        make_server(2, "http://10.0.0.2:8000", weight=4),
+        make_server(3, "http://10.0.0.3:8000", weight=4),
+    ]
+    cached_body = make_body([str(i) for i in range(100)])
+    chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
+
+    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
+    selected = chooser.choose(candidates, context, set())
+
+    assert selected.id == 1
+
+
+def test_prefix_cache_medium_match_prefers_cached_server_below_suggested_workload():
+    # Weight-2 pool: cached server 2 at workload 1 < 2 keeps its medium-match
+    # affinity even though idle servers exist.
     chooser = PrefixCachePrebleServerChooser(
         lambda targets: {"http://10.0.0.1:8000": 0, "http://10.0.0.2:8000": 1, "http://10.0.0.3:8000": 0},
         prefix_block_chars=1,
     )
     candidates = [
-        make_server(1, "http://10.0.0.1:8000"),
-        make_server(2, "http://10.0.0.2:8000"),
-        make_server(3, "http://10.0.0.3:8000"),
+        make_server(1, "http://10.0.0.1:8000", weight=2),
+        make_server(2, "http://10.0.0.2:8000", weight=2),
+        make_server(3, "http://10.0.0.3:8000", weight=2),
     ]
     chooser.on_response(candidates[1], make_context(make_body([str(i) for i in range(60)]), request_id=201), 200)
 

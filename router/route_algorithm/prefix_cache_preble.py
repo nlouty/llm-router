@@ -50,23 +50,11 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         secondary_match_threshold: float | None = None,
         max_prefix_chars: int | None = None,
         prefix_block_chars: int | None = None,
-        overload_workload_gap: int | None = None,
-        overload_workload_ratio: float | None = None,
     ):
         super().__init__(count_provider)
         prefix_config = APP_CONFIG.get("prefix_cache", {})
         self.primary_match_threshold = self._float_setting(primary_match_threshold, prefix_config.get("primary_match_threshold"), 0.9)
         self.secondary_match_threshold = self._float_setting(secondary_match_threshold, prefix_config.get("secondary_match_threshold"), 0.5)
-        self.overload_workload_gap = self._int_setting(
-            overload_workload_gap,
-            prefix_config.get("overload_workload_gap"),
-            4,
-        )
-        self.overload_workload_ratio = self._float_setting(
-            overload_workload_ratio,
-            prefix_config.get("overload_workload_ratio"),
-            2.0,
-        )
         self.max_prefix_chars = self._positive_int_setting(
             max_prefix_chars,
             prefix_config.get("max_prefix_chars"),
@@ -287,7 +275,8 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
         load_counts = self._load_counts(available)
         cached = self._pick_least_loaded(cached_matches, load_counts)
-        if self._is_cached_overloaded(cached, available, load_counts):
+        min_load = min(load_counts.get(server.id, 0) for server in available)
+        if self._is_overloaded(cached, load_counts.get(cached.id, 0), min_load):
             logger.info(
                 "[PrefixCachePreble] cached server_id=%s overloaded; "
                 "falling back to least loaded server",
@@ -296,38 +285,11 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             return self._pick_least_loaded(available, load_counts)
         return cached
 
-    def _is_cached_overloaded(
-        self,
-        cached: Any,
-        available: Sequence[Any],
-        load_counts: dict[int, float],
-    ) -> bool:
-        cached_norm = self._normalized_load(cached, load_counts)
-        min_norm = min(self._normalized_load(server, load_counts) for server in available)
-        if self._is_overloaded(cached_norm, min_norm):
-            return True
-
-        if getattr(cached, "role", "mixed") != "prefiller":
-            return False
-        siblings = [
-            server
-            for server in available
-            if getattr(server, "role", "mixed") == "prefiller"
-            and getattr(server, "group_id", None) == getattr(cached, "group_id", None)
-        ]
-        if len(siblings) <= 1:
-            return False
-        own_loads = {
-            server.id: int(getattr(server, "workload", 0) or 0) / effective_weight(server)
-            for server in siblings
-        }
-        return self._is_overloaded(own_loads[cached.id], min(own_loads.values()))
-
-    def _is_overloaded(self, normalized_load: float, minimum_normalized: float) -> bool:
-        return (
-            normalized_load - minimum_normalized >= self.overload_workload_gap
-            and normalized_load >= minimum_normalized * self.overload_workload_ratio
-        )
+    def _is_overloaded(self, server: Any, load: float, min_load: float) -> bool:
+        # weight doubles as the server's suggested workload (issue #247): escape
+        # cache affinity only when the cached server is at or above its weight
+        # AND a materially lighter server exists (load > 2x the lightest one).
+        return load >= effective_weight(server) and load > min_load * 2
 
     def on_response(self, server: Any, context: ServerSelectionContext, status_code: int) -> None:
         if not 200 <= status_code < 300 or self._redis_client is None:

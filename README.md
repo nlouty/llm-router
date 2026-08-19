@@ -26,7 +26,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
 
 - **Load Balancing & Server Selection**
   - Pluggable `ServerChooser` protocol with `ServerSelectionContext`
-  - `PrefixCachePrebleServerChooser` (default): Redis-backed character-prefix cache, primary/secondary match thresholds, least-loaded-among-matches selection, per-server `cache_time` eviction
+  - `PrefixCachePrebleServerChooser` (default): Redis-backed character-prefix cache, primary/secondary match thresholds, least-loaded-among-matches selection, overload escape when a cached server's `workload` reaches its `weight` and doubles the pool minimum, per-server `cache_time` eviction
   - `LeastConnectionServerChooser`: picks server with fewest in-flight `processing` requests
   - Candidate servers are filtered by online state, circuit-breaker state, soft delete, VIP pool, and model id (never by estimated request size)
   - Retry to another server **only** on a connection failure (request never reached the upstream) or a context overflow (HTTP 400 naming the server's `context_window`, retried on a same-model server with a strictly larger window — single-node path and PD prefill phase); read timeouts, other HTTP errors, and PD logic failures do not retry, to preserve POST idempotency. Bounded by `max_attempts_per_request`

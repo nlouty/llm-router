@@ -45,8 +45,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "prefix_cache": {
         "primary_match_threshold": 0.9,
         "secondary_match_threshold": 0.5,
-        "overload_workload_gap": 4,
-        "overload_workload_ratio": 2.0,
         "max_prefix_chars": 2000000,
         "prefix_block_chars": 128,
         "redis": {
