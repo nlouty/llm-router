@@ -70,7 +70,10 @@ def proxy(request, path: str):
 
     try:
         ip, created = IPRepository.get_or_create(client_ip)
-        if created:
+        # Only fetch user info via CMDB when it is enabled; in dummy mode the
+        # ips row created above is all the provisioning there is, and the
+        # fire-and-forget thread would race the request thread on the database.
+        if created and APP_CONFIG.get("cmdb", {}).get("enabled", False):
             threading.Thread(target=CMDBService().fetch_and_save_user, args=(client_ip,), daemon=True).start()
 
         identity = IdentityService.resolve(request, ip)
