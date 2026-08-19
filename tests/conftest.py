@@ -10,7 +10,7 @@ from django.db import connection
 
 django.setup()
 
-from router.models import Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP
+from router.models import Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP, Department, CodehubReview
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -23,7 +23,7 @@ def api_test_tables(django_db_setup, django_db_blocker):
             ):
                 schema_editor.delete_model(UserIP)
                 schema_editor.create_model(UserIP)
-            for model in (Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP):
+            for model in (Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP, Department, CodehubReview):
                 if model._meta.db_table not in existing_tables:
                     schema_editor.create_model(model)
             if Ips._meta.db_table in connection.introspection.table_names() and not has_column("ips", "vip"):
@@ -86,12 +86,27 @@ def has_column(table, column):
 
 @pytest.fixture(autouse=True)
 def clean_api_tables(api_test_tables):
-    RequestRecord.objects.all().delete()
-    Ips.objects.all().delete()
-    Server.objects.all().delete()
-    Whitelist.objects.all().delete()
-    Model.objects.all().delete()
-    ServerOperation.objects.all().delete()
-    MrLiveReview.objects.all().delete()
-    DailyMrReview.objects.all().delete()
-    UserIP.objects.all().delete()
+    # Background daemon threads (e.g. CMDB IP provisioning at views.py proxy
+    # entry) may briefly hold the sqlite file when a test ends; retry the
+    # cleanup so the next test does not fail with "database table is locked".
+    import time
+    from django.db import OperationalError
+
+    for attempt in range(3):
+        try:
+            RequestRecord.objects.all().delete()
+            Ips.objects.all().delete()
+            Server.objects.all().delete()
+            Whitelist.objects.all().delete()
+            Model.objects.all().delete()
+            ServerOperation.objects.all().delete()
+            MrLiveReview.objects.all().delete()
+            DailyMrReview.objects.all().delete()
+            UserIP.objects.all().delete()
+            Department.objects.all().delete()
+            CodehubReview.objects.all().delete()
+            break
+        except OperationalError:
+            if attempt == 2:
+                raise
+            time.sleep(0.2)

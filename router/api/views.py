@@ -248,10 +248,9 @@ def output_token(request):
 
     # Return bucketed data based on granularity
     labels = bucket_labels(start, end, granularity)
-    rows = RequestRepository.sum_output_tokens_by_bucket(
+    values = RequestRepository.sum_output_tokens_by_bucket(
         start, end, bucket_expression("send_time", granularity), model_id
     )
-    values = {format_bucket(bucket, granularity): count for bucket, count in rows.items()}
     response = {"code": 200, "stats": fill_series(labels, values, "total_output_tokens", 0)}
     
     if model_obj:
