@@ -18,6 +18,7 @@ proxy:
   stream_total_timeout_seconds: 900
   normal_connect_timeout_seconds: 5
   normal_read_timeout_seconds: 900
+  llm_choosing_timeout_seconds: 10
   client_disconnect_check_interval_seconds: 0.5
   stale_processing_minutes: 20
   opencode_failure_delay_seconds: 180

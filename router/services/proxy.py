@@ -14,7 +14,14 @@ from django.http import HttpRequest, HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 import requests
 
-from router.services.request_context import get_request_id, set_request_id, clear_request_id
+from router.services.request_context import (
+    clear_llm_choosing_deadline,
+    clear_request_id,
+    get_llm_choosing_deadline,
+    get_request_id,
+    set_llm_choosing_deadline,
+    set_request_id,
+)
 from router.services.request_logger import append_request_log
 
 from router.config import APP_CONFIG
@@ -97,6 +104,7 @@ class ProxyService:
             float(proxy_config.get("normal_connect_timeout_seconds", 5)),
             float(proxy_config.get("normal_read_timeout_seconds", 900)),
         )
+        self.llm_choosing_timeout = float(proxy_config.get("llm_choosing_timeout_seconds", 10))
         self.stream_total_timeout = float(proxy_config.get("stream_total_timeout_seconds", 900))
         self.client_disconnect_check_interval = float(proxy_config.get("client_disconnect_check_interval_seconds", 0.5))
         self.opencode_failure_delay = float(proxy_config.get("opencode_failure_delay_seconds", 30))
@@ -158,6 +166,14 @@ class ProxyService:
         record) while keeping the llm-choosing record conventions (ip_id = 0,
         user_agent = "llm-choosing"). Auto selection is skipped so a routing
         model with auto = TRUE can never re-enter the choosing algorithm.
+
+        The whole choosing request is capped at
+        proxy.llm_choosing_timeout_seconds (default 10): forward_internal sets
+        the deadline in the request context, and every upstream attempt's
+        socket timeouts are clamped to the remaining budget, so a hung routing
+        server is disconnected at the deadline and the choosing call fails
+        fast with a 504 instead of blocking for up to
+        normal_read_timeout_seconds per attempt.
         """
         parsed = RequestParser(
             int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 28528))
@@ -176,6 +192,7 @@ class ProxyService:
         # request's id afterwards so the caller's own PD-aware candidate
         # selection keeps logging under the outer record.
         previous_request_id = get_request_id()
+        set_llm_choosing_deadline(time.monotonic() + self.llm_choosing_timeout)
         try:
             return self.forward(
                 internal_request,
@@ -187,6 +204,7 @@ class ProxyService:
                 skip_auto_selection=True,
             )
         finally:
+            clear_llm_choosing_deadline()
             if previous_request_id is not None:
                 set_request_id(previous_request_id)
             else:
@@ -446,10 +464,28 @@ class ProxyService:
             # looks like a ConnectionError (which #198 retries) and a retry
             # storm of 3 x ~900s ends in a synthetic "502 Bad Gateway" instead
             # of the 504 the client should see.
-            budget = self.stream_total_timeout if is_stream else self.normal_timeout[1]
             request_started = time.monotonic()
-            deadline = request_started + budget
+            # llm-choosing requests carry a short absolute deadline set by
+            # forward_internal in the request context; each attempt's socket
+            # timeouts are clamped to the remaining budget (see
+            # _deadline_timeout) so a hung routing server is disconnected at
+            # the deadline.
+            llm_choosing_deadline = get_llm_choosing_deadline()
+            if llm_choosing_deadline is not None:
+                deadline = llm_choosing_deadline
+            else:
+                budget = self.stream_total_timeout if is_stream else self.normal_timeout[1]
+                deadline = request_started + budget
             while state.attempts < self.max_attempts_per_request:
+                if llm_choosing_deadline is not None and time.monotonic() >= deadline:
+                    state.last_status = 504
+                    state.last_reason = "Gateway Timeout"
+                    append_request_log(record.id, json.dumps({
+                        "event": "timeout_budget_exceeded",
+                        "elapsed_ms": int((time.monotonic() - request_started) * 1000),
+                        "attempts": state.attempts,
+                    }, ensure_ascii=False))
+                    break
                 server = self._effective_chooser().choose(candidates, context, state.attempted_server_ids)
                 if server is None:
                     append_request_log(record.id, json.dumps({
@@ -940,6 +976,22 @@ class ProxyService:
             self._maybe_delay_opencode_failure(user_agent, status)
         return HttpResponse(json.dumps(error_payload(message, error_type)), status=status, content_type="application/json")
 
+    @staticmethod
+    def _deadline_timeout(base: tuple[float, float]) -> tuple[float, float]:
+        """Clamp (connect, read) socket timeouts to the remaining llm-choosing
+        budget from the request context (set by forward_internal; absent for
+        normal client requests). When the read timeout fires, urllib3 drops
+        the connection instead of returning it to the pool, so the routing
+        server is disconnected at the deadline rather than after
+        normal_read_timeout_seconds."""
+        deadline = get_llm_choosing_deadline()
+        if deadline is None:
+            return base
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            remaining = 0.001
+        return (min(base[0], remaining), remaining)
+
     def _handle_normal(self, django_request, server, upstream_url, headers, body, upstream_client):
         req_headers = {**headers}
         if server.csb_token:
@@ -949,7 +1001,7 @@ class ProxyService:
             upstream_url,
             headers=req_headers,
             data=body if django_request.method.upper() not in {"GET", "HEAD"} else None,
-            timeout=self.normal_timeout,
+            timeout=self._deadline_timeout(self.normal_timeout),
         )
 
     def _handle_stream(self, django_request, server, upstream_url, headers, body):
