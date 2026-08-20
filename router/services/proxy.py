@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from django.http import HttpRequest, HttpResponse, StreamingHttpResponse
+from django.utils import timezone
 import requests
 
 from router.services.request_context import get_request_id, set_request_id, clear_request_id
@@ -232,27 +233,14 @@ class ProxyService:
             auto_model_selection,
             headers,
         )
-        should_record_model_choice = self.auto_router.should_record_model_choice(
+        decision = self.auto_router.resolve(
             parsed,
+            record,
+            context,
+            model,
             is_vip_channel,
-            auto_model_selection,
         )
-        model_choice_started = time.monotonic() if should_record_model_choice else None
-        try:
-            decision = self.auto_router.resolve(
-                parsed,
-                record,
-                context,
-                model,
-                is_vip_channel,
-            )
-            model = decision.model
-        finally:
-            if model_choice_started is not None:
-                RequestRepository.record_model_choosing_latency(
-                    record,
-                    int((time.monotonic() - model_choice_started) * 1000),
-                )
+        model = decision.model
 
         self._count_tokens_after_selection(parsed, record, model)
 
@@ -580,6 +568,13 @@ class ProxyService:
         server,
     ):
         upstream_url, target_pod_ip = self._start_attempt(django_request, path, record, context, state, server)
+        if record.model_choosing_latency is None:
+            # Elapsed time from request receipt to the first upstream send.
+            # ttft minus this value is the LLM-side time to first token.
+            RequestRepository.record_model_choosing_latency(
+                record,
+                int((timezone.now() - record.send_time).total_seconds() * 1000),
+            )
         workload_handed_off = False
         try:
             upstream = self._perform_request(
@@ -999,11 +994,15 @@ class ProxyService:
                         return
                     if chunk:
                         if first_chunk_at is None:
-                            first_chunk_at = time.monotonic()
+                            first_chunk_at = timezone.now()
                         chunks.append(chunk)
                         yield chunk
                 self._notify_chooser_response(server, context, status_code)
-                ttft = int((first_chunk_at - request_start) * 1000) if first_chunk_at is not None else None
+                ttft = (
+                    int((first_chunk_at - record.send_time).total_seconds() * 1000)
+                    if first_chunk_at is not None
+                    else None
+                )
                 proxy_response.finish_stream_success(
                     record,
                     status_code,

@@ -161,7 +161,7 @@ The original client request row records:
 - `model_id`: updated to the selected concrete model when one is chosen.
 - `router_result`: original model prefix plus the route decision, capped at 300 characters. This is persisted during processing (together with `model_id`) as soon as a model is resolved, not only at request finish. `AdmissionService.check_concurrency` reads the prefix (everything before the first `:`) to bucket in-flight requests by their entrance model, so the origin prefix must not be removed or reordered.
 - `estimate_tokens`: fast heuristic estimate (`fast_estimate_tokens`) before model selection, replaced by a real tokenizer count after model selection when `tokenizer.enabled` is on.
-- `model_choosing_latency`: elapsed milliseconds for small-request routing or true auto selection.
+- `model_choosing_latency`: elapsed milliseconds from request receipt to the first upstream send, recorded for every dispatched request (not only auto ones); auto-selection and small-request-routing time is included in that window.
 - `prefix_cache` and `last_match`: server-selection prefix-cache data for the final upstream attempt.
 
 Routing LLM calls are separate internal request rows. Statistics APIs exclude rows with `ip_id = 0`.

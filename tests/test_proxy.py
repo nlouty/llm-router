@@ -898,18 +898,21 @@ def test_original_request_latency_remains_end_to_end_when_llm_choosing_is_logged
     base_time = timezone.now()
     # now() consumers in the new in-process flow (requests module): outer
     # record creation, choosing pool pick (list_pd_holders), choosing record
-    # creation, choosing pool pick, choosing circuit-breaker success, choosing
-    # finish, outer pool pick, outer circuit-breaker success, outer finish.
+    # creation, choosing pool pick, choosing dispatch latency, choosing
+    # circuit-breaker success, choosing finish, outer pool pick, outer
+    # dispatch latency, outer circuit-breaker success, outer finish.
     request_times = [
         base_time,                                  # 1. outer create
         base_time + timedelta(milliseconds=100),    # 2. choosing pool pick
         base_time + timedelta(milliseconds=100),    # 3. choosing create
         base_time + timedelta(milliseconds=250),    # 4. choosing pool pick
-        base_time + timedelta(milliseconds=250),    # 5. choosing cb success
-        base_time + timedelta(milliseconds=250),    # 6. choosing finish
-        base_time + timedelta(milliseconds=400),    # 7. outer pool pick
-        base_time + timedelta(milliseconds=400),    # 8. outer cb success
-        base_time + timedelta(milliseconds=700),    # 9. outer finish
+        base_time + timedelta(milliseconds=250),    # 5. choosing dispatch latency
+        base_time + timedelta(milliseconds=250),    # 6. choosing cb success
+        base_time + timedelta(milliseconds=250),    # 7. choosing finish
+        base_time + timedelta(milliseconds=400),    # 8. outer pool pick
+        base_time + timedelta(milliseconds=400),    # 9. outer dispatch latency
+        base_time + timedelta(milliseconds=400),    # 10. outer cb success
+        base_time + timedelta(milliseconds=700),    # 11. outer finish
     ]
 
     def fake_now():
@@ -1619,7 +1622,7 @@ def test_non_auto_request_does_not_call_routing_llm_and_keeps_user_model(monkeyp
     assert record.router_result is None
 
 
-def test_small_auto_request_records_small_request_latency(monkeypatch):
+def test_small_auto_request_records_dispatch_latency(monkeypatch):
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     Server.objects.create(model_id=target_model.id, base_url="http://target.example", is_online=True)
@@ -1669,7 +1672,9 @@ def test_small_auto_request_records_small_request_latency(monkeypatch):
     assert response.status_code == 200
     record = _external_request_record()
     assert record.router_result == "auto:small_request_routing"
-    assert record.model_choosing_latency == 125
+    # model_choosing_latency now covers request receipt to the first upstream
+    # send, so it is recorded on the dispatch of every request (auto or not).
+    assert record.model_choosing_latency is not None
 
 
 def test_small_counted_request_routes_directly_to_routing_server(monkeypatch):

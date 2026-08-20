@@ -8,6 +8,7 @@ from typing import Any
 
 import requests
 from django.http import StreamingHttpResponse
+from django.utils import timezone
 
 from router.config import APP_CONFIG
 from router.repositories.requests import RequestRepository
@@ -270,6 +271,14 @@ class PDForwardService:
             "prefiller_url": prefiller.base_url,
             "group_id": getattr(prefiller, "group_id", None),
         }, ensure_ascii=False))
+        if record.model_choosing_latency is None:
+            # First upstream send for this request: elapsed time from request
+            # receipt to the prefill dispatch. ttft minus this value is the
+            # LLM-side time to first token.
+            RequestRepository.record_model_choosing_latency(
+                record,
+                int((timezone.now() - record.send_time).total_seconds() * 1000),
+            )
         try:
             prefill_json, prompt_tokens, cached_tokens = self._do_prefill(
                 prefiller, prefiller_url, headers, body
@@ -367,6 +376,10 @@ class PDForwardService:
 
         kv_params = _extract_kv_params(prefill_json)
 
+        # The prefill probe generates exactly one token (max_tokens=1), so its
+        # completion is the request's first-token moment.
+        prefill_ttft = int((timezone.now() - record.send_time).total_seconds() * 1000)
+
         append_request_log(record.id, json.dumps({
             "event": "pd_prefill_success",
             "prefiller_url": prefiller.base_url,
@@ -375,6 +388,7 @@ class PDForwardService:
             "prefix_cache_ratio": round(cached_tokens / prompt_tokens, 4) if prompt_tokens else 0.0,
             "has_kv_params": bool(kv_params),
             "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+            "ttft_ms": prefill_ttft,
         }, ensure_ascii=False))
 
         # Prefill succeeded: release prefiller and transition to neutral "processing".
@@ -397,7 +411,7 @@ class PDForwardService:
             )
         return self._normal_decode(
             path, headers, body, record, context, served_as_vip, model,
-            state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
+            state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip, prefill_ttft,
         )
 
     # ------------------------------------------------------------------
@@ -430,7 +444,7 @@ class PDForwardService:
 
     def _normal_decode(
         self, path, headers, body, record, context, served_as_vip, model,
-        state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
+        state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip, prefill_ttft,
     ):
         from router.services.proxy import _RouteAttemptResult
 
@@ -579,6 +593,7 @@ class PDForwardService:
                 "completion_tokens": completion_tokens,
                 "cached_tokens": cached_tokens,
                 "recompute_count": recompute_count,
+                "ttft_ms": prefill_ttft,
             }, ensure_ascii=False))
             _prompt, output_tokens, _cached = _parse_usage(data.get("usage") if data else None)
             RequestRepository.finish(
@@ -586,6 +601,7 @@ class PDForwardService:
                 current_target, model.id if model else None,
                 attempt_count=state.attempts, final_prefix_cache=cached_tokens,
                 router_result=proxy_response.router_result(context),
+                ttft=prefill_ttft,
                 success_note=proxy_response.request_non_utf8_fail_reason(getattr(context, "body", b"")),
             )
             self._release_decoder(decoder, prompt_tokens)
@@ -754,7 +770,7 @@ class PDForwardService:
                                 return
                             if chunk:
                                 if ttft is None:
-                                    ttft = int((time.monotonic() - request_start) * 1000)
+                                    ttft = int((timezone.now() - record.send_time).total_seconds() * 1000)
                                 chunks.append(chunk)
                                 generated, completion_tokens, recomputed = self._scan_chunk(
                                     chunk, generated, completion_tokens

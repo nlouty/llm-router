@@ -148,7 +148,7 @@ class TestDecodeRetryPolicy:
         state = _RetryState()
         result = svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, prefiller, {}, 1, 0, "P: x",
+            False, None, state, prefiller, {}, 1, 0, "P: x", None,
         )
         return result, state
 
@@ -189,7 +189,7 @@ class TestDecodeRetryPolicy:
         state = _RetryState()
         result = svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, prefiller, {}, 1, 0, "P: x",
+            False, None, state, prefiller, {}, 1, 0, "P: x", None,
         )
         assert result.should_retry is False
         assert result.response is None
@@ -227,7 +227,7 @@ class TestDecodeRetryPolicy:
         state = _RetryState()
         result = svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, prefiller, {}, 1, 0, "P: x",
+            False, None, state, prefiller, {}, 1, 0, "P: x", None,
         )
         assert result.should_retry is False
         assert result.response is None
@@ -280,7 +280,7 @@ class TestDecodeRecordsPrefixContext:
         svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record,
             self._context_with_last_match(record, 76543),
-            False, None, state, prefiller, {}, 1, 0, "P: x",
+            False, None, state, prefiller, {}, 1, 0, "P: x", None,
         )
 
         assert len(captured) == 1
@@ -411,7 +411,7 @@ class TestDecodeErrorLogsBodyAndDetailedReason:
         state = _RetryState()
         svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, self._prefiller(), {}, 1, 0, "P: x",
+            False, None, state, self._prefiller(), {}, 1, 0, "P: x", None,
         )
 
         resp_events = [e for e in events if e.get("event") == "pd_decode_response"]
