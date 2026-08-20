@@ -25,6 +25,7 @@ proxy:
   stream_total_timeout_seconds: 900
   normal_connect_timeout_seconds: 5
   normal_read_timeout_seconds: 900
+  llm_choosing_timeout_seconds: 10
   client_disconnect_check_interval_seconds: 0.5
   stale_processing_minutes: 20
   opencode_failure_delay_seconds: 180
@@ -133,7 +134,7 @@ Prefix cache blocks are measured in Python Unicode characters, not LLM tokenizer
 
 `vip.cooldown_seconds` controls how long a VIP server stays in cooldown before it can be demoted to the normal pool. `vip.min_normal_servers` keeps at least that many normal servers available when VIP scale-up promotes servers.
 
-`proxy.default_max_tokens` is injected into JSON bodies that omit `max_tokens`. `proxy.unknown_model_max_tokens` is used only when admission checks a request without a model name. `proxy.auto_max_tokens` is the `max_tokens` limit for auto-routed requests — exact `model: auto` or any model with `auto = TRUE` — because the serving target is not known until routing resolves it. Stream and normal requests have separate connect/read timeout settings; streaming also has `stream_total_timeout_seconds`.
+`proxy.default_max_tokens` is injected into JSON bodies that omit `max_tokens`. `proxy.unknown_model_max_tokens` is used only when admission checks a request without a model name. `proxy.auto_max_tokens` is the `max_tokens` limit for auto-routed requests — exact `model: auto` or any model with `auto = TRUE` — because the serving target is not known until routing resolves it. Stream and normal requests have separate connect/read timeout settings; streaming also has `stream_total_timeout_seconds`. `proxy.llm_choosing_timeout_seconds` is the absolute budget for the internal llm-choosing request: every attempt's socket timeouts are clamped to the remaining budget, so a hung routing server is disconnected at the deadline and the choosing call fails fast with a 504 (the client request then falls back to the default model).
 
 `load_balancer.chooser_class` must point to a class implementing `choose(candidates, context, attempted_server_ids)`. The default prefix-cache chooser stores successful request prefixes in Redis and falls back to least-connection selection when no useful cache match exists. Retries are attempted **only** on connection failures (the request body never reached the upstream, so retrying another server is safe for non-idempotent POST). Read timeouts and any HTTP response status — including the values listed in `retry_status_codes` — are **not** retried; the only deliberate exception is context-overflow, which retries once on a larger-context server/model. `mark_unhealthy_status_codes` controls passive circuit-breaker failures.
 

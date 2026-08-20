@@ -427,7 +427,7 @@ class PDForwardService:
             prefiller_url,
             headers=req_headers,
             data=prefill_body,
-            timeout=self.prefill_timeout,
+            timeout=self.proxy._deadline_timeout(self.prefill_timeout),
         )
         if response.status_code >= 400:
             raise _PrefillHttpError(response.status_code, response.reason or "", response, response.content)
@@ -616,7 +616,8 @@ class PDForwardService:
         if getattr(decoder, "csb_token", None):
             req_headers["csb-token"] = decoder.csb_token
         response = requests.post(
-            decoder_url, headers=req_headers, data=decode_body, timeout=self.normal_timeout,
+            decoder_url, headers=req_headers, data=decode_body,
+            timeout=self.proxy._deadline_timeout(self.normal_timeout),
         )
         return response, response.content, response.status_code
 
