@@ -164,7 +164,11 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
     def _read_cache_hashes(self, redis_keys: list[str], error_message: str):
         try:
-            pipe = self._redis_client.pipeline()
+            # transaction=False: no MULTI/EXEC wrapper. The batch is ~10-15k
+            # commands per request; wrapping it in MULTI makes Redis execute it
+            # atomically and buffer every reply, stalling the single-threaded
+            # server (and every other client) for 10-20ms per request.
+            pipe = self._redis_client.pipeline(transaction=False)
             for key in redis_keys:
                 pipe.hgetall(key)
             return pipe.execute()
@@ -311,7 +315,10 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
         field_value = json.dumps({"exp": expiry_ts, "rid": context.request_id})
         try:
-            pipe = self._redis_client.pipeline()
+            # transaction=False: same reason as _read_cache_hashes — the write
+            # batch is 2x the block count and must not run as one atomic
+            # MULTI/EXEC block that freezes Redis for every other request.
+            pipe = self._redis_client.pipeline(transaction=False)
             for h, _ in prefix_data:
                 key = self._cache_key(model_key, h)
                 pipe.hset(key, str(server.id), field_value)
