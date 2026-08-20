@@ -95,7 +95,7 @@ The default chooser is `PrefixCachePrebleServerChooser`. Before each backend att
 
 If `match_ratio > prefix_cache.primary_match_threshold` (`0.9` by default), the chooser picks the least-loaded cached server. If no primary match exists but some server has `match_ratio > prefix_cache.secondary_match_threshold` (`0.5` by default), it picks the least-loaded server from that secondary set. Otherwise it picks the least-loaded candidate overall.
 
-Prefix cache blocks are measured in Unicode characters with `prefix_cache.prefix_block_chars` (`128` by default). Prefix cache metadata is written only after a successful upstream response.
+Prefix cache blocks are measured in Unicode characters with `prefix_cache.prefix_block_chars` (`512` by default, capped at `prefix_cache.max_prefix_chars` = `524288` chars per request). Prefix cache metadata is written only after a successful upstream response.
 
 Candidate servers are filtered by model, VIP pool, online state, soft delete, and circuit-breaker state (never by estimated request size; `servers.context_window` only gates the context-overflow retry).
 

@@ -76,7 +76,9 @@ def mock_redis():
             queued_reads.clear()
             return results
         pipe.execute = pipe_execute
-        client.pipeline = lambda: pipe
+        # Accept the real client's pipeline(transaction=...) kwarg and ignore it:
+        # the mock pipeline has no MULTI/EXEC semantics to toggle.
+        client.pipeline = lambda transaction=True: pipe
         mock.return_value = client
         PrefixCachePrebleServerChooser._redis_client = client
         yield client, storage
