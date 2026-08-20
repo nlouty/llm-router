@@ -182,7 +182,7 @@ class TestDecoderCircuitRecovery:
                 path="chat/completions", method="POST", is_stream=False, body=b"{}",
             ),
             False, None,
-            _RetryState(), prefiller, {}, 1, 0, "P: x",
+            _RetryState(), prefiller, {}, 1, 0, "P: x", None,
         )
 
         assert result.response is not None  # terminal success, not a retry

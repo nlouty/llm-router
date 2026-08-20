@@ -48,16 +48,6 @@ class AutoRouteAlgorithm:
             return False
         return ModelRepository.should_auto_select(model)
 
-    def should_record_model_choice(
-        self,
-        parsed,
-        is_vip_channel: bool,
-        auto_model_selection: bool,
-    ) -> bool:
-        # Model-choice timing covers small-request routing and true auto
-        # selection; both run only for auto requests (issue #227).
-        return auto_model_selection
-
     def resolve(
         self,
         parsed,
