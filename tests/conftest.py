@@ -85,6 +85,16 @@ def has_column(table, column):
 
 
 @pytest.fixture(autouse=True)
+def _reset_request_log_buffers():
+    # Buffered per-request log events (request_logger) must not leak from one
+    # test into the next test's log_path assertions.
+    yield
+    from router.services import request_logger
+
+    request_logger.clear_request_log_buffers()
+
+
+@pytest.fixture(autouse=True)
 def clean_api_tables(api_test_tables):
     # Background daemon threads (e.g. CMDB IP provisioning at views.py proxy
     # entry) may briefly hold the sqlite file when a test ends; retry the

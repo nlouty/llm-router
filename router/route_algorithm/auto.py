@@ -170,14 +170,23 @@ class AutoRouteAlgorithm:
         record.router_result = router_result
         record.save(update_fields=["model_id", "router_result"])
         parsed.model_name = model.model_name
-        parsed.body = self.update_body_model(
-            parsed.body,
-            model.model_name,
-            disable_thinking=disable_thinking,
-        )
+        try:
+            new_body, new_data = AutoRouteAlgorithm._rewrite_body_data(
+                getattr(parsed, "data", None),
+                parsed.body,
+                model.model_name,
+                disable_thinking,
+            )
+        except Exception:
+            new_body, new_data = parsed.body, getattr(parsed, "data", None)
+        parsed.body = new_body
+        if new_data is not None:
+            parsed.data = new_data
         context.model_id = model.id
         context.model_name = model.model_name
-        context.body = parsed.body
+        context.body = new_body
+        if new_data is not None:
+            context.body_data = new_data
 
     def _get_auto_route_model(
         self,
@@ -185,7 +194,10 @@ class AutoRouteAlgorithm:
         record: Any,
         context: ServerSelectionContext,
     ) -> tuple[Any, str | None]:
-        if self._is_multimodal(body):
+        # Parsed JSON of the request, threaded from RequestParser so the whole
+        # routing path parses the body exactly once (Action 5).
+        body_data = getattr(context, "body_data", None)
+        if self._is_multimodal(body, body_data):
             model = ModelRepository.get_multimodal_model()
             if model:
                 return model, "multimodal_bypass"
@@ -203,7 +215,7 @@ class AutoRouteAlgorithm:
         if sticky_model is not None:
             return sticky_model, "session-sticky"
 
-        cached_model = self._check_cache_hit(body, auto_models, model_names)
+        cached_model = self._check_cache_hit(body, auto_models, model_names, body_data)
         if cached_model:
             return cached_model, "cache_hit"
 
@@ -215,9 +227,12 @@ class AutoRouteAlgorithm:
             model_names,
         )
 
-    def _is_multimodal(self, body: bytes) -> bool:
+    def _is_multimodal(self, body: bytes, parsed_data: dict | None = None) -> bool:
         try:
-            data = json.loads(body.decode("utf-8"))
+            if isinstance(parsed_data, dict):
+                data = parsed_data
+            else:
+                data = json.loads(body.decode("utf-8"))
             for message in data.get("messages", []):
                 if self._has_chat_image_part(message.get("content")):
                     return True
@@ -241,8 +256,9 @@ class AutoRouteAlgorithm:
         body: bytes,
         active_models: list[Any],
         model_names: list[str],
+        parsed_data: dict | None = None,
     ) -> Any | None:
-        if self._user_prompt_count_from_body(body) == 1:
+        if self._user_prompt_count_from_body(body, parsed_data) == 1:
             return None
 
         chooser = self.chooser
@@ -265,13 +281,26 @@ class AutoRouteAlgorithm:
 
         since = timezone.now() - timedelta(seconds=self.STICKY_SESSION_WINDOW_SECONDS)
         choices = RequestRepository.list_recent_session_choices(session, since)
+        # Choices often repeat the same model id; resolve each id once per
+        # request instead of hitting the models table per choice.
+        models: dict[int, Any] = {}
         for choice in choices:
             if not self.is_sticky_anchor_result(choice.get("router_result")):
                 continue
-            model = ModelRepository.get_by_id(choice.get("model_id"))
-            if model is not None and ServerRepository.list_pd_holders(model.id, vip=False):
+            model_id = choice.get("model_id")
+            if model_id not in models:
+                models[model_id] = ModelRepository.get_by_id(model_id)
+            model = models[model_id]
+            if model is not None and self._model_has_pd_holders(model.id):
                 return model
         return None
+
+    def _model_has_pd_holders(self, model_id: int) -> bool:
+        # Reuse the proxy's per-request candidate memo so the later
+        # _select_candidates for the same model does not re-query the DB.
+        if self.proxy is not None and hasattr(self.proxy, "_pd_holders_cached"):
+            return bool(self.proxy._pd_holders_cached(model_id))
+        return bool(ServerRepository.list_pd_holders(model_id, vip=False))
 
     @staticmethod
     def is_sticky_anchor_result(router_result: str | None) -> bool:
@@ -285,9 +314,12 @@ class AutoRouteAlgorithm:
         )
 
     @staticmethod
-    def _user_prompt_count_from_body(body: bytes) -> int:
+    def _user_prompt_count_from_body(body: bytes, parsed_data: dict | None = None) -> int:
         try:
-            data = json.loads(body.decode("utf-8"))
+            if isinstance(parsed_data, dict):
+                data = parsed_data
+            else:
+                data = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return 0
         if not isinstance(data, dict):
@@ -352,7 +384,11 @@ class AutoRouteAlgorithm:
             return None, self._routing_unavailable_result()
 
         self._ensure_system_prompt(model_names)
-        payload = self._build_routing_payload(routing_model.model_name, body)
+        # Reuse the parsed JSON threaded on the context so the routing payload
+        # is built without re-parsing the request body (Action 5).
+        payload = self._build_routing_payload(
+            routing_model.model_name, body, getattr(context, "body_data", None)
+        )
         if len(payload.get("messages", [])) <= 1:
             return None, "no_user_query"
 
@@ -568,10 +604,12 @@ class AutoRouteAlgorithm:
                 "where complexity is an integer from 1 to 10."
             )
 
-    def _build_routing_payload(self, model_name: str, body: bytes) -> dict[str, Any]:
+    def _build_routing_payload(
+        self, model_name: str, body: bytes, parsed_data: dict | None = None
+    ) -> dict[str, Any]:
         payload = {
             "model": model_name,
-            "messages": self._routing_messages_from_body(body),
+            "messages": self._routing_messages_from_body(body, parsed_data),
             "stream": False,
             "response_format": self._routing_response_format(),
         }
@@ -600,15 +638,18 @@ class AutoRouteAlgorithm:
             },
         }
 
-    def _routing_messages_from_body(self, body: bytes) -> list[dict[str, Any]]:
+    def _routing_messages_from_body(self, body: bytes, parsed_data: dict | None = None) -> list[dict[str, Any]]:
         messages = [{"role": "system", "content": self._router_system_prompt}]
-        messages.extend(self._user_messages_from_body(body))
+        messages.extend(self._user_messages_from_body(body, parsed_data))
         return messages
 
     @staticmethod
-    def _user_messages_from_body(body: bytes) -> list[dict[str, Any]]:
+    def _user_messages_from_body(body: bytes, parsed_data: dict | None = None) -> list[dict[str, Any]]:
         try:
-            data = json.loads(body.decode("utf-8"))
+            if isinstance(parsed_data, dict):
+                data = parsed_data
+            else:
+                data = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return []
         if not isinstance(data, dict):
@@ -684,19 +725,40 @@ class AutoRouteAlgorithm:
         body: bytes,
         model_name: str,
         disable_thinking: bool = False,
+        parsed_data: dict | None = None,
     ) -> bytes:
         try:
-            body_data = json.loads(body.decode("utf-8"))
-            body_data["model"] = model_name
-            if disable_thinking:
-                AutoRouteAlgorithm.disable_thinking(body_data)
-            return json.dumps(
-                body_data,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
+            new_body, _data = AutoRouteAlgorithm._rewrite_body_data(
+                parsed_data, body, model_name, disable_thinking
+            )
+            return new_body
         except Exception:
             return body
+
+    @staticmethod
+    def _rewrite_body_data(
+        parsed_data: dict | None,
+        body: bytes,
+        model_name: str,
+        disable_thinking: bool,
+    ) -> tuple[bytes, dict]:
+        """Rewrite the body with the resolved model, reusing already-parsed JSON.
+
+        Returns ``(new_body, body_data)``; ``body_data`` is the parsed object
+        matching ``new_body`` so callers can keep their parsed copy in sync
+        without re-parsing. Mutates ``parsed_data`` in place when provided.
+        """
+        if isinstance(parsed_data, dict):
+            body_data = parsed_data
+        else:
+            body_data = json.loads(body.decode("utf-8"))
+        body_data["model"] = model_name
+        if disable_thinking:
+            AutoRouteAlgorithm.disable_thinking(body_data)
+        return (
+            json.dumps(body_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            body_data,
+        )
 
     @staticmethod
     def disable_thinking(body_data: dict[str, Any]) -> None:

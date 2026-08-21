@@ -16,7 +16,7 @@ from router.repositories.servers import ServerRepository
 from router.services import proxy_logging, proxy_response
 from router.services.request_context import get_request_id
 from router.services.request_log_handler import install_pd_handler
-from router.services.request_logger import append_request_log
+from router.services.request_logger import append_request_log, flush_request_log
 from router.utils.errors import error_payload, timeout_sse_event
 from router.utils.sse import parse_sse_usage
 
@@ -607,9 +607,12 @@ class PDForwardService:
             self._release_decoder(decoder, prompt_tokens)
             self.proxy._after_finish(served_as_vip, model)
             client_content = rewrite_json_cached_tokens(content, cached_tokens)
-            return _RouteAttemptResult(
-                response=proxy_response.response_from_upstream(response, client_content, status_code)
+            final_response = proxy_response.response_from_upstream(response, client_content, status_code)
+            # Prefix-cache write after the client has received the response.
+            final_response = self.proxy._attach_chooser_response_hook(
+                final_response, prefiller, context, status_code
             )
+            return _RouteAttemptResult(response=final_response)
 
     def _post_decode(self, decoder, decoder_url, headers, decode_body):
         req_headers = {**headers}
@@ -892,11 +895,13 @@ class PDForwardService:
                     pass
             finally:
                 release_current_decoder()
+                flush_request_log(record.id)
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
         response["X-Accel-Buffering"] = "no"
-        return response
+        # Prefix-cache write after the last streamed chunk has been delivered.
+        return self.proxy._attach_chooser_response_hook(response, prefiller, context, 200)
 
     # ------------------------------------------------------------------
     # Helpers

@@ -150,6 +150,9 @@ class TestDecoderCircuitRecovery:
             {
                 "_build_url": staticmethod(lambda base, path, qs: f"{base}/{path}"),
                 "_notify_chooser_response": staticmethod(lambda s, ctx, code: None),
+                # PD defers the prefix-cache write to a response.close()
+                # callback; the stub returns the response unchanged.
+                "_attach_chooser_response_hook": staticmethod(lambda resp, s, ctx, code: resp),
                 "_after_finish": staticmethod(lambda vip, m: None),
                 "_decrement_workload": staticmethod(lambda s: None),
                 "circuit_breaker": fake_cb,

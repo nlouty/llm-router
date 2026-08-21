@@ -22,7 +22,7 @@ from router.services.request_context import (
     set_llm_choosing_deadline,
     set_request_id,
 )
-from router.services.request_logger import append_request_log
+from router.services.request_logger import append_request_log, flush_request_log
 
 from router.config import APP_CONFIG
 from router.repositories.requests import (
@@ -113,6 +113,10 @@ class ProxyService:
         self.vip_port = int(APP_CONFIG.get("server", {}).get("vip_port", 8008))
         self.tokenizer_enabled = bool(APP_CONFIG.get("tokenizer", {}).get("enabled", False))
         self._active_chooser = None
+        # Per-request memo for candidate queries: this service instance serves
+        # exactly one request, so repeated lookups for the same (model, vip,
+        # window) within it reuse the first result instead of re-querying.
+        self._candidate_cache: dict = {}
 
     def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False, skip_auto_selection: bool = False):
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
@@ -154,6 +158,7 @@ class ProxyService:
             # create a second record and orphan this one.
             return self._finish_unhandled(record, exc)
         finally:
+            flush_request_log(record.id)
             clear_request_id()
 
     def forward_internal(self, body: bytes, model, path: str = "chat/completions") -> HttpResponse:
@@ -385,6 +390,7 @@ class ProxyService:
             origin_model_name=parsed.model_name,
             auto_model_selection=auto_model_selection,
             session=getattr(record, "session", None),
+            body_data=getattr(parsed, "data", None),
         )
 
     def _build_url(self, base_url: str, path: str, query_string: str) -> str:
@@ -398,7 +404,23 @@ class ProxyService:
         if path.rstrip("/") == "models" and model_id is None:
             candidates = ServerRepository.list_all_online()
             return [random.choice(candidates)] if candidates else []
-        return ServerRepository.list_pd_holders(model_id, vip=vip, min_context_window=min_context_window)
+        return self._pd_holders_cached(model_id, vip=vip, min_context_window=min_context_window)
+
+    def _pd_holders_cached(self, model_id: int | None, vip: bool | None = None, min_context_window: int = 0) -> list:
+        """list_pd_holders memoized for the lifetime of this request.
+
+        The sticky-model resolution and the subsequent candidate selection can
+        ask for the same (model, vip=False, window=0) pool; answer both from
+        one DB query. Window-scoped retry lookups use a different key.
+        """
+        key = ("pd_holders", model_id, vip, min_context_window)
+        cached = self._candidate_cache.get(key)
+        if cached is None:
+            cached = ServerRepository.list_pd_holders(
+                model_id, vip=vip, min_context_window=min_context_window
+            )
+            self._candidate_cache[key] = cached
+        return cached
 
     def _select_candidates(self, path: str, model, is_vip_channel: bool, is_identity_vip: bool = False, min_context_window: int = 0):
         model_id = model.id if model else None
@@ -559,6 +581,7 @@ class ProxyService:
             return self._retry_failure_response(record, state, served_as_vip, model, user_agent, context)
         finally:
             self._close_disconnect_scope(disconnect_scope)
+            flush_request_log(record.id)
             clear_request_id()
 
     def _open_disconnect_scope(self, django_request, is_stream: bool) -> _DisconnectScope:
@@ -725,7 +748,7 @@ class ProxyService:
             )
 
         if not is_stream:
-            return self._normal_success_response(
+            result = self._normal_success_response(
                 upstream,
                 content,
                 record,
@@ -737,6 +760,9 @@ class ProxyService:
                 state.attempts,
                 served_as_vip,
             )
+            if 200 <= status_code < 300 and result.response is not None:
+                self._attach_chooser_response_hook(result.response, server, context, status_code)
+            return result
 
         response = self._stream_success(
             django_request,
@@ -1126,11 +1152,15 @@ class ProxyService:
                 except Exception:
                     pass
                 self._after_finish(served_as_vip, model)
+                flush_request_log(record.id)
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
         response["X-Accel-Buffering"] = "no"
-        return response
+        # The prefix-cache write runs after the last streamed chunk has been
+        # delivered to the client (gunicorn calls close() in a finally after
+        # writing every chunk).
+        return self._attach_chooser_response_hook(response, server, context, status_code)
 
     def _client_closed_response(self, record, served_as_vip: bool = False, model=None):
         proxy_response.finish_client_closed(record)
@@ -1164,20 +1194,60 @@ class ProxyService:
         return self._active_chooser or self.chooser
 
     def _notify_chooser_response(self, server, context, status_code: int, *, record_circuit: bool = True) -> None:
+        # Circuit-breaker bookkeeping only. The chooser's on_response hook
+        # (the Redis prefix-cache write) is deferred until after the client
+        # response has been delivered via _attach_chooser_response_hook, so a
+        # slow Redis can never delay the user-visible response.
         if record_circuit and 200 <= status_code < 300:
             self.circuit_breaker.record_success(server)
+
+    def _attach_chooser_response_hook(self, response, server, context, status_code: int):
+        """Attach the chooser's on_response hook (the Redis prefix-cache write)
+        to *response* so it runs once the WSGI server has finished sending it.
+
+        The hook function is captured NOW: the effective chooser can change
+        during the request (embeddings swap in the workload chooser whose
+        on_response is None), and the hook must belong to the chooser that
+        selected the server, not whatever is active when close() runs later.
+        """
         hook = getattr(self._effective_chooser(), "on_response", None)
-        if not hook:
-            return
-        try:
-            hook(server, context, status_code)
-        except Exception as exc:
-            proxy_logging.log_chooser_response_hook_error(
-                context,
-                server,
-                status_code,
-                exc,
-            )
+        if hook is None:
+            return response
+
+        def callback():
+            try:
+                hook(server, context, status_code)
+            except Exception as exc:
+                proxy_logging.log_chooser_response_hook_error(
+                    context,
+                    server,
+                    status_code,
+                    exc,
+                )
+
+        return self._attach_response_close_hook(response, callback)
+
+    @staticmethod
+    def _attach_response_close_hook(response, callback):
+        """Run *callback* once the WSGI server has finished sending *response*.
+
+        Django's WSGIHandler hands the response back to the WSGI server;
+        gunicorn (sync and gthread workers) writes every chunk to the client
+        socket and then calls ``respiter.close()`` in a finally, so the
+        callback runs strictly after the response has been delivered — the
+        request thread pays the Redis write cost only after the user already
+        received the response, with no extra threads or queues involved.
+        """
+        original_close = response.close
+
+        def close_with_callback():
+            try:
+                original_close()
+            finally:
+                callback()
+
+        response.close = close_with_callback
+        return response
 
     def _mark_unhealthy(self, server) -> None:
         if server.id != 0:

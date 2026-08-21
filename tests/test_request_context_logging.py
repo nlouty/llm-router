@@ -14,6 +14,7 @@ def reset_request_logger_cache(monkeypatch):
 
 
 def _log_lines(tmp_path):
+    request_logger.flush_request_log(777)
     files = list(tmp_path.rglob("777.log"))
     assert len(files) == 1, f"expected one log file, found {files}"
     return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines() if line.strip()]

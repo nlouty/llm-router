@@ -26,6 +26,7 @@ from router.services import proxy_logging
 from router.services.proxy import ProxyService
 from router.services.request_context import clear_request_id, set_request_id
 from router.services.request_log_handler import install_pd_handler
+from router.services.request_logger import flush_request_log
 from router.utils.errors import error_response
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,7 @@ def proxy(request, path: str):
             logger.error("proxy unhandled %s request_id=%s path=/v1/%s: %s", type(exc).__name__, record.id, path, str(exc)[:200])
             logger.debug("%s", traceback.format_exc())
         finally:
+            flush_request_log(record.id)
             clear_request_id()
         return error_response(502, "502 Bad Gateway", "server_error")
 

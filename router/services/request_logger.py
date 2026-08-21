@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,17 @@ from router.config import APP_CONFIG, BASE_DIR
 _LOG_PATH_CACHE: Path | None = None
 _REQUEST_LOG_FILE_CACHE: dict[int, Path] = {}
 _VERBOSE_REQUEST_LOG_ENV = "LLM_ROUTER_VERBOSE_REQUEST_LOG"
+
+# Per-request append buffering: every event used to open/write/close its own
+# file handle (~15-20 syscall pairs per request). Events for the same request
+# now accumulate in memory and are flushed together — after the flush interval
+# elapses, when the buffer registry grows too large, or explicitly at request
+# end via flush_request_log(). Worst case on a crashed worker, at most the
+# events appended within the last flush interval are lost.
+_BUFFERED_MESSAGES: dict[int, list[str]] = {}
+_BUFFERED_LAST_FLUSH: dict[int, float] = {}
+_FLUSH_INTERVAL_SECONDS = 0.25
+_MAX_BUFFERED_REQUESTS = 10000
 
 
 def _resolve_log_path() -> Path:
@@ -61,8 +73,42 @@ def verbose_request_logging_enabled() -> bool:
 
 
 def append_request_log(request_id: int, message: str) -> None:
+    now = time.monotonic()
+    last_flush = _BUFFERED_LAST_FLUSH.get(request_id)
+    if last_flush is not None and now - last_flush < _FLUSH_INTERVAL_SECONDS:
+        _BUFFERED_MESSAGES.setdefault(request_id, []).append(message)
+        _evict_buffered_overflow()
+        return
+    buffered = _BUFFERED_MESSAGES.pop(request_id, [])
+    _BUFFERED_LAST_FLUSH[request_id] = now
     with _request_log_file(request_id).open("a", encoding="utf-8") as handle:
+        for buffered_message in buffered:
+            handle.write(buffered_message.rstrip() + "\n")
         handle.write(message.rstrip() + "\n")
+
+
+def flush_request_log(request_id: int) -> None:
+    """Write any buffered events for *request_id* to its per-request log file."""
+    messages = _BUFFERED_MESSAGES.pop(request_id, [])
+    if not messages:
+        return
+    with _request_log_file(request_id).open("a", encoding="utf-8") as handle:
+        for message in messages:
+            handle.write(message.rstrip() + "\n")
+    _BUFFERED_LAST_FLUSH.pop(request_id, None)
+
+
+def clear_request_log_buffers() -> None:
+    """Drop buffered (unflushed) events; used by tests between runs."""
+    _BUFFERED_MESSAGES.clear()
+    _BUFFERED_LAST_FLUSH.clear()
+
+
+def _evict_buffered_overflow() -> None:
+    # Flush the oldest buffered requests (dicts keep insertion order) so the
+    # registry never grows unboundedly on a long-lived worker.
+    while len(_BUFFERED_MESSAGES) > _MAX_BUFFERED_REQUESTS:
+        flush_request_log(next(iter(_BUFFERED_MESSAGES)))
 
 
 def append_error_log(request_id: int, message: str) -> None:
