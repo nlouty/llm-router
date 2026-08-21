@@ -1,4 +1,5 @@
 from django.apps import apps
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import connection
 
@@ -15,6 +16,21 @@ class Command(BaseCommand):
         fix = options.get("fix")
         dry_run = options.get("dry_run")
 
+        # Say exactly which database and which model definitions are being
+        # compared. A "matches" verdict is only meaningful for the database
+        # and code the app itself uses: running this command with a different
+        # DB_* environment (or with USE_SQLITE_FOR_TESTS leaking in) or from
+        # an older checkout compares the wrong pair and produces false
+        # reassurance while the live app fails with UndefinedColumn.
+        db_config = settings.DATABASES["default"]
+        app_config = apps.get_app_config("router")
+        self.stdout.write(
+            "Validating schema of database "
+            f"'{db_config.get('NAME')}' at {db_config.get('HOST') or 'localhost'}:{db_config.get('PORT') or 'default'} "
+            f"(engine={db_config.get('ENGINE')}, user={db_config.get('USER')}) "
+            f"against {len(models)} models defined in {app_config.models_module.__file__}"
+        )
+
         pass_count = 0
         while True:
             drift = self._inspect_schema(models)
@@ -24,11 +40,18 @@ class Command(BaseCommand):
             if pass_count == 0:
                 self._write_drift(drift)
 
-            if not fix:
+            if dry_run:
+                # Preview the SQL without touching the database, even without
+                # --fix, so `check_db_schema --dry-run` alone already shows
+                # what would be applied.
+                self._apply_fixes(drift, models, dry_run=True)
                 raise SystemExit(1)
 
-            if dry_run:
-                self._apply_fixes(drift, models, dry_run=True)
+            if not fix:
+                self.stderr.write(
+                    "Run 'check_db_schema --fix --dry-run' to preview the SQL that would be "
+                    "applied, then 'check_db_schema --fix' to apply it."
+                )
                 raise SystemExit(1)
 
             self._apply_fixes(drift, models, dry_run=False)
