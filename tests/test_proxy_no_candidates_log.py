@@ -69,7 +69,8 @@ def test_no_candidates_logs_request_context_with_messages_redacted(tmp_path, mon
 
     context_lines = [line for line in content.splitlines() if '"event": "request_context"' in line]
     assert len(context_lines) == 1
-    payload = json.loads(context_lines[0])
+    # Lines are prefixed "[<timestamp>] " (issue #262); strip it before parsing.
+    payload = json.loads(context_lines[0].partition("] ")[2])
     logged_body = json.loads(payload["request_body"])
     assert "messages" not in logged_body            # privacy: removed
     assert "top-secret-prompt" not in content        # never leaks anywhere in the log

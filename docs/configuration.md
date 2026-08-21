@@ -82,7 +82,7 @@ database:
   sslmode: disable
 ```
 
-Request logs are written below `log_path` as `YYYY/MM/DD/HH/MM/<request_id>.log`. `start_prod.sh` defaults `log_path` to `/data/router_log` and disables verbose request logging. `start_test.sh` defaults `log_path` to `.logs/requests` and enables a `user_request` event containing the full request body as pretty JSON.
+Request logs are written below `log_path` as `YYYY/MM/DD/HH/MM/<request_id>.log`. Each event line is prefixed with its timestamp `[YYYY-MM-DD HH:MM:SS.mmm]` in the configured `TIME_ZONE` (issue #262). `start_prod.sh` defaults `log_path` to `/data/router_log` and disables verbose request logging. `start_test.sh` defaults `log_path` to `.logs/requests` and enables a `user_request` event containing the full request body as pretty JSON.
 
 Point the router to another config file with:
 

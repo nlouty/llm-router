@@ -47,10 +47,17 @@ def _current_log_time() -> datetime:
     return datetime.now(timezone.get_current_timezone())
 
 
-def _request_log_file(request_id: int) -> Path:
+def _event_time_prefix(now: datetime) -> str:
+    # Issue #262: each event line is prefixed with its time. Millisecond
+    # precision because events within one request routinely share a second.
+    return f"[{now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}]"
+
+
+def _request_log_file(request_id: int, now: datetime | None = None) -> Path:
     log_file = _REQUEST_LOG_FILE_CACHE.get(request_id)
     if log_file is None:
-        now = _current_log_time()
+        if now is None:
+            now = _current_log_time()
         log_file = (
             _resolve_log_path()
             / f"{now.year:04d}"
@@ -73,6 +80,10 @@ def verbose_request_logging_enabled() -> bool:
 
 
 def append_request_log(request_id: int, message: str) -> None:
+    # One clock read per event: the prefix and (on first write) the file's
+    # minute bucket both derive from it.
+    event_time = _current_log_time()
+    message = f"{_event_time_prefix(event_time)} {message}"
     now = time.monotonic()
     last_flush = _BUFFERED_LAST_FLUSH.get(request_id)
     if last_flush is not None and now - last_flush < _FLUSH_INTERVAL_SECONDS:
@@ -81,7 +92,7 @@ def append_request_log(request_id: int, message: str) -> None:
         return
     buffered = _BUFFERED_MESSAGES.pop(request_id, [])
     _BUFFERED_LAST_FLUSH[request_id] = now
-    with _request_log_file(request_id).open("a", encoding="utf-8") as handle:
+    with _request_log_file(request_id, event_time).open("a", encoding="utf-8") as handle:
         for buffered_message in buffered:
             handle.write(buffered_message.rstrip() + "\n")
         handle.write(message.rstrip() + "\n")
