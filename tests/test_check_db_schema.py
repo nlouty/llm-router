@@ -1,5 +1,6 @@
 import pytest
 from django.apps import apps
+from django.conf import settings
 from django.core.management import call_command
 from django.db import connection
 
@@ -109,6 +110,37 @@ def test_check_db_schema_succeeds_when_schema_matches(capsys):
 
     output = capsys.readouterr()
     assert "Database schema matches Django model definitions" in output.out
+
+
+def test_check_db_schema_reports_validated_database_target(capsys):
+    call_command("check_db_schema")
+
+    output = capsys.readouterr()
+    # A "matches" verdict must be attributable: which database and which
+    # model definitions were actually compared.
+    assert "Validating schema of database" in output.out
+    assert settings.DATABASES["default"]["NAME"] in output.out
+    assert "models defined in" in output.out
+    assert "router/models.py" in output.out
+
+
+@postgres_only
+def test_check_db_schema_bare_dry_run_previews_fix_sql(capsys):
+    # With drift present, plain `--dry-run` (no --fix) prints the SQL that
+    # would be applied, without touching the database.
+    index_name = "idx_requests_processing_target"
+    drop_index(index_name)
+    try:
+        with pytest.raises(SystemExit):
+            call_command("check_db_schema", "--dry-run")
+
+        output = capsys.readouterr()
+        assert f"Missing index in requests: {index_name}" in output.err
+        assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in output.out
+        assert not has_index(index_name)
+    finally:
+        if not has_index(index_name):
+            create_request_index(index_name)
 
 
 def test_user_visit_counts_is_not_required(capsys):
