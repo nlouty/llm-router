@@ -30,6 +30,7 @@ class Command(BaseCommand):
             f"(engine={db_config.get('ENGINE')}, user={db_config.get('USER')}) "
             f"against {len(models)} models defined in {app_config.models_module.__file__}"
         )
+        self._report_connection_context(models)
 
         pass_count = 0
         while True:
@@ -62,6 +63,57 @@ class Command(BaseCommand):
             self.stdout.write("Applied fixes, re-checking schema...")
 
         self.stdout.write(self.style.SUCCESS("Database schema matches Django model definitions"))
+
+    def _report_connection_context(self, models):
+        """Report the search_path and where each model table actually resolves.
+
+        The app resolves unqualified table names through its connection's
+        search_path. If this check runs with a different search_path than the
+        serving app (different DB user default, connection OPTIONS, or a SET
+        search_path in the app), introspection can validate one schema's
+        tables while the app queries another schema's — producing a false
+        "matches" even though the app crashes with UndefinedColumn. Printing
+        the resolved locations, and warning when a table name exists in
+        several schemas, removes that blind spot.
+        """
+        if connection.vendor != "postgresql":
+            return
+        tables = sorted({model._meta.db_table for model in models})
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_schemas(true)")
+            schemas = cursor.fetchone()[0]
+            self.stdout.write(f"PostgreSQL search_path: {', '.join(schemas)}")
+            cursor.execute(
+                "SELECT t, to_regclass(t)::text FROM unnest(%s::text[]) AS t",
+                [tables],
+            )
+            resolved = dict(cursor.fetchall())
+            cursor.execute(
+                """
+                SELECT c.relname, n.nspname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relname = ANY(%s)
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                ORDER BY c.relname, n.nspname
+                """,
+                [tables],
+            )
+            occurrences: dict[str, list[str]] = {}
+            for relname, nspname in cursor.fetchall():
+                occurrences.setdefault(relname, []).append(nspname)
+
+        self.stdout.write("Resolved table locations (search_path + to_regclass):")
+        for table in tables:
+            self.stdout.write(f"  {table} -> {resolved.get(table) or 'NOT FOUND'}")
+        for table, schema_list in occurrences.items():
+            if len(schema_list) > 1:
+                self.stderr.write(
+                    f"WARNING: table '{table}' exists in multiple schemas "
+                    f"({', '.join(schema_list)}); the serving app resolves it through "
+                    "ITS connection's search_path - confirm the app connection uses "
+                    "the same search_path as this check."
+                )
 
     def _apply_fixes(self, drift, models, dry_run):
         for table in drift["missing_tables"]:

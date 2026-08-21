@@ -125,6 +125,20 @@ def test_check_db_schema_reports_validated_database_target(capsys):
 
 
 @postgres_only
+def test_check_db_schema_reports_search_path_and_resolved_tables(capsys):
+    call_command("check_db_schema")
+
+    output = capsys.readouterr()
+    # Table resolution is search_path-dependent; the report must show the
+    # schema each model table actually resolves to, so a checker/app
+    # search_path mismatch cannot hide behind a false "matches".
+    assert "PostgreSQL search_path:" in output.out
+    assert "Resolved table locations" in output.out
+    assert "requests -> " in output.out
+    assert "models -> " in output.out
+
+
+@postgres_only
 def test_check_db_schema_bare_dry_run_previews_fix_sql(capsys):
     # With drift present, plain `--dry-run` (no --fix) prints the SQL that
     # would be applied, without touching the database.
