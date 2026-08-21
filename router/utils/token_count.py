@@ -110,7 +110,7 @@ def count_tokens_with_latency(model_path: str | None, text: str) -> tuple[int, i
 
 
 def _get_tokenizer(model_path: str):
-    """Load and cache the tokenizer for *model_path*; fast first, slow fallback."""
+    """Load and cache the fast tokenizer for *model_path* (no slow fallback)."""
     global _import_failed, _import_error
     if model_path in _tokenizers or model_path in _failed_paths or _import_failed:
         return _tokenizers.get(model_path)
@@ -126,22 +126,21 @@ def _get_tokenizer(model_path: str):
             _import_error = str(exc) or exc.__class__.__name__
             logger.warning("transformers unavailable; tokenizer counting disabled: %s", exc)
             return None
-        tokenizer = None
-        last_error = None
-        for use_fast in (True, False):
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=use_fast)
-                break
-            except Exception as exc:
-                last_error = str(exc) or exc.__class__.__name__
-                continue
-        if tokenizer is None:
+        # Fast (Rust) tokenizers only: a silent slow fallback costs ~10x encode
+        # latency. trust_remote_code=True lets custom tokenizers (GLM, DeepSeek,
+        # ...) register their fast implementation.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, use_fast=True, trust_remote_code=True
+            )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
             _failed_paths.add(model_path)
-            _load_errors[model_path] = last_error or "unknown error"
+            _load_errors[model_path] = error
             logger.warning(
-                "no tokenizer loaded for model_path=%s (%s); counting 0",
+                "fast tokenizer load failed for model_path=%s (%s); counting 0",
                 model_path,
-                last_error or "unknown error",
+                error,
             )
             return None
         _load_errors.pop(model_path, None)

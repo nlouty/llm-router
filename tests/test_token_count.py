@@ -62,7 +62,7 @@ def test_unloadable_path_counts_zero_with_reason(monkeypatch):
 
 
 def test_failed_load_captures_error_message(monkeypatch):
-    def from_pretrained(path, use_fast):
+    def from_pretrained(path, use_fast, trust_remote_code):
         raise OSError("repo not found")
 
     transformers = SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=from_pretrained))
@@ -86,7 +86,7 @@ def test_tokenizer_loaded_once_per_path(monkeypatch):
     calls = []
     transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(
-            from_pretrained=lambda path, use_fast: (calls.append(path), FakeTokenizer())[1]
+            from_pretrained=lambda path, use_fast, trust_remote_code: (calls.append(path), FakeTokenizer())[1]
         )
     )
     monkeypatch.setitem(sys.modules, "transformers", transformers)
@@ -96,25 +96,25 @@ def test_tokenizer_loaded_once_per_path(monkeypatch):
     assert calls == ["p"]
 
 
-def test_fast_then_slow_fallback(monkeypatch):
+def test_no_slow_fallback_and_trust_remote_code(monkeypatch):
     calls = []
 
-    def from_pretrained(path, use_fast):
-        calls.append(use_fast)
-        if use_fast:
-            raise OSError("no fast tokenizer")
-        return FakeTokenizer()
+    def from_pretrained(path, use_fast, trust_remote_code):
+        calls.append((use_fast, trust_remote_code))
+        raise OSError("no fast tokenizer")
 
     transformers = SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=from_pretrained))
     monkeypatch.setitem(sys.modules, "transformers", transformers)
-    assert token_count._get_tokenizer("p") is not None
-    assert calls == [True, False]
+    assert token_count._get_tokenizer("p") is None
+    # One fast-only attempt with trust_remote_code, never a slow retry.
+    assert calls == [(True, True)]
+    assert token_count._load_errors["p"] == "no fast tokenizer"
 
 
 def test_failed_path_not_retried(monkeypatch):
     calls = []
 
-    def from_pretrained(path, use_fast):
+    def from_pretrained(path, use_fast, trust_remote_code):
         calls.append(use_fast)
         raise OSError("always fails")
 
@@ -122,8 +122,8 @@ def test_failed_path_not_retried(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     assert token_count._get_tokenizer("p") is None
     assert token_count._get_tokenizer("p") is None
-    # fast+slow once per path, never retried on subsequent calls
-    assert len(calls) == 2
+    # one fast attempt per path, never retried on subsequent calls
+    assert len(calls) == 1
     assert token_count._load_errors["p"] == "always fails"
 
 
