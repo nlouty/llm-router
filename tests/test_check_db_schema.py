@@ -55,6 +55,32 @@ def create_request_index(index_name):
         schema_editor.execute(str(index.create_sql(RequestRecord, schema_editor)))
 
 
+def create_request_index_with_old_predicate(index_name):
+    """Recreate an index under the right name with the pre-PD single-status
+    predicate - the exact drift that disabled the processing indexes."""
+    with connection.schema_editor() as schema_editor:
+        schema_editor.execute(f'DROP INDEX IF EXISTS "{index_name}";')
+        schema_editor.execute(
+            f'CREATE INDEX "{index_name}" ON requests (target_pod_ip) '
+            "WHERE task_status = 'processing';"
+        )
+
+
+def live_index_predicate(index_name):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT pg_get_expr(i.indpred, i.indrelid)
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname = %s AND c.relnamespace = current_schema()::regnamespace
+            """,
+            [index_name],
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
 def has_index(index_name):
     with connection.cursor() as cursor:
         cursor.execute(
@@ -277,3 +303,64 @@ def test_check_db_schema_fix_creates_missing_request_index(capsys):
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in output.out
     assert f'"{index_name}"' in output.out
     assert has_index(index_name)
+
+
+@postgres_only
+def test_check_db_schema_reports_index_condition_drift(capsys):
+    # Same index name, old single-status predicate: present by name, unusable
+    # by the live queries. Name-only validation reports "matches"; the
+    # definition check must flag it.
+    index_name = "idx_requests_processing_target"
+    create_request_index_with_old_predicate(index_name)
+
+    try:
+        with pytest.raises(SystemExit):
+            call_command("check_db_schema", "--dry-run")
+
+        output = capsys.readouterr()
+        assert f"Index definition drift in requests: {index_name}" in output.err
+        assert f"DROP INDEX CONCURRENTLY IF EXISTS" in output.out
+        assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in output.out
+        # Preview only: the drifted index is untouched.
+        assert has_index(index_name)
+        assert "'prefilling'" not in (live_index_predicate(index_name) or "")
+    finally:
+        if "'prefilling'" not in (live_index_predicate(index_name) or ""):
+            drop_index(index_name)
+            create_request_index(index_name)
+
+
+@postgres_only
+def test_check_db_schema_fix_recreates_drifted_index(capsys):
+    index_name = "idx_requests_processing_target"
+    create_request_index_with_old_predicate(index_name)
+
+    call_command("check_db_schema", "--fix")
+
+    output = capsys.readouterr()
+    assert f"Index definition drift in requests: {index_name}" in output.err
+    assert f"DROP INDEX CONCURRENTLY IF EXISTS" in output.out
+    assert f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{index_name}"' in output.out
+    # The recreated index now carries the multi-status predicate.
+    assert "'prefilling'" in (live_index_predicate(index_name) or "")
+    assert has_index(index_name)
+
+
+@postgres_only
+def test_check_db_schema_accepts_matching_partial_index_condition(capsys):
+    # An index created from the current model definition must NOT be flagged:
+    # the canonicalized signatures (predicate printed by pg_get_expr on both
+    # sides) have to compare equal.
+    index_name = "idx_requests_proc_sendtime"
+    drop_index(index_name)
+    try:
+        create_request_index(index_name)
+
+        call_command("check_db_schema")
+
+        output = capsys.readouterr()
+        assert "Database schema matches Django model definitions" in output.out
+        assert "Index definition drift" not in output.err
+    finally:
+        if not has_index(index_name):
+            create_request_index(index_name)

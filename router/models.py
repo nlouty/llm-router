@@ -164,6 +164,11 @@ class RequestRecord(TimestampedSoftDeleteModel):
                 condition=Q(task_status__in=["processing", "prefilling", "decoding"]),
             ),
             models.Index(
+                name="idx_requests_proc_sendtime",
+                fields=["send_time"],
+                condition=Q(task_status__in=["processing", "prefilling", "decoding"]),
+            ),
+            models.Index(
                 name="idx_req_vip_proc_model",
                 fields=["model_id"],
                 condition=Q(task_status__in=["processing", "prefilling", "decoding"], vip=True),

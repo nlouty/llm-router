@@ -22,6 +22,23 @@ The database schema is intentionally not owned by Django migrations. Router mode
 - `review_slices`
 - `review_summary`
 
+## Production Table Scale
+
+Row counts this router serves in production (as of 2026-08; update when the magnitude changes):
+
+| Table | Rows (order of magnitude) | Notes |
+| --- | --- | --- |
+| `models` | < 10 | hot-path lookups per request |
+| `servers`, `departments`, `whitelist` | < 100 each | `servers` rows are updated per request |
+| `ips`, `user_ips` | ~1,000 | |
+| `requests` | ~7,000,000, expected to reach ~100,000,000 | ~12k requests/hour, no retention job; append-heavy with several UPDATEs per row |
+
+Any schema or query change must be designed against these magnitudes, in particular:
+
+- Every hot-path query against `requests` must be index-backed (verify with `EXPLAIN` before shipping). One sequential scan of `requests` costs seconds of CPU, and hot-path queries run per request — even a handful of seq scans per second can saturate the database host.
+- Assume `requests` holds ~100M rows when adding columns or indexes; `CREATE INDEX CONCURRENTLY` (what `check_db_schema --fix` emits) is mandatory for live creation.
+- Small tables are fully cached, so per-request reads are cheap — but per-request `UPDATE`s on the same `servers` rows still cause row-lock contention and dead-tuple churn.
+
 ## Timezone
 
 Datetime columns should use `TIMESTAMPTZ` on PostgreSQL. The router runs with `TIME_ZONE = Asia/Shanghai` and sets the database connection time zone to `Asia/Shanghai`, so request lifecycle times such as `send_time` and `end_time` are saved and read in Beijing time.
@@ -92,7 +109,7 @@ CREATE UNIQUE INDEX CONCURRENTLY uniq_user_ips_active_emp_key
     WHERE apikey <> '' AND is_valid = TRUE AND deleted_at IS NULL;
 CREATE INDEX CONCURRENTLY idx_user_ips_employee_no ON user_ips (employee_no);
 CREATE INDEX CONCURRENTLY idx_req_vip_proc_model
-    ON requests (model_id) WHERE task_status = 'processing' AND vip = TRUE;
+    ON requests (model_id) WHERE task_status IN ('processing', 'prefilling', 'decoding') AND vip = TRUE;
 ```
 
 Do not convert historical `requests.user_ip_id` values or derive `requests.vip` in this phase. Rollback is safe only before API-key rows are registered; afterward, dropping `apikey` would destroy registered credentials.
@@ -217,6 +234,10 @@ ALTER TABLE requests ADD COLUMN session VARCHAR(255) NULL;
 Internal routing-model calls used to classify auto-routed targets are also recorded in `requests`. These rows use `ip_id = 0`, `user_agent = "llm-choosing"`, `is_stream = FALSE`, and the routing model's `model_id`. Statistics APIs exclude `ip_id = 0` rows.
 
 The required request-table indexes are declared in `RequestRecord._meta.indexes`. Processing partial indexes are important on large `requests` tables because the hot path counts only active `processing` rows.
+
+> **Condition drift warning:** `check_db_schema` detects index *definition* drift — an index that exists under the declared name but with a different column list or partial-index `WHERE` condition — and `--fix` recreates it (`DROP INDEX CONCURRENTLY` + `CREATE INDEX CONCURRENTLY`). It does this by building the expected index on a temporary empty copy of the table and comparing the `pg_get_expr`-canonicalized definitions of both sides.
+>
+> This matters because Postgres silently stops using a partial index when the query predicate stops implying the index predicate (a query filtering `task_status IN ('processing','prefilling','decoding')` cannot use a partial index whose predicate is `task_status = 'processing'`). This exact drift disabled all four processing partial indexes from 2026-07-25 (PD-disaggregation statuses added to queries but not to the live indexes) until 2026-08-21, forcing every hot-path query into full sequential scans of the multi-million-row table.
 
 ## Admin And Review Tables
 

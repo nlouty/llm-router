@@ -148,6 +148,17 @@ class Command(BaseCommand):
                 if not dry_run:
                     self._execute_index_sql(sql)
 
+        for table, indexes in drift["drifted_indexes"].items():
+            model = {m._meta.db_table: m for m in models}[table]
+            for index in indexes:
+                drop_sql = self._drop_index_sql(index.name)
+                create_sql = self._create_index_sql(model, index)
+                self.stdout.write(drop_sql)
+                self.stdout.write(create_sql)
+                if not dry_run:
+                    self._execute_index_sql(drop_sql)
+                    self._execute_index_sql(create_sql)
+
     def _inspect_schema(self, models):
         drift = {
             "missing_tables": [],
@@ -160,6 +171,7 @@ class Command(BaseCommand):
             "unique_mismatches": {},
             "missing_constraints": {},
             "missing_indexes": {},
+            "drifted_indexes": {},
         }
         expected_tables = {model._meta.db_table: model for model in models}
 
@@ -209,6 +221,10 @@ class Command(BaseCommand):
                 missing_indexes = self._missing_indexes(cursor, table, model)
                 if missing_indexes:
                     drift["missing_indexes"][table] = missing_indexes
+
+                drifted_indexes = self._drifted_indexes(cursor, table, model)
+                if drifted_indexes:
+                    drift["drifted_indexes"][table] = drifted_indexes
 
         drift["missing_tables"].sort()
         return drift
@@ -533,6 +549,13 @@ class Command(BaseCommand):
             for index in indexes:
                 self.stderr.write(f"Missing index in {table}: {index.name}")
 
+        for table, indexes in drift["drifted_indexes"].items():
+            for index in indexes:
+                self.stderr.write(
+                    f"Index definition drift in {table}: {index.name} "
+                    "(exists with a different column list or partial-index condition; must be recreated)"
+                )
+
     def _missing_constraints(self, cursor, table, model):
         if connection.vendor != "postgresql":
             return []
@@ -544,6 +567,63 @@ class Command(BaseCommand):
         if connection.vendor != "postgresql":
             return []
 
+        db_indexes = self._existing_index_names(cursor, table)
+
+        missing = []
+        for index in model._meta.indexes:
+            if index.name not in db_indexes:
+                missing.append(index)
+        return missing
+
+    def _drifted_indexes(self, cursor, table, model):
+        """Declared indexes that exist by name but with a different definition.
+
+        Name-only comparison (as ``_missing_indexes`` does) hides condition
+        drift: an index recreated with the same name but an old ``WHERE``
+        predicate stays "present" while Postgres silently stops using it for
+        queries whose predicate is no longer implied. To compare definitions
+        soundly, the expected index is built on an empty temporary copy of
+        the table (``LIKE table`` keeps column names and types) using the
+        same SQL the fixer would apply, and both live and expected indexes
+        are compared through ``pg_get_expr`` so both sides are canonicalized
+        by PostgreSQL itself.
+        """
+        if connection.vendor != "postgresql":
+            return []
+
+        declared = model._meta.indexes
+        existing = self._existing_index_names(cursor, table)
+        candidates = [index for index in declared if index.name in existing]
+        if not candidates:
+            return []
+
+        quote_name = connection.ops.quote_name
+        probe_table = f"__schema_probe_{table}"
+        drifted = []
+        cursor.execute(f"DROP TABLE IF EXISTS {quote_name(probe_table)}")
+        cursor.execute(f"CREATE TEMP TABLE {quote_name(probe_table)} (LIKE {quote_name(table)})")
+        try:
+            for index in candidates:
+                try:
+                    cursor.execute(self._probe_index_sql(model, index, table, probe_table))
+                except Exception as exc:  # noqa: BLE001
+                    self.stderr.write(
+                        f"Could not validate index {index.name} on {table} "
+                        f"({str(exc)[:60]}); skipping definition check"
+                    )
+                    continue
+                live = self._index_signature(cursor, index.name, "to_regnamespace(current_schema())")
+                expected = self._index_signature(cursor, index.name, "pg_my_temp_schema()")
+                if live is None or expected is None:
+                    continue
+                if live != expected:
+                    drifted.append(index)
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {quote_name(probe_table)}")
+        return drifted
+
+    @staticmethod
+    def _existing_index_names(cursor, table):
         cursor.execute(
             """
             SELECT indexname
@@ -553,10 +633,56 @@ class Command(BaseCommand):
             """,
             [table],
         )
-        db_indexes = {row[0] for row in cursor.fetchall()}
+        return {row[0] for row in cursor.fetchall()}
 
-        missing = []
-        for index in model._meta.indexes:
-            if index.name not in db_indexes:
-                missing.append(index)
-        return missing
+    def _probe_index_sql(self, model, index, table, probe_table):
+        sql = self._create_index_sql(model, index)
+        # Concurrent builds are not possible on temporary tables, and the
+        # probe must target the copy, not the live table.
+        sql = sql.replace("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ", "CREATE UNIQUE INDEX ", 1)
+        sql = sql.replace("CREATE INDEX CONCURRENTLY IF NOT EXISTS ", "CREATE INDEX ", 1)
+        sql = sql.replace(
+            f"ON {connection.ops.quote_name(table)}",
+            f"ON {connection.ops.quote_name(probe_table)}",
+            1,
+        )
+        return sql
+
+    @staticmethod
+    def _index_signature(cursor, index_name, namespace_expr):
+        """(unique, key columns, predicate) as canonicalized by PostgreSQL.
+
+        ``namespace_expr`` is an inlined SQL expression returning a namespace
+        OID: ``to_regnamespace(current_schema())`` for the live index or
+        ``pg_my_temp_schema()`` for the probe (the pg_temp alias is not
+        resolvable through to_regnamespace). It cannot be a bound parameter
+        because the cast would treat it as a literal schema name.
+        """
+        cursor.execute(
+            f"""
+            SELECT i.indisunique,
+                   pg_get_expr(i.indpred, i.indrelid),
+                   (SELECT array_agg(a.attname ORDER BY k.ord)
+                    FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum),
+                   array_length(i.indkey, 1)
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname = %s
+              AND c.relnamespace = {namespace_expr}
+            """,
+            [index_name],
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        unique, predicate, columns, key_count = row
+        if columns is None or key_count is None or len(columns) != key_count:
+            # Expression index: cannot be compared structurally.
+            return None
+        return (bool(unique), tuple(columns), predicate)
+
+    @staticmethod
+    def _drop_index_sql(index_name):
+        quote_name = connection.ops.quote_name
+        return f"DROP INDEX CONCURRENTLY IF EXISTS {quote_name(index_name)};"
