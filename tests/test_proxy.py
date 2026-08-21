@@ -1646,7 +1646,16 @@ def test_small_auto_request_records_dispatch_latency(monkeypatch):
         fake_request,
     )
     monotonic_values = iter([10.0, 10.125, 10.125])
-    monkeypatch.setattr("router.services.proxy.time.monotonic", lambda: next(monotonic_values))
+
+    def fake_monotonic():
+        # Buffered request logging now also samples the clock; keep returning
+        # the last timestamp once the scripted sequence is exhausted.
+        try:
+            return next(monotonic_values)
+        except StopIteration:
+            return 10.125
+
+    monkeypatch.setattr("router.services.proxy.time.monotonic", fake_monotonic)
 
     django_request = MagicMock()
     django_request.method = "POST"

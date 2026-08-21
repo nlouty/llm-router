@@ -32,12 +32,6 @@ class _PrefixMatch:
     server_match_request_ids: dict[int, Any] = field(default_factory=dict)
 
 
-@dataclass
-class _ValidPrefixServers:
-    found: bool = False
-    primary: list[Any] = field(default_factory=list)
-
-
 class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     _redis_client: redis.Redis | None = None
     _client_lock = threading.Lock()
@@ -97,20 +91,18 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         if not available:
             return None
 
-        request_chars = self._prefix_chars_from_body(context.body)
+        request_chars, prefix_data = self._prefix_work_for_context(context)
         if not request_chars or self._redis_client is None:
             self._clear_prefix_context(context)
             return self._choose_least_loaded(available)
 
         model_key = context.model_name or str(context.model_id or "")
         available_by_id = {server.id: server for server in available}
-        prefix_data = self._get_prefix_hashes(request_chars)
         if not prefix_data:
             self._clear_prefix_context(context)
             return self._choose_least_loaded(available)
 
-        cached_values = self._read_cached_prefixes(model_key, prefix_data)
-        match = self._collect_prefix_matches(cached_values, prefix_data, request_chars, available_by_id)
+        match = self._probe_prefix_matches(model_key, prefix_data, request_chars, available_by_id)
         self._log_prefix_matches(model_key, available, match)
         selected = self._choose_from_prefix_match(available, match)
         self._apply_selected_prefix_context(context, selected, match)
@@ -155,106 +147,106 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         context.prefix_cache = 0.0
         context.last_match = None
 
-    def _read_cached_prefixes(self, model_key: str, prefix_data: list[tuple[str, int]]):
-        redis_keys = [self._cache_key(model_key, prefix_hash) for prefix_hash, _ in prefix_data]
-        return self._read_cache_hashes(redis_keys, "[PrefixCachePreble] Redis HGETALL failed: %s")
-
     def _cache_key(self, model_key: str, prefix_hash: str) -> str:
         return f"{self._cache_key_namespace}:{model_key}:{prefix_hash}"
 
-    def _read_cache_hashes(self, redis_keys: list[str], error_message: str):
-        try:
-            # transaction=False: no MULTI/EXEC wrapper. The batch is ~10-15k
-            # commands per request; wrapping it in MULTI makes Redis execute it
-            # atomically and buffer every reply, stalling the single-threaded
-            # server (and every other client) for 10-20ms per request.
-            pipe = self._redis_client.pipeline(transaction=False)
-            for key in redis_keys:
-                pipe.hgetall(key)
-            return pipe.execute()
-        except Exception as e:
-            logger.error(error_message, e)
-            return [{} for _ in redis_keys]
-
-    def _collect_prefix_matches(
+    def _probe_prefix_matches(
         self,
-        cached_values,
+        model_key: str,
         prefix_data: list[tuple[str, int]],
         request_chars: str,
         available_by_id: dict[int, Any],
     ) -> _PrefixMatch:
+        """Find each available server's longest cached prefix via binary search.
+
+        A successful request of length L writes a cache entry at every block
+        boundary <= L with the same expiry, so for a fixed prefix text a
+        server's entry validity is monotone in the block index: if block k is
+        valid, every smaller block-multiple is valid too. The longest valid
+        index per server is therefore found with ceil(log2(n)) probes instead
+        of one HGETALL per block. All active servers share the same lattice
+        and every binary search takes the same number of steps, so each round
+        probes every unresolved server's midpoint in ONE pipeline.
+
+        Semantics equal the old full scan for the routable set: per-server
+        ratios, per-server originating request ids, primary (ratio > 0.9) and
+        secondary (> 0.5) sets. The only divergence is best_match_ratio, which
+        previously also counted entries of servers that are not currently
+        available; it now reflects available servers only (it feeds the
+        prefix_cache_match log event, not selection).
+        """
         match = _PrefixMatch()
         now_ts = time.time()
-        for index, value in enumerate(cached_values):
-            if not value:
-                continue
-            try:
-                self._apply_cached_prefix_match(
-                    match,
-                    value,
-                    prefix_data[index][1],
-                    len(request_chars),
-                    available_by_id,
-                    now_ts,
-                )
-            except Exception as e:
-                logger.error("[PrefixCachePreble] Failed to parse cached value: %s", e)
-        return match
+        block_count = len(prefix_data)
+        request_len = len(request_chars)
 
-    def _apply_cached_prefix_match(
-        self,
-        match: _PrefixMatch,
-        value,
-        prefix_len: int,
-        request_len: int,
-        available_by_id: dict[int, Any],
-        now_ts: float,
-    ) -> None:
-        match_ratio = prefix_len / request_len
-        valid_servers = self._valid_servers_for_prefix(
-            value,
-            match_ratio,
-            available_by_id,
-            match.server_match_ratios,
-            match.server_match_request_ids,
-            now_ts,
-        )
-        if not valid_servers.found:
-            return
-        if match_ratio > match.best_match_ratio:
-            match.best_match_ratio = match_ratio
-        if valid_servers.primary:
-            match.cached_matches = valid_servers.primary
+        lower = {server_id: 0 for server_id in available_by_id}
+        upper = {server_id: block_count for server_id in available_by_id}
+        best_index = {server_id: -1 for server_id in available_by_id}
+        best_entry = {server_id: None for server_id in available_by_id}
+        active = list(available_by_id)
+        while active:
+            pipe = self._redis_client.pipeline(transaction=False)
+            probes: list[tuple[int, int]] = []
+            for server_id in active:
+                mid = (lower[server_id] + upper[server_id]) // 2
+                pipe.hgetall(self._cache_key(model_key, prefix_data[mid][0]))
+                probes.append((server_id, mid))
+            values = self._execute_probe_pipeline(pipe, len(probes))
+            next_active: list[int] = []
+            for (server_id, mid), value in zip(probes, values):
+                entry = self._valid_server_entry(value, server_id, now_ts)
+                if entry is not None:
+                    lower[server_id] = mid + 1
+                    best_index[server_id] = mid
+                    best_entry[server_id] = entry
+                else:
+                    upper[server_id] = mid
+                if lower[server_id] < upper[server_id]:
+                    next_active.append(server_id)
+            active = next_active
 
-    def _valid_servers_for_prefix(
-        self,
-        servers_data: dict[str, str],
-        match_ratio: float,
-        available_by_id: dict[int, Any],
-        server_match_ratios: dict[int, float],
-        server_match_request_ids: dict[int, Any],
-        now_ts: float,
-    ) -> _ValidPrefixServers:
-        valid_servers = _ValidPrefixServers()
-        for server_id_text, field_value in servers_data.items():
-            try:
-                entry = json.loads(field_value)
-                expiry_ts = float(entry.get("exp", 0))
-                request_id = entry.get("rid")
-            except (TypeError, ValueError):
+        for server_id, index in best_index.items():
+            if index < 0:
                 continue
-            if now_ts >= expiry_ts:
-                continue
-            server_id = int(server_id_text)
-            valid_servers.found = True
-            if match_ratio > server_match_ratios.get(server_id, 0.0):
-                server_match_ratios[server_id] = match_ratio
-                server_match_request_ids[server_id] = request_id
+            match_ratio = prefix_data[index][1] / request_len
+            match.server_match_ratios[server_id] = match_ratio
+            entry = best_entry[server_id] or {}
+            match.server_match_request_ids[server_id] = entry.get("rid")
+            if match_ratio > match.best_match_ratio:
+                match.best_match_ratio = match_ratio
             if match_ratio > self.primary_match_threshold:
                 server = available_by_id.get(server_id)
                 if server:
-                    valid_servers.primary.append(server)
-        return valid_servers
+                    match.cached_matches.append(server)
+        return match
+
+    def _execute_probe_pipeline(self, pipe, probe_count: int):
+        try:
+            return pipe.execute()
+        except Exception as e:
+            logger.error("[PrefixCachePreble] Redis HGETALL failed: %s", e)
+            return [{} for _ in range(probe_count)]
+
+    @staticmethod
+    def _valid_server_entry(value, server_id: int, now_ts: float) -> dict | None:
+        """Parse and validate one server's cached entry at a probed block.
+
+        Returns the parsed entry dict when the server has a valid (unexpired)
+        entry at that block, None otherwise (missing, malformed, or expired).
+        """
+        if not isinstance(value, dict):
+            return None
+        field_value = value.get(str(server_id))
+        if field_value is None:
+            return None
+        try:
+            entry = json.loads(field_value)
+            if now_ts < float(entry.get("exp", 0)):
+                return entry
+        except (TypeError, ValueError):
+            return None
+        return None
 
     @staticmethod
     def _log_prefix_matches(model_key: str, available: Sequence[Any], match: _PrefixMatch) -> None:
@@ -298,29 +290,23 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     def on_response(self, server: Any, context: ServerSelectionContext, status_code: int) -> None:
         if not 200 <= status_code < 300 or self._redis_client is None:
             return
-        request_chars = self._prefix_chars_from_body(context.body)
-        if not request_chars:
+        # Reuse choose()'s extracted text and hashes for the same body instead
+        # of re-parsing and re-hashing the whole request (Action 4).
+        request_chars, prefix_data = self._prefix_work_for_context(context)
+        if not request_chars or not prefix_data:
             return
 
         model_key = context.model_name or str(context.model_id or "")
         raw_cache_time = getattr(server, "cache_time", 3600)
         cache_time = 3600 if raw_cache_time is None else int(raw_cache_time)
-        expiry_ts = time.time() + cache_time
-
-        # Generate hashes for blocks and full request
-        prefix_data = self._get_prefix_hashes(request_chars)
-
-        if not prefix_data:
-            return
-
-        field_value = json.dumps({"exp": expiry_ts, "rid": context.request_id})
+        field_value = json.dumps({"exp": time.time() + cache_time, "rid": context.request_id})
         try:
-            # transaction=False: same reason as _read_cache_hashes — the write
+            # transaction=False: same reason as the read probes — the write
             # batch is 2x the block count and must not run as one atomic
             # MULTI/EXEC block that freezes Redis for every other request.
             pipe = self._redis_client.pipeline(transaction=False)
-            for h, _ in prefix_data:
-                key = self._cache_key(model_key, h)
+            for prefix_hash, _ in prefix_data:
+                key = self._cache_key(model_key, prefix_hash)
                 pipe.hset(key, str(server.id), field_value)
                 pipe.expire(key, cache_time)
             pipe.execute()
@@ -391,19 +377,59 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     def _tokens_from_body(self, body: bytes) -> str:
         return self._prefix_chars_from_body(body)
 
+    def _prefix_work_for_context(
+        self, context: ServerSelectionContext
+    ) -> tuple[str, list[tuple[str, int]]]:
+        """Extract and hash the prefix text for a request, exactly once.
+
+        The (body, text, hashes) triple is cached on the context so
+        on_response() — which runs after a possibly long stream on the same
+        context — reuses choose()'s JSON parse and hash pass instead of
+        repeating them. The body-bytes guard makes the cache safe across the
+        retry loop: a rewritten body (model resolution, decode recompute)
+        produces a cache miss and a fresh extraction.
+        """
+        cached = getattr(context, "_prefix_cache_work", None)
+        if cached is not None and cached[0] == context.body:
+            return cached[1], cached[2]
+        request_chars = self._prefix_chars_for_context(context)
+        prefix_data = self._get_prefix_hashes(request_chars) if request_chars else []
+        context._prefix_cache_work = (context.body, request_chars, prefix_data)
+        return request_chars, prefix_data
+
+    def _prefix_chars_for_context(self, context: ServerSelectionContext) -> str:
+        body_data = getattr(context, "body_data", None)
+        if isinstance(body_data, dict):
+            text = self._text_from_body(context.body, body_data)
+        else:
+            text = self._text_from_body(context.body)
+        return text[: self.max_prefix_chars]
+
     @staticmethod
-    def _text_from_body(body: bytes) -> str:
+    def _text_from_body(body: bytes, parsed_data: dict | None = None) -> str:
         try:
             text = body.decode("utf-8")
         except UnicodeDecodeError:
             return ""
+        if isinstance(parsed_data, dict):
+            rendered = PrefixCachePrebleServerChooser._text_from_data(parsed_data)
+            return rendered if rendered is not None else text
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             return text
         if not isinstance(data, dict):
             return text
+        rendered = PrefixCachePrebleServerChooser._text_from_data(data)
+        return rendered if rendered is not None else text
 
+    @staticmethod
+    def _text_from_data(data: dict) -> str | None:
+        """Render the prompt text from an already-parsed JSON object.
+
+        Returns None when the object renders no section (callers fall back to
+        the raw body text, preserving the pre-existing behavior).
+        """
         # Section order mirrors how serving-side chat templates lay out the
         # rendered prompt (GLM-5.2 / DeepSeek-V4-Flash / Qwen3.6): generation
         # options, then tool definitions, then the messages. vLLM prefix-cache
@@ -449,7 +475,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             return prompt
         if isinstance(prompt, list):
             return "\n".join(item for item in prompt if isinstance(item, str))
-        return text
+        return None
 
     @staticmethod
     def _message_content_text(content: Any) -> str:
@@ -531,61 +557,42 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             return {name: 0.0 for name in model_names}
 
         results = {name: 0.0 for name in model_names}
-        redis_keys, key_map = self._model_prefix_cache_keys(model_names, prefix_data)
-        if not redis_keys:
-            return results
-
-        cached_values = self._read_cache_hashes(redis_keys, "[PrefixCachePreble] Multi-model Redis HGETALL failed: %s")
-        self._apply_model_prefix_ratios(results, cached_values, key_map, prefix_data, len(request_chars))
-        return results
-
-    def _model_prefix_cache_keys(
-        self,
-        model_names: list[str],
-        prefix_data: list[tuple[str, int]],
-    ) -> tuple[list[str], list[tuple[str, int]]]:
-        redis_keys = []
-        key_map = []
-        for model_name in model_names:
-            for index, (prefix_hash, _) in enumerate(prefix_data):
-                redis_keys.append(self._cache_key(model_name, prefix_hash))
-                key_map.append((model_name, index))
-        return redis_keys, key_map
-
-    def _apply_model_prefix_ratios(
-        self,
-        results: dict[str, float],
-        cached_values,
-        key_map: list[tuple[str, int]],
-        prefix_data: list[tuple[str, int]],
-        request_len: int,
-    ) -> None:
+        # Per-model longest cached prefix via binary search: any valid server
+        # entry at block k implies entries at every smaller block-multiple
+        # (same monotonicity as the per-server search), so log2(n) probes per
+        # model replace one HGETALL per block per model. All models share the
+        # lattice, so one pipeline per round covers every unresolved model.
         now_ts = time.time()
-        for index, value in enumerate(cached_values):
-            if not value:
-                continue
-            try:
-                self._apply_model_prefix_ratio(results, value, key_map[index], prefix_data, request_len, now_ts)
-            except Exception:
-                continue
+        block_count = len(prefix_data)
+        request_len = len(request_chars)
+        lower = {name: 0 for name in model_names}
+        upper = {name: block_count for name in model_names}
+        best_index = {name: -1 for name in model_names}
+        active = list(model_names)
+        while active:
+            pipe = self._redis_client.pipeline(transaction=False)
+            probes: list[tuple[str, int]] = []
+            for name in active:
+                mid = (lower[name] + upper[name]) // 2
+                pipe.hgetall(self._cache_key(name, prefix_data[mid][0]))
+                probes.append((name, mid))
+            values = self._execute_probe_pipeline(pipe, len(probes))
+            next_active: list[str] = []
+            for (name, mid), value in zip(probes, values):
+                if PrefixCachePrebleServerChooser._has_valid_cached_server(value, now_ts):
+                    lower[name] = mid + 1
+                    best_index[name] = mid
+                else:
+                    upper[name] = mid
+                if lower[name] < upper[name]:
+                    next_active.append(name)
+            active = next_active
 
-    @staticmethod
-    def _apply_model_prefix_ratio(
-        results: dict[str, float],
-        value,
-        mapped_key: tuple[str, int],
-        prefix_data: list[tuple[str, int]],
-        request_len: int,
-        now_ts: float,
-    ) -> None:
-        if not PrefixCachePrebleServerChooser._has_valid_cached_server(value, now_ts):
-            return
-
-        model_name, prefix_index = mapped_key
-        _, prefix_len = prefix_data[prefix_index]
-        ratio = prefix_len / request_len
-        if ratio > results[model_name]:
-            results[model_name] = ratio
+        for name, index in best_index.items():
+            if index < 0:
+                continue
+            results[name] = prefix_data[index][1] / request_len
+        return results
 
     @staticmethod
     def _has_valid_cached_server(servers_data: dict[str, str], now_ts: float) -> bool:

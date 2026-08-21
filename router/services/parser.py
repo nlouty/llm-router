@@ -17,6 +17,9 @@ class ParsedRequest:
     estimated_full_body_tokens: int = 0
     tokenizer_latency_ms: int = 0
     tokenizer_error: str | None = None
+    # Parsed JSON object of the request (None for non-JSON bodies). Kept so the
+    # routing pipeline parses each request body exactly once.
+    data: dict | None = None
 
 
 class RequestParser:
@@ -34,7 +37,6 @@ class RequestParser:
 
         if not isinstance(data, dict):
             return ParsedRequest(body=body, model_name=None, stream=False, max_tokens=None, is_json=True)
-
         stream = bool(data.get("stream"))
 
         # vLLM resolves max_tokens and max_completion_tokens into one effective
@@ -81,6 +83,7 @@ class RequestParser:
             max_tokens=max_tokens,
             is_json=True,
             estimated_full_body_tokens=estimated_full_body_tokens,
+            data=data,
         )
 
     @staticmethod

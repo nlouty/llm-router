@@ -21,6 +21,13 @@ class ServerSelectionContext:
     last_match: int | None = None
     router_result: str | None = None
     session: str | None = None
+    # Parsed JSON of ``body`` when the request is a JSON object; populated once
+    # by RequestParser and kept in sync with ``body`` by model resolution, so
+    # downstream consumers avoid re-parsing the same bytes.
+    body_data: dict | None = None
+    # Per-request cache of (body_bytes, prefix_text, prefix_hashes) computed by
+    # the prefix-cache chooser so on_response reuses choose()'s hashing work.
+    _prefix_cache_work: tuple | None = None
 
 
 class ServerChooser(Protocol):
