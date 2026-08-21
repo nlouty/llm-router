@@ -7,6 +7,11 @@ import pytest
 from router.services import request_logger
 
 
+# The autouse fixture pins _current_log_time to datetime(2026, 6, 8, 12, 34),
+# so every appended line carries this timestamp prefix (issue #262).
+_PREFIX = "[2026-06-08 12:34:00.000]"
+
+
 @pytest.fixture(autouse=True)
 def reset_request_logger_cache(monkeypatch):
     monkeypatch.setattr(request_logger, "_LOG_PATH_CACHE", None)
@@ -23,7 +28,7 @@ def test_append_request_log_writes_line(tmp_path, monkeypatch):
     request_logger.flush_request_log(123)
 
     path = tmp_path / "2026" / "06" / "08" / "12" / "34" / "123.log"
-    assert path.read_text(encoding="utf-8") == '{"event":"server_attempt"}\n'
+    assert path.read_text(encoding="utf-8") == _PREFIX + ' {"event":"server_attempt"}\n'
 
 
 def test_append_request_log_resolves_relative_path(tmp_path, monkeypatch):
@@ -34,7 +39,7 @@ def test_append_request_log_resolves_relative_path(tmp_path, monkeypatch):
     request_logger.flush_request_log(123)
 
     path = Path(tmp_path / "logs" / "requests" / "2026" / "06" / "08" / "12" / "34" / "123.log")
-    assert path.read_text(encoding="utf-8") == '{"event":"multi_server_route"}\n'
+    assert path.read_text(encoding="utf-8") == _PREFIX + ' {"event":"multi_server_route"}\n'
 
 
 def test_append_error_log_uses_request_log_file(tmp_path, monkeypatch):
@@ -46,8 +51,8 @@ def test_append_error_log_uses_request_log_file(tmp_path, monkeypatch):
 
     path = tmp_path / "2026" / "06" / "08" / "12" / "34" / "123.log"
     assert path.read_text(encoding="utf-8") == (
-        '{"event":"server_attempt"}\n'
-        '{"event":"upstream_error"}\n'
+        _PREFIX + ' {"event":"server_attempt"}\n'
+        + _PREFIX + ' {"event":"upstream_error"}\n'
     )
 
 
@@ -65,7 +70,11 @@ def test_same_request_keeps_first_minute_bucket(tmp_path, monkeypatch):
 
     first_path = tmp_path / "2026" / "06" / "08" / "12" / "34" / "123.log"
     second_path = tmp_path / "2026" / "06" / "08" / "12" / "35" / "123.log"
-    assert first_path.read_text(encoding="utf-8") == "first\nsecond\n"
+    # Each line keeps the time of its own event; only the file bucket is
+    # pinned to the request's first minute.
+    assert first_path.read_text(encoding="utf-8") == (
+        "[2026-06-08 12:34:00.000] first\n[2026-06-08 12:35:00.000] second\n"
+    )
     assert not second_path.exists()
 
 
@@ -90,7 +99,8 @@ def test_append_verbose_request_log_writes_pretty_full_json_body(tmp_path, monke
     log_files = list(tmp_path.rglob("123.log"))
     assert len(log_files) == 1
     log_text = log_files[0].read_text(encoding="utf-8")
-    payload = json.loads(log_text)
+    assert log_text.startswith(_PREFIX + " {")
+    payload = json.loads(log_text[len(_PREFIX) + 1:])
     assert payload == {
         "event": "user_request",
         "request_id": 123,
