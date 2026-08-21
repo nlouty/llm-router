@@ -195,6 +195,7 @@ ALTER TABLE requests ADD COLUMN estimate_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE requests ADD COLUMN model_choosing_latency BIGINT NULL;
 ALTER TABLE requests ADD COLUMN ttft BIGINT NULL;
 ALTER TABLE requests ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE requests ADD COLUMN session VARCHAR(255) NULL;
 ```
 
 `task_status` is one of the request lifecycle states used by the router, including `processing`, `success`, `failed`, `agent_disconnected`, and `incomplete`.
@@ -210,6 +211,8 @@ ALTER TABLE requests ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
 `model_choosing_latency` stores elapsed milliseconds from request receipt (`send_time`) to the first send of the request to an LLM server (the prefill probe for pd-disaggregation requests). It is recorded once per request, on the first dispatch, for every request that reaches a server — not only auto-routed ones; requests that fail before dispatch (e.g. no candidates, blocked) leave it NULL. `ttft - model_choosing_latency` is therefore the LLM-side time to first token as observed by the router.
 
 `ttft` stores time-to-first-token in milliseconds, measured from request receipt (`send_time`). For streaming requests it ends at the first non-empty chunk received from the upstream server — for pd-disaggregation streaming requests this includes the prefill phase. For non-streaming pd-disaggregation requests it ends when the prefill probe completes (the probe generates exactly one token, so that completion is the first-token moment; see `_normal_decode` in `proxy_pd_forward.py` and `_stream_success` in `proxy.py`). Single-node non-streaming requests leave it NULL.
+
+`session` stores the client session id extracted from the request headers (`x-session-id` and friends; see `router/utils/session.py`), capped at 255 chars, `NULL` when absent. Auto-routing uses it for session-sticky model selection (the most recent committed `router_result` for the session wins within a one-hour window). The `idx_requests_session_send` index on `(session, send_time)` backs that lookup and is declared in `RequestRecord._meta.indexes`; `check_db_schema` creates it when missing.
 
 Internal routing-model calls used to classify auto-routed targets are also recorded in `requests`. These rows use `ip_id = 0`, `user_agent = "llm-choosing"`, `is_stream = FALSE`, and the routing model's `model_id`. Statistics APIs exclude `ip_id = 0` rows.
 
