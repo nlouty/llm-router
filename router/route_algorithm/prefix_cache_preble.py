@@ -11,6 +11,7 @@ from typing import Any, Callable, Sequence
 import redis
 
 from router.config import APP_CONFIG
+from router.models import is_prefiller_role
 from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import (
     LeastConnectionServerChooser,
@@ -30,6 +31,20 @@ class _PrefixMatch:
     cached_matches: list[Any] = field(default_factory=list)
     server_match_ratios: dict[int, float] = field(default_factory=dict)
     server_match_request_ids: dict[int, Any] = field(default_factory=dict)
+    # Cluster-scoped view (issue #276): group_id -> max member ratio among
+    # prefiller-role servers with a non-empty group_id (they share one
+    # kv-cache pool; any member can pull the KV via RDMA).
+    cluster_ratios: dict[str, float] = field(default_factory=dict)
+    # Ratio of the winning scope. Set only for cluster paths: the KV the chosen
+    # placement can actually reuse, including RDMA pulls. None keeps the
+    # selected server's own ratio (standalone/cold paths, pre-#276 semantics).
+    scope_ratio: float | None = None
+    # "local" (the selected server holds the KV in its own DRAM) or "rdma"
+    # (the KV is pulled from the cluster pool). None = no prefix reused.
+    delivery: str | None = None
+    # Server id a cached request was steered away from because that
+    # n-prefiller had a new prefill in flight (busy-holder switch).
+    switched_from: int | None = None
 
 
 class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
@@ -59,6 +74,9 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             prefix_config.get("prefix_block_chars"),
             128,
         )
+        # Injectable "new prefill in flight" counter per "P: {base_url}" target
+        # (issue #276 busy-holder switch). None -> ServerRepository query.
+        self.new_prefill_provider = None
         self._ensure_redis()
 
     def _ensure_redis(self):
@@ -100,7 +118,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         available_by_id = {server.id: server for server in available}
         if not prefix_data:
             self._clear_prefix_context(context)
-            return self._choose_least_loaded(available)
+            return self._choose_new(available)
 
         match = self._probe_prefix_matches(model_key, prefix_data, request_chars, available_by_id)
         self._log_prefix_matches(model_key, available, match)
@@ -113,18 +131,30 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                     "event": "prefix_cache_match",
                     "model_key": model_key,
                     "best_match_ratio": round(match.best_match_ratio, 4),
+                    "best_cluster_ratio": round(max(match.cluster_ratios.values()), 4) if match.cluster_ratios else 0.0,
                     "cached_match_count": len(match.cached_matches) if match.cached_matches else 0,
                     "available_count": len(available),
                 }, ensure_ascii=False))
             if selected is not None:
                 match_ratio = match.server_match_ratios.get(selected.id, 0.0)
-                is_cache_hit = match_ratio > self.primary_match_threshold and selected in (match.cached_matches or [])
+                if match.delivery == "local":
+                    reason = "cache_hit"
+                elif match.switched_from is not None:
+                    reason = "rdma_switch"
+                elif match.delivery == "rdma":
+                    reason = "rdma_pull"
+                else:
+                    reason = "least_loaded"
                 append_request_log(context.request_id, json.dumps({
                     "event": "prefix_server_chosen",
                     "server_id": selected.id,
                     "base_url": selected.base_url,
+                    "group_id": getattr(selected, "group_id", None),
                     "match_ratio": round(match_ratio, 4),
-                    "reason": "cache_hit" if is_cache_hit else "least_loaded",
+                    "cluster_ratio": round(match.scope_ratio, 4) if match.scope_ratio is not None else None,
+                    "delivery": match.delivery,
+                    "switched_from": match.switched_from,
+                    "reason": reason,
                     "role": getattr(selected, "role", "mixed") or "mixed",
                 }, ensure_ascii=False))
 
@@ -139,7 +169,16 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         if selected is None:
             self._clear_prefix_context(context)
             return
-        context.prefix_cache = match.server_match_ratios.get(selected.id, 0.0)
+        # Cluster paths record the scope (cluster) ratio — the KV the chosen
+        # placement can actually reuse, including RDMA pulls — so the stored
+        # requests.prefix_cache doubles as the request's classification for
+        # count_new_prefills_by_targets. Other paths keep the selected
+        # server's own ratio (pre-#276 semantics).
+        context.prefix_cache = (
+            match.scope_ratio
+            if match.scope_ratio is not None
+            else match.server_match_ratios.get(selected.id, 0.0)
+        )
         context.last_match = match.server_match_request_ids.get(selected.id)
 
     @staticmethod
@@ -215,10 +254,15 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             match.server_match_request_ids[server_id] = entry.get("rid")
             if match_ratio > match.best_match_ratio:
                 match.best_match_ratio = match_ratio
+            server = available_by_id.get(server_id)
+            if server is None:
+                continue
+            if is_prefiller_role(getattr(server, "role", None)) and server.group_id:
+                group = server.group_id
+                if match_ratio > match.cluster_ratios.get(group, 0.0):
+                    match.cluster_ratios[group] = match_ratio
             if match_ratio > self.primary_match_threshold:
-                server = available_by_id.get(server_id)
-                if server:
-                    match.cached_matches.append(server)
+                match.cached_matches.append(server)
         return match
 
     def _execute_probe_pipeline(self, pipe, probe_count: int):
@@ -262,13 +306,181 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             )
 
     def _choose_from_prefix_match(self, available: Sequence[Any], match: _PrefixMatch):
+        """Cluster-scoped selection (issue #276).
+
+        Scopes are prefiller clusters (group_id -> max member ratio; the
+        cluster's servers share one kv-cache pool) and standalone servers
+        (mixed servers and blank-group prefillers, which keep server-based
+        semantics). The best cluster ratio is compared against the best
+        standalone ratio; the higher scope wins. Within a winning cluster the
+        request class decides placement:
+
+        - cached  (ratio > primary):   holders first, busy-holder switch to a
+          same-cluster p-prefiller, cluster-first #247 escape.
+        - partial (ratio > secondary): n-prefillers inside the cluster so the
+          partial KV is pulled via RDMA instead of recomputed.
+        - cold:                        strict n-prefiller isolation, globally.
+        """
+        scope_group = self._winning_scope(available, match)
+        if scope_group is not None:
+            return self._choose_within_cluster(available, match, scope_group)
+        if self._best_standalone_ratio(available, match) > self.secondary_match_threshold:
+            return self._choose_standalone(available, match)
+        return self._choose_new(available)
+
+    @staticmethod
+    def _server_role(server: Any) -> str:
+        return getattr(server, "role", "mixed") or "mixed"
+
+    @staticmethod
+    def _is_cluster_prefiller(server: Any) -> bool:
+        """Prefiller-style server in a named cluster (shares the pool's KV)."""
+        return is_prefiller_role(getattr(server, "role", None)) and bool(
+            getattr(server, "group_id", None)
+        )
+
+    def _winning_scope(self, available: Sequence[Any], match: _PrefixMatch) -> str | None:
+        """group_id of the winning cluster, or None when standalone/cold wins.
+
+        Ties prefer the cluster: its KV is pullable by any member via RDMA.
+        """
+        if not match.cluster_ratios:
+            return None
+        best_group = max(match.cluster_ratios, key=match.cluster_ratios.get)
+        best_cluster_ratio = match.cluster_ratios[best_group]
+        if best_cluster_ratio <= self.secondary_match_threshold:
+            return None
+        if self._best_standalone_ratio(available, match) > best_cluster_ratio:
+            return None
+        return best_group
+
+    def _best_standalone_ratio(self, available: Sequence[Any], match: _PrefixMatch) -> float:
+        return max(
+            (
+                match.server_match_ratios.get(server.id, 0.0)
+                for server in available
+                if not self._is_cluster_prefiller(server)
+            ),
+            default=0.0,
+        )
+
+    def _choose_within_cluster(
+        self, available: Sequence[Any], match: _PrefixMatch, scope_group: str
+    ):
+        group_servers = [
+            server
+            for server in available
+            if self._is_cluster_prefiller(server) and server.group_id == scope_group
+        ]
+        match.scope_ratio = match.cluster_ratios[scope_group]
+        if match.scope_ratio > self.primary_match_threshold:
+            selected = self._choose_cached(available, match, group_servers)
+        else:
+            selected = self._choose_partial(available, group_servers)
+        if selected is not None:
+            # Local DRAM beats RDMA: delivery is "local" only when the selected
+            # server itself holds the prefix.
+            own_ratio = match.server_match_ratios.get(selected.id, 0.0)
+            match.delivery = "local" if own_ratio > self.primary_match_threshold else "rdma"
+            if match.switched_from == selected.id:
+                # The escape ladder landed back on the busy holder (it is still
+                # the least-loaded n-prefiller): not an actual switch.
+                match.switched_from = None
+        return selected
+
+    def _choose_cached(
+        self, available: Sequence[Any], match: _PrefixMatch, group_servers: list[Any]
+    ):
+        """Cached class: least-loaded holder (local DRAM). The busy-holder
+        switch steers the request to a same-cluster p-prefiller (RDMA pull)
+        when the holder is an n-prefiller already running a new prefill —
+        issue #276's head-of-line blocking. Overload escape stays inside the
+        cluster first: p-prefillers, then n-prefillers, then global.
+        """
+        load_counts = self._load_counts(available)
+        min_load = min(load_counts.get(server.id, 0) for server in available)
+        holders = [
+            server
+            for server in group_servers
+            if match.server_match_ratios.get(server.id, 0.0) > self.primary_match_threshold
+        ]
+        chosen = self._pick_least_loaded(holders, load_counts) if holders else None
+        if chosen is not None:
+            busy_with_new = (
+                self._server_role(chosen) == "prefiller"
+                and self._has_new_prefill(chosen)
+            )
+            if not busy_with_new and not self._is_overloaded(
+                chosen, load_counts.get(chosen.id, 0), min_load
+            ):
+                return chosen
+            if busy_with_new:
+                has_p = any(self._server_role(s) == "prefix-prefiller" for s in group_servers)
+                if not has_p:
+                    # Split disabled for this cluster: stay on the holder.
+                    return chosen
+                match.switched_from = chosen.id
+                logger.info(
+                    "[PrefixCachePreble] holder server_id=%s has a new prefill "
+                    "in flight; switching to a same-cluster prefix-prefiller",
+                    chosen.id,
+                )
+        return self._cached_escape(available, group_servers, load_counts)
+
+    def _cached_escape(
+        self,
+        available: Sequence[Any],
+        group_servers: list[Any],
+        load_counts: dict[int, float],
+    ):
+        """#247 escape for the cached class, cluster-first: same-cluster
+        p-prefillers, then same-cluster n-prefillers, then global least-loaded
+        (terminal — matches the pre-#276 escape)."""
+        min_load = min(load_counts.get(server.id, 0) for server in available)
+        for role in ("prefix-prefiller", "prefiller"):
+            tier = [s for s in group_servers if self._server_role(s) == role]
+            candidate = self._pick_least_loaded(tier, load_counts) if tier else None
+            if candidate is not None and not self._is_overloaded(
+                candidate, load_counts.get(candidate.id, 0), min_load
+            ):
+                return candidate
+        logger.info(
+            "[PrefixCachePreble] cached cluster exhausted; falling back to "
+            "least loaded server"
+        )
+        return self._pick_least_loaded(available, load_counts)
+
+    def _choose_partial(self, available: Sequence[Any], group_servers: list[Any]):
+        """Partial class (secondary < ratio <= primary): new-style placement,
+        but inside the argmax cluster so the partial KV is pulled via RDMA
+        instead of recomputed on a server outside the pool."""
+        load_counts = self._load_counts(available)
+        n_in_cluster = [s for s in group_servers if self._server_role(s) == "prefiller"]
+        if n_in_cluster:
+            return self._pick_least_loaded(n_in_cluster, load_counts)
+        return self._choose_new(available, load_counts)
+
+    def _choose_new(self, available: Sequence[Any], load_counts: dict[int, float] | None = None):
+        """Cold/new class: p-prefillers are reserved for prefix-cached traffic
+        and never take new requests, even when all n-prefillers are busy and
+        the p-prefillers idle (issue #276). Everything else — n-prefillers and
+        mixed servers — competes on plain least-loaded."""
+        if load_counts is None:
+            load_counts = self._load_counts(available)
+        non_p = [s for s in available if self._server_role(s) != "prefix-prefiller"]
+        if non_p:
+            return self._pick_least_loaded(non_p, load_counts)
+        return self._pick_least_loaded(available, load_counts)
+
+    def _choose_standalone(self, available: Sequence[Any], match: _PrefixMatch):
+        """Server-based selection for scopes without the cluster split (mixed
+        servers, blank-group prefillers): unchanged pre-#276 behavior."""
         cached_matches = match.cached_matches or [
             server for server in available
             if match.server_match_ratios.get(server.id, 0.0) > self.secondary_match_threshold
         ]
         if not cached_matches:
-            return self._choose_least_loaded(available)
-
+            return self._choose_new(available)
         load_counts = self._load_counts(available)
         cached = self._pick_least_loaded(cached_matches, load_counts)
         min_load = min(load_counts.get(server.id, 0) for server in available)
@@ -280,6 +492,23 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             )
             return self._pick_least_loaded(available, load_counts)
         return cached
+
+    def _has_new_prefill(self, server: Any) -> bool:
+        """True when the n-prefiller has >= 1 new (non-cached) prefill in
+        flight: processing rows still in their prefill phase on this server
+        with a dispatch-time classification <= the primary threshold."""
+        target = f"P: {server.base_url}"
+        counts = self._new_prefill_counts([target])
+        return counts.get(target, 0) > 0
+
+    def _new_prefill_counts(self, targets: list[str]) -> dict[str, int]:
+        if self.new_prefill_provider is not None:
+            return self.new_prefill_provider(targets)
+        from router.repositories.servers import ServerRepository
+
+        return ServerRepository.count_new_prefills_by_targets(
+            targets, max_prefix_cache=self.primary_match_threshold
+        )
 
     def _is_overloaded(self, server: Any, load: float, min_load: float) -> bool:
         # weight doubles as the server's suggested workload (issue #247): escape
@@ -354,7 +583,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         candidate set (they hold no prefix cache and are chosen later).
         """
         load_counts = super()._load_counts(available)
-        prefillers = [s for s in available if getattr(s, "role", "mixed") == "prefiller"]
+        prefillers = [s for s in available if is_prefiller_role(getattr(s, "role", None))]
         if not prefillers:
             return load_counts
         decoder_mins = self._cluster_decoder_mins()

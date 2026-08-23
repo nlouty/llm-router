@@ -85,9 +85,10 @@ def mock_redis():
         PrefixCachePrebleServerChooser._redis_client = None
 
 
-def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[str, float] | None = None):
+def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[str, float] | None = None, new_prefill_targets: set[str] | None = None):
     """Build a chooser where each server reports a fixed workload, and PD
-    decoder-min loads are stubbed (no DB needed)."""
+    decoder-min loads are stubbed (no DB needed). ``new_prefill_targets`` are
+    base_urls whose "P: {base_url}" target reports one new prefill in flight."""
     c = PrefixCachePrebleServerChooser.__new__(PrefixCachePrebleServerChooser)
     # minimal init skipping redis/APP_CONFIG
     c.primary_match_threshold = 0.9
@@ -97,6 +98,10 @@ def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[
     c.count_provider = None
     c.server_count_provider = lambda servers: {
         s.id: server_workloads.get(s.id, getattr(s, "workload", 0)) for s in servers
+    }
+    busy = new_prefill_targets or set()
+    c.new_prefill_provider = lambda targets: {
+        t: 1 for t in targets if t[len("P: "):] in busy
     }
     c._ensure_redis = lambda: None
     if decoder_mins is not None:

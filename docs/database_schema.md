@@ -171,6 +171,9 @@ CREATE TABLE servers (
     vip BOOLEAN NOT NULL DEFAULT FALSE,
     vip_cooldown TIMESTAMPTZ NULL,
     context_window INTEGER NULL,
+    role VARCHAR(32) NOT NULL DEFAULT 'mixed',
+    group_id VARCHAR(64) NULL,
+    active_tokens DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NULL,
     updated_at TIMESTAMPTZ NULL,
     deleted_at TIMESTAMPTZ NULL
@@ -196,6 +199,21 @@ CREATE INDEX servers_online_model_idx
 `context_window` is an optional per-server context-window ceiling that must be maintained manually (set it to the server's real limit, e.g. vLLM's `--max-model-len`). It is not used to pre-filter candidate servers. When an upstream rejects a request with an overflow error whose message contains this value, the router retries on a larger-window server of the same model — for single-node servers on the main proxy path, and for PD clusters on the prefill phase (the prefill probe is the first upstream call, so overflow always surfaces there). The router never switches to a different model on overflow. `NULL` means unlimited (and disables the overflow retry for that server). Keep decoder windows `NULL` or strictly larger than their prefiller's: the larger-window candidate query drops any server — including a cluster's decoders — whose `context_window` is not larger than the failed prefiller's.
 
 `weight` is the server's capacity multiplier and suggested workload (default 1). Server selection compares normalized load `workload / weight`, so a server with weight 2 is chosen over a weight-1 server as long as its own workload is below twice the other's. It is also the per-server overload threshold for prefix-cache affinity: the chooser escapes the cached server (falling back to least-loaded selection among all candidates) only when its in-flight workload has reached its `weight` **and** exceeds twice the lightest candidate's workload, so affinity is kept unless a materially lighter server exists (mixed servers and prefillers; decoders keep their own `active_tokens` path). Set it to the server's suggested concurrent request count (e.g. 4 for a 910C pool, 2 for a 910B4 pool). VIP channel candidates are restricted to weight-1 servers.
+
+`role` is the server's PD-disaggregation style:
+
+- `mixed` — single-node server, handles both prefill and decode. Never a cluster member: **keep `group_id` NULL for mixed servers** (the router ignores a mixed server's `group_id`, but a set value is a configuration error).
+- `prefiller` (n-prefiller) — PD prefiller taking **new** requests (<90% prefix match). Also serves prefix-cached requests when it has no new prefill in flight.
+- `prefix-prefiller` (p-prefiller) — PD prefiller for **prefix-cached** requests (>90% prefix match, KV pulled from the cluster pool via RDMA when the local holder is busy). Requires `group_id`. Give p-prefillers a larger `weight` than n-prefillers: it raises their #247 overload threshold and makes them preferred under normalized load.
+- `decoder` — PD decoder, chosen after prefill by least `active_tokens` within its cluster. Never directly routable.
+
+A cluster = prefiller-role servers sharing a non-empty `group_id` (plus its decoders); the cluster's prefillers share one kv-cache pool (issue #276). Prefillers and decoders require `group_id`; blank-`group_id` prefillers keep server-based (non-cluster) routing. `role` was widened from `varchar(12)` to `varchar(32)` for `prefix-prefiller` (16 chars) — deploy the router first, then apply the ALTER (surfaced by `check_db_schema`), then assign `prefix-prefiller` roles:
+
+```sql
+ALTER TABLE servers ALTER COLUMN role TYPE varchar(32);
+```
+
+`active_tokens` is a decoder-only load estimate (router-managed): reserved when a decoder is chosen after prefill and released when its decode phase ends.
 
 ## `requests` Table
 

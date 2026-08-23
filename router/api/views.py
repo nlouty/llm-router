@@ -713,10 +713,10 @@ def _add_server_validation_failure(base_url: str, model_name: str, role: str, gr
         return "base_url must end with /v1", base_url
     if not model_name:
         return "model_name is required", base_url
-    if role not in ("mixed", "prefiller", "decoder"):
-        return f"role must be one of mixed, prefiller, decoder (got {role!r})", base_url
-    if role in ("prefiller", "decoder") and not group_id:
-        return "group_id is required for prefiller/decoder servers", base_url
+    if role not in ("mixed", "prefiller", "prefix-prefiller", "decoder"):
+        return f"role must be one of mixed, prefiller, prefix-prefiller, decoder (got {role!r})", base_url
+    if role in ("prefiller", "prefix-prefiller", "decoder") and not group_id:
+        return "group_id is required for prefiller/prefix-prefiller/decoder servers", base_url
     if Server.objects.filter(base_url=base_url).exists():
         return "base_url already exists", base_url
     return None

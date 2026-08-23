@@ -109,13 +109,23 @@ class Server(TimestampedSoftDeleteModel):
     vip = models.BooleanField(default=False)
     vip_cooldown = models.DateTimeField(blank=True, null=True)
     context_window = models.IntegerField(blank=True, null=True)
-    role = models.CharField(max_length=12, blank=True, default="mixed")
+    role = models.CharField(max_length=32, blank=True, default="mixed")
     group_id = models.CharField(max_length=64, blank=True, null=True)
     active_tokens = models.FloatField(default=0.0)
 
     class Meta:
         managed = False
         db_table = "servers"
+
+
+PREFILLER_ROLES = ("prefiller", "prefix-prefiller")
+
+
+def is_prefiller_role(role: str | None) -> bool:
+    """True for both prefiller styles: ``prefiller`` (n-prefiller, takes new
+    requests) and ``prefix-prefiller`` (p-prefiller, takes prefix-cached
+    requests; issue #276). Mixed servers and decoders are never prefillers."""
+    return (role or "mixed") in PREFILLER_ROLES
 
 
 class RequestRecord(TimestampedSoftDeleteModel):

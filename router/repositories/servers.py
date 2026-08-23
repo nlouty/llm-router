@@ -8,7 +8,7 @@ from django.db.models.functions import Greatest
 from django.utils import timezone
 
 from router.config import APP_CONFIG
-from router.models import Server
+from router.models import Server, is_prefiller_role
 from router.services.request_context import get_request_id
 from router.services.request_logger import append_request_log
 
@@ -195,8 +195,11 @@ class ServerRepository:
     def list_pd_holders(model_id: int | None, vip: bool | None = None, min_context_window: int = 0) -> list[Server]:
         """Routable servers eligible for prefix-cache selection.
 
-        Returns only single-node (role='mixed') and prefiller (role='prefiller')
-        servers. Decoders are never directly routable and hold no prefix cache.
+        Returns single-node (role='mixed') and prefiller-role servers — both
+        styles: ``prefiller`` (n-prefiller) and ``prefix-prefiller``
+        (p-prefiller, issue #276). Decoders are never directly routable and
+        hold no prefix cache. A mixed server's ``group_id`` is ignored: mixed
+        servers are never cluster members.
 
         A prefiller is included only if its cluster still has at least one
         routable decoder; otherwise the cluster cannot serve a PD request and the
@@ -209,7 +212,7 @@ class ServerRepository:
             role = getattr(server, "role", "mixed") or "mixed"
             if role == "mixed":
                 result.append(server)
-            elif role == "prefiller":
+            elif is_prefiller_role(role):
                 prefillers_by_group.setdefault(server.group_id or "", []).append(server)
             # decoders are skipped
         if not prefillers_by_group:
@@ -230,7 +233,9 @@ class ServerRepository:
                 "event": "pd_holders_list",
                 "total_candidates": len(result),
                 "mixed_count": sum(1 for s in result if getattr(s, "role", "mixed") == "mixed"),
-                "prefiller_count": sum(1 for s in result if getattr(s, "role", "mixed") == "prefiller"),
+                "prefiller_count": sum(1 for s in result if is_prefiller_role(getattr(s, "role", None))),
+                "n_prefiller_count": sum(1 for s in result if (getattr(s, "role", "mixed") or "mixed") == "prefiller"),
+                "p_prefiller_count": sum(1 for s in result if (getattr(s, "role", "mixed") or "mixed") == "prefix-prefiller"),
                 "prefiller_groups": sorted(prefillers_by_group.keys()),
                 "decoder_groups": sorted(decoder_groups),
             }, ensure_ascii=False))
@@ -288,18 +293,55 @@ class ServerRepository:
 
     @staticmethod
     def pick_least_workload_prefiller(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
-        """Pick the least-workload routable prefiller in a cluster."""
+        """Pick the least-workload routable prefiller (either style) in a cluster."""
         attempted_ids = attempted_ids or set()
         servers = ServerRepository.list_all_online()
         prefillers = [
             s for s in servers
-            if (getattr(s, "role", "mixed") or "mixed") == "prefiller"
+            if is_prefiller_role(getattr(s, "role", None))
             and s.group_id == group_id
             and s.id not in attempted_ids
         ]
         if not prefillers:
             return None
         return min(prefillers, key=lambda s: (int(getattr(s, "workload", 0) or 0)))
+
+    @staticmethod
+    def count_new_prefills_by_targets(
+        target_pod_ips: list[str], max_prefix_cache: float = 0.9
+    ) -> dict[str, int]:
+        """Count in-flight NEW (non-cached) PD prefills per prefiller target.
+
+        Used by the p/n prefiller split (issue #276) to detect an n-prefiller
+        that already has a long new request in its prefill queue, so cached
+        requests can be steered to a same-cluster p-prefiller instead of
+        queueing behind it.
+
+        WARNING — phase invariant: a PD request's ``target_pod_ip`` equals
+        ``"P: {prefiller.base_url}"`` ONLY while it is in the prefill phase;
+        decode start rewrites it to ``"P: X -- D: Y"`` (proxy_pd_forward),
+        which the exact-match filter below deliberately excludes — the
+        prefiller is already released at that point. Do not change either
+        string format without updating this query.
+
+        ``prefix_cache`` holds the request's dispatch-time classification
+        (cluster-based match ratio), so ``<= max_prefix_cache`` selects new and
+        partial requests — the ones a cached request would queue behind.
+        """
+        from router.models import RequestRecord
+        from router.repositories.requests import is_processing_q
+
+        if not target_pod_ips:
+            return {}
+        rows = (
+            RequestRecord.objects
+            .filter(target_pod_ip__in=target_pod_ips)
+            .filter(is_processing_q())
+            .filter(prefix_cache__lte=max_prefix_cache)
+            .values("target_pod_ip")
+            .annotate(count=Count("id"))
+        )
+        return {row["target_pod_ip"]: row["count"] for row in rows}
 
     @staticmethod
     def recalculate_workload(
