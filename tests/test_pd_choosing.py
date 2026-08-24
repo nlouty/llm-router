@@ -230,3 +230,68 @@ def test_llm_choosing_records_routing_failure_when_pipeline_returns_502(monkeypa
     assert "routing_failed" in router_result
     record = RequestRecord.objects.get(ip_id=LLM_CHOOSING_IP_ID)
     assert record.task_status == "failed"
+
+
+def test_llm_choosing_via_pd_cluster_with_prefix_prefiller(monkeypatch):
+    """A prefix-prefiller (p-prefiller, issue #276) takes the same two-phase
+    PD path as an n-prefiller: PD dispatch is role-style agnostic."""
+    target_model = Model.objects.create(
+        model_name="target-model-pp", auto=True, complexity_min=1, complexity_max=10
+    )
+    routing_model = Model.objects.create(model_name="router-model-pp", is_routing_model=True)
+    prefiller = Server.objects.create(
+        model_id=routing_model.id,
+        base_url="http://pp.example",
+        is_online=True,
+        role="prefix-prefiller",
+        group_id="g1",
+    )
+    decoder = Server.objects.create(
+        model_id=routing_model.id,
+        base_url="http://dd.example",
+        is_online=True,
+        role="decoder",
+        group_id="g1",
+    )
+
+    def fake_pd_post(url, headers=None, data=None, timeout=None):
+        response = MagicMock()
+        if "pp.example" in url:
+            response.status_code = 200
+            response.json.return_value = {
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 1,
+                    "prompt_tokens_details": {"cached_tokens": 9},
+                },
+                "kv_transfer_params": {
+                    "remote_engine_id": "e1",
+                    "remote_host": "h",
+                    "remote_port": 1,
+                },
+            }
+            return response
+        assert "dd.example" in url
+        response.status_code = 200
+        response.reason = "OK"
+        response.headers = {"content-type": "application/json"}
+        response.content = (
+            b'{"choices":[{"message":{"content":"{\\"complexity\\":5}"}}],'
+            b'"usage":{"prompt_tokens":11,"completion_tokens":3,'
+            b'"prompt_tokens_details":{"cached_tokens":0}}}'
+        )
+        return response
+
+    monkeypatch.setattr(
+        "router.services.proxy_pd_forward.requests.post", fake_pd_post
+    )
+
+    service = ProxyService(_FirstChooser())
+    body = b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
+    model, router_result = _query_routing(service, body, [target_model])
+
+    assert model == target_model
+    assert router_result == "complexity:5"
+    record = RequestRecord.objects.get(ip_id=LLM_CHOOSING_IP_ID)
+    assert record.target_pod_ip == f"P: {prefiller.base_url} -- D: {decoder.base_url}"
+    assert record.task_status == "success"

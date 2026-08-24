@@ -144,3 +144,71 @@ def test_add_server_updates_existing_model_path():
 
     assert response.status_code == 200
     assert Model.objects.get(model_name="m1").model_path == "/models/m1"
+
+
+def test_add_server_prefix_prefiller_success():
+    client = Client()
+    payload = {
+        "base_url": "http://pp/v1",
+        "model_name": "m1",
+        "role": "prefix-prefiller",
+        "group_id": "g1",
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+        mock_get.return_value = mock_resp
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["role"] == "prefix-prefiller"
+    assert data["group_id"] == "g1"
+
+    server = Server.objects.get(base_url="http://pp/v1")
+    assert server.role == "prefix-prefiller"
+    assert server.group_id == "g1"
+
+
+def test_add_server_prefix_prefiller_requires_group_id():
+    client = Client()
+    payload = {
+        "base_url": "http://pp-ng/v1",
+        "model_name": "m1",
+        "role": "prefix-prefiller",
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+        mock_get.return_value = mock_resp
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 400
+    assert "group_id is required" in response.json()["error"]
+
+
+def test_add_server_rejects_unknown_role():
+    client = Client()
+    payload = {
+        "base_url": "http://bad-role/v1",
+        "model_name": "m1",
+        "role": "p-prefiller",  # the issue's shorthand is not a valid role
+        "group_id": "g1",
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+        mock_get.return_value = mock_resp
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 400
+    assert "role must be one of" in response.json()["error"]

@@ -190,3 +190,79 @@ class TestDecoderCircuitRecovery:
 
         assert result.response is not None  # terminal success, not a retry
         assert decoder.id in called  # decoder success recorded
+
+
+def _record(target_pod_ip=None, task_status="prefilling", prefix_cache=0.0, model_id=1):
+    return RequestRecord.objects.create(
+        user_ip_id=1,
+        ip_id=None,
+        send_time=timezone.now(),
+        model_id=model_id,
+        task_status=task_status,
+        target_pod_ip=target_pod_ip,
+        prefix_cache=prefix_cache,
+    )
+
+
+class TestListPdHoldersSplitRoles:
+    def test_prefix_prefiller_returned_with_its_cluster(self):
+        _server("http://n1", role="prefiller", group_id="g1")
+        _server("http://p1", role="prefix-prefiller", group_id="g1")
+        _server("http://d1", role="decoder", group_id="g1")
+
+        holders = ServerRepository.list_pd_holders(None)
+        urls = sorted(s.base_url for s in holders)
+        assert urls == ["http://n1", "http://p1"]
+
+    def test_prefix_prefiller_dropped_without_routable_decoder(self):
+        # Same decoder-less-cluster rule as n-prefillers.
+        _server("http://p1", role="prefix-prefiller", group_id="g1")
+
+        holders = ServerRepository.list_pd_holders(None)
+        assert holders == []
+
+
+class TestCountNewPrefills:
+    """The "new prefill in flight" signal for the busy-holder switch (#276).
+
+    Pins the phase invariant: only rows whose target_pod_ip still equals
+    "P: {base_url}" (prefill phase) count; decode rewrites the target to
+    "P: X -- D: Y" and must be excluded.
+    """
+
+    def test_prefill_phase_new_row_counts(self):
+        _record(target_pod_ip="P: http://n1", task_status="prefilling", prefix_cache=0.0)
+        counts = ServerRepository.count_new_prefills_by_targets(["P: http://n1"])
+        assert counts == {"P: http://n1": 1}
+
+    def test_decode_phase_row_does_not_count(self):
+        _record(
+            target_pod_ip="P: http://n1 -- D: http://d1",
+            task_status="decoding",
+            prefix_cache=0.0,
+        )
+        counts = ServerRepository.count_new_prefills_by_targets(["P: http://n1"])
+        assert counts == {}
+
+    def test_cached_row_does_not_count(self):
+        # A cached request queued on the holder does not trigger the switch.
+        _record(target_pod_ip="P: http://n1", task_status="prefilling", prefix_cache=0.95)
+        counts = ServerRepository.count_new_prefills_by_targets(["P: http://n1"])
+        assert counts == {}
+
+    def test_terminal_row_does_not_count(self):
+        _record(target_pod_ip="P: http://n1", task_status="success", prefix_cache=0.0)
+        counts = ServerRepository.count_new_prefills_by_targets(["P: http://n1"])
+        assert counts == {}
+
+    def test_batches_across_targets(self):
+        _record(target_pod_ip="P: http://n1", task_status="prefilling", prefix_cache=0.3)
+        _record(target_pod_ip="P: http://n1", task_status="processing", prefix_cache=0.0)
+        _record(target_pod_ip="P: http://n2", task_status="prefilling", prefix_cache=0.0)
+        counts = ServerRepository.count_new_prefills_by_targets(
+            ["P: http://n1", "P: http://n2"]
+        )
+        assert counts == {"P: http://n1": 2, "P: http://n2": 1}
+
+    def test_empty_targets(self):
+        assert ServerRepository.count_new_prefills_by_targets([]) == {}

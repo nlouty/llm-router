@@ -25,6 +25,7 @@ from router.services.request_context import (
 from router.services.request_logger import append_request_log, flush_request_log
 
 from router.config import APP_CONFIG
+from router.models import is_prefiller_role
 from router.repositories.requests import (
     LLM_CHOOSING_IP_ID,
     LLM_CHOOSING_USER_AGENT,
@@ -527,10 +528,12 @@ class ProxyService:
                     "attempt": state.attempts + 1,
                 }, ensure_ascii=False))
 
-                # PD disaggregation: a chosen prefiller is handed to the two-phase
-                # PD forward service (prefill -> pick decoder -> decode). Mixed
+                # PD disaggregation: a chosen prefiller (either style —
+                # 'prefiller' / n-prefiller or 'prefix-prefiller' /
+                # p-prefiller, issue #276) is handed to the two-phase PD
+                # forward service (prefill -> pick decoder -> decode). Mixed
                 # servers take the existing single-node path.
-                if getattr(server, "role", "mixed") == "prefiller":
+                if is_prefiller_role(getattr(server, "role", None)):
                     append_request_log(record.id, json.dumps({
                         "event": "pd_path_selected",
                         "prefiller_id": server.id,
