@@ -3,6 +3,7 @@ from __future__ import annotations
 from router.config import APP_CONFIG
 from router.models import Server
 from router.repositories.servers import ServerRepository
+from router.services.request_context import get_llm_choosing_deadline
 
 
 class CircuitBreakerService:
@@ -15,6 +16,17 @@ class CircuitBreakerService:
 
     def record_failure(self, server: Server) -> None:
         """Record a failure. Opens the circuit if threshold is reached."""
+        # llm-choosing (routing-model) requests are capped at
+        # llm_choosing_timeout_seconds, so a routing server busy prefilling
+        # large client requests fails the choosing call at the deadline
+        # without being unhealthy. Their failures must not accumulate into
+        # consecutive_failures, or a few slow probes open the circuit and
+        # drop the server from every pool while normal traffic still works.
+        # Successes still count (record_success below): a completed probe
+        # proves the server alive and is the in-band recovery path for
+        # routing servers whose only traffic is choosing requests.
+        if get_llm_choosing_deadline() is not None:
+            return
         ServerRepository.record_failure(
             server,
             failure_threshold=self.failure_threshold,

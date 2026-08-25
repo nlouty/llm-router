@@ -12,8 +12,11 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
+import requests
+
 from router.models import Model, RequestRecord, Server
 from router.repositories.requests import LLM_CHOOSING_IP_ID
+from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
 from router.services.proxy import ProxyService
 
@@ -183,3 +186,41 @@ def test_llm_choosing_deadline_exhaustion_skips_upstream_and_falls_back(monkeypa
     assert "routing_failed" in router_result
     record = RequestRecord.objects.get(ip_id=LLM_CHOOSING_IP_ID)
     assert record.task_status == "failed"
+
+
+def test_llm_choosing_timeouts_do_not_accumulate_circuit_failures(monkeypatch):
+    """Routing-model probe timeouts must not count toward the circuit breaker.
+
+    A routing server busy prefilling large client requests answers slower than
+    llm_choosing_timeout_seconds, so its probes fail at the deadline even
+    though the server is healthy for normal traffic. If those failures
+    accumulated, three slow probes would open the circuit and drop the server
+    from every pool (the exact scenario in test_circuit_breaker_timeout.py,
+    where the same timeout on a client request must open the circuit).
+    """
+    fallback_model = Model.objects.create(model_name="DeepSeek-V4-Flash")
+    target_model, routing_model = _routing_models()
+    server = Server.objects.create(
+        model_id=routing_model.id, base_url="http://busy-prefill.example", is_online=True
+    )
+
+    def slow(self_inner, method, url, **kwargs):
+        raise requests.exceptions.ReadTimeout("busy prefilling")
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        slow,
+    )
+
+    service = ProxyService(_FirstChooser())
+    service.llm_choosing_timeout = 2
+    body = b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
+    for _ in range(3):  # three failed probes: at or above failure_threshold
+        model, router_result = _query_routing(service, body, [target_model])
+        assert model == fallback_model
+        assert "routing_failed" in router_result
+
+    server.refresh_from_db()
+    assert server.consecutive_failures == 0
+    assert server.circuit_state == "closed"
+    assert server in ServerRepository.list_all_online()
