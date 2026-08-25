@@ -24,7 +24,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_disconnect.py` | `DisconnectWatcher` event/callback semantics |
 | `test_errors.py` | Error payload shape and SSE timeout event format |
 | `test_headers.py` | Request-header filtering (hop-by-hop + bodyless `Content-Type`) |
-| `test_llm_choosing_timeout.py` | llm-choosing budget: attempt socket timeouts clamped to the remaining budget (single-node + PD), deadline exhaustion skips the upstream and falls back |
+| `test_llm_choosing_timeout.py` | llm-choosing budget: attempt socket timeouts clamped to the remaining budget (single-node + PD), deadline exhaustion skips the upstream and falls back, choosing-request timeouts do not accumulate `consecutive_failures` |
 | `test_manage.py` | `manage.py prod`/`test` argument parsing and DB port selection |
 | `test_management_api.py` | Whitelist upsert messages and `refresh_user_info` thread launch |
 | `test_model_online_list.py` | Online model catalog excludes deprecated models |
