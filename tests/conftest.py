@@ -77,6 +77,10 @@ def api_test_tables(django_db_setup, django_db_blocker):
             for col in ("role", "group_id", "active_tokens"):
                 if Server._meta.db_table in connection.introspection.table_names() and not has_column("servers", col):
                     schema_editor.add_field(Server, Server._meta.get_field(col))
+            # Per-server credential columns
+            for col in ("csb_token", "api_key"):
+                if Server._meta.db_table in connection.introspection.table_names() and not has_column("servers", col):
+                    schema_editor.add_field(Server, Server._meta.get_field(col))
         yield
 
 

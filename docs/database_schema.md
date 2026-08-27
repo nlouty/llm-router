@@ -163,6 +163,7 @@ CREATE TABLE servers (
     last_failure_at TIMESTAMPTZ NULL,
     cache_time INTEGER NOT NULL DEFAULT 3600,
     csb_token VARCHAR(500) NULL,
+    api_key VARCHAR(500) NULL,
     circuit_state VARCHAR(20) NOT NULL DEFAULT 'closed',
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     last_state_change_at TIMESTAMPTZ NULL,
@@ -189,6 +190,8 @@ CREATE INDEX servers_online_model_idx
 `cache_time` controls how long successful prefix-cache entries for this server stay valid in Redis.
 
 `csb_token`, when present, is injected into upstream requests as the `csb-token` header.
+
+`api_key` (issue #279) holds the credential for servers managed by an external system that only accept one specific key. When present, every upstream send to that server — normal, stream, retries, PD prefill and decode, health probes, and add-server verification — strips the client's `Authorization`/`x-api-key`/`api-key` headers and sends `Authorization: Bearer <api_key>` instead (see `build_upstream_headers` in `router/utils/headers.py`). `NULL` keeps today's behavior: the client's own `Authorization` is forwarded. It is set via the optional `api_key` field of `/api/add_server` (masked in the response); like other admin-maintained columns it can also be set directly on existing rows. The column is added by `check_db_schema --fix` (it surfaces `ALTER TABLE servers ADD COLUMN api_key VARCHAR(500) NULL`).
 
 `circuit_state`, `consecutive_failures`, `last_state_change_at`, and `cooldown_seconds` are router-managed circuit-breaker fields. Closed servers are routable. Open servers become half-open after cooldown. Half-open servers are routable for probe traffic.
 
@@ -275,6 +278,8 @@ CREATE TABLE server_operations (
     deleted_at TIMESTAMPTZ NULL
 );
 ```
+
+`add_server` requests that carry an `api_key` store it in plaintext in `request_data` (an internal audit table) and masked in `response_data`/the API response.
 
 `mr_live_review` stores MR review ingestion and reporting data. `discussion_id` must be unique.
 

@@ -682,6 +682,7 @@ def _process_add_server_item(data, now):
     role = (data.get("role") or "mixed").strip()
     group_id = (data.get("group_id") or "").strip() or None
     model_path = (data.get("model_path") or "").strip() or None
+    api_key = (data.get("api_key") or "").strip() or None
     operation = _create_add_server_operation(data, now)
 
     validation_failure = _add_server_validation_failure(base_url, model_name, role, group_id)
@@ -689,11 +690,11 @@ def _process_add_server_item(data, now):
         message, result_base_url = validation_failure
         return _fail_add_server_operation(operation, message, result_base_url)
 
-    verify_error = _verify_server_model(base_url, model_name)
+    verify_error = _verify_server_model(base_url, model_name, api_key)
     if verify_error:
         return _fail_add_server_operation(operation, verify_error, base_url)
 
-    return _create_add_server_success(operation, base_url, model_name, role, group_id, model_path)
+    return _create_add_server_success(operation, base_url, model_name, role, group_id, model_path, api_key)
 
 
 def _create_add_server_operation(data, now):
@@ -722,10 +723,11 @@ def _add_server_validation_failure(base_url: str, model_name: str, role: str, gr
     return None
 
 
-def _verify_server_model(base_url: str, model_name: str) -> str | None:
+def _verify_server_model(base_url: str, model_name: str, api_key: str | None = None) -> str | None:
     verify_url = base_url.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
     try:
-        resp = http_requests.get(verify_url, timeout=10)
+        resp = http_requests.get(verify_url, timeout=10, headers=headers)
         resp.raise_for_status()
         models_data = resp.json()
         model_ids = [model.get("id", "") for model in models_data.get("data", [])]
@@ -748,7 +750,7 @@ def _fail_add_server_operation(operation, message: str, base_url: str | None = N
     return result
 
 
-def _create_add_server_success(operation, base_url: str, model_name: str, role: str = "mixed", group_id: str | None = None, model_path: str | None = None):
+def _create_add_server_success(operation, base_url: str, model_name: str, role: str = "mixed", group_id: str | None = None, model_path: str | None = None, api_key: str | None = None):
     model_obj, _ = Model.objects.get_or_create(
         model_name=model_name,
         defaults={"model_path": model_path},
@@ -761,6 +763,7 @@ def _create_add_server_success(operation, base_url: str, model_name: str, role: 
         base_url=base_url,
         role=role,
         group_id=group_id,
+        api_key=api_key,
         created_at=timezone.now(),
         updated_at=timezone.now(),
     )
@@ -774,6 +777,7 @@ def _create_add_server_success(operation, base_url: str, model_name: str, role: 
         "role": role,
         "group_id": group_id,
         "model_path": model_path,
+        "api_key": _mask_apikey(api_key) if api_key else None,
     }
     operation.updated_at = timezone.now()
     operation.save()
