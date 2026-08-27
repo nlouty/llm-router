@@ -101,6 +101,7 @@ class Server(TimestampedSoftDeleteModel):
     last_failure_at = models.DateTimeField(blank=True, null=True)
     cache_time = models.IntegerField(default=3600)
     csb_token = models.CharField(max_length=500, blank=True, null=True)
+    api_key = models.CharField(max_length=500, blank=True, null=True)
     circuit_state = models.CharField(max_length=20, default="closed")
     consecutive_failures = models.IntegerField(default=0)
     last_state_change_at = models.DateTimeField(blank=True, null=True)

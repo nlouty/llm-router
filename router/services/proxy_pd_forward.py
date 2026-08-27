@@ -18,6 +18,7 @@ from router.services.request_context import get_request_id
 from router.services.request_log_handler import install_pd_handler
 from router.services.request_logger import append_request_log, flush_request_log
 from router.utils.errors import error_payload, timeout_sse_event
+from router.utils.headers import build_upstream_headers
 from router.utils.sse import parse_sse_usage
 
 logger = logging.getLogger(__name__)
@@ -420,9 +421,7 @@ class PDForwardService:
 
     def _do_prefill(self, prefiller, prefiller_url, headers, body) -> tuple[dict, int, int]:
         prefill_body = build_prefill_body(body)
-        req_headers = {**headers}
-        if getattr(prefiller, "csb_token", None):
-            req_headers["csb-token"] = prefiller.csb_token
+        req_headers = build_upstream_headers(headers, prefiller)
         response = requests.post(
             prefiller_url,
             headers=req_headers,
@@ -615,9 +614,7 @@ class PDForwardService:
             return _RouteAttemptResult(response=final_response)
 
     def _post_decode(self, decoder, decoder_url, headers, decode_body):
-        req_headers = {**headers}
-        if getattr(decoder, "csb_token", None):
-            req_headers["csb-token"] = decoder.csb_token
+        req_headers = build_upstream_headers(headers, decoder)
         response = requests.post(
             decoder_url, headers=req_headers, data=decode_body,
             timeout=self.proxy._deadline_timeout(self.normal_timeout),
@@ -700,9 +697,7 @@ class PDForwardService:
                     )
                     decoder_url = self.proxy._build_url(decoder.base_url, path, "")
 
-                    req_headers = {**headers}
-                    if getattr(decoder, "csb_token", None):
-                        req_headers["csb-token"] = decoder.csb_token
+                    req_headers = build_upstream_headers(headers, decoder)
                     try:
                         upstream = requests.request(
                             "POST", decoder_url, headers=req_headers, data=decode_body,

@@ -45,7 +45,7 @@ from router.route_algorithm.auto import AutoRouteAlgorithm
 from router.route_algorithm.base import ServerSelectionContext
 from router.route_algorithm.least_connection import LeastConnectionServerChooser
 from router.utils.errors import error_payload, error_response, timeout_sse_event
-from router.utils.headers import filter_request_headers
+from router.utils.headers import build_upstream_headers, filter_request_headers
 from router.utils.session import extract_session_id
 
 
@@ -1022,9 +1022,7 @@ class ProxyService:
         return (min(base[0], remaining), remaining)
 
     def _handle_normal(self, django_request, server, upstream_url, headers, body, upstream_client):
-        req_headers = {**headers}
-        if server.csb_token:
-            req_headers["csb-token"] = server.csb_token
+        req_headers = build_upstream_headers(headers, server)
         return upstream_client.request(
             django_request.method,
             upstream_url,
@@ -1034,9 +1032,7 @@ class ProxyService:
         )
 
     def _handle_stream(self, django_request, server, upstream_url, headers, body):
-        req_headers = {**headers}
-        if server.csb_token:
-            req_headers["csb-token"] = server.csb_token
+        req_headers = build_upstream_headers(headers, server)
         return requests.request(
             django_request.method,
             upstream_url,

@@ -508,6 +508,22 @@ Single request body:
 }
 ```
 
+Optional fields:
+
+- `role` / `group_id` — PD-disaggregation role (`mixed`, `prefiller`, `prefix-prefiller`, `decoder`) and its cluster group.
+- `model_path` — tokenizer artifact location for the model.
+- `api_key` — for servers managed by an external system that only accept one specific key (issue #279). When set, the router authenticates upstream sends to this server (including the verification GET and health probes) with this key instead of the client's `Authorization` header. The response echoes it masked (`sk-1…wxyz`); the raw key is stored on the `servers` row.
+
+Example:
+
+```json
+{
+  "base_url": "http://10.1.2.3:8000/v1",
+  "model_name": "gpt-3.5-turbo",
+  "api_key": "sk-managed-key"
+}
+```
+
 Multiple request body:
 
 ```json

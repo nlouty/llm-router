@@ -212,3 +212,64 @@ def test_add_server_rejects_unknown_role():
 
     assert response.status_code == 400
     assert "role must be one of" in response.json()["error"]
+
+
+def test_add_server_with_api_key_stores_masks_and_verifies_with_it():
+    client = Client()
+    payload = {
+        "base_url": "http://keyed/v1",
+        "model_name": "m1",
+        "api_key": "sk-server-managed-key-123456",
+    }
+
+    captured = {}
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+
+        def capture(url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            return mock_resp
+
+        mock_get.side_effect = capture
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["api_key"] == "sk-s…3456"
+    assert "sk-server-managed-key-123456" not in json.dumps(data)
+
+    server = Server.objects.get(base_url="http://keyed/v1")
+    assert server.api_key == "sk-server-managed-key-123456"
+
+    # The verification GET must authenticate with the server's key.
+    assert captured["url"] == "http://keyed/v1/models"
+    assert captured["headers"] == {"Authorization": "Bearer sk-server-managed-key-123456"}
+
+
+def test_add_server_without_api_key_verifies_without_headers():
+    client = Client()
+    payload = {"base_url": "http://unkeyed/v1", "model_name": "m1"}
+
+    captured = {}
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+
+        def capture(url, **kwargs):
+            captured["headers"] = kwargs.get("headers")
+            return mock_resp
+
+        mock_get.side_effect = capture
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    assert captured["headers"] is None
+    assert Server.objects.get(base_url="http://unkeyed/v1").api_key is None
