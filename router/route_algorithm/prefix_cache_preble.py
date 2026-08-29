@@ -111,8 +111,11 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
         request_chars, prefix_data = self._prefix_work_for_context(context)
         if not request_chars or self._redis_client is None:
+            # Unclassifiable request (no extractable prompt text / no Redis):
+            # treat it as new so p-prefillers stay reserved (issue #276)
+            # instead of taking it via plain least-loaded.
             self._clear_prefix_context(context)
-            return self._choose_least_loaded(available)
+            return self._choose_new(available)
 
         model_key = context.model_name or str(context.model_id or "")
         available_by_id = {server.id: server for server in available}
@@ -434,8 +437,9 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         load_counts: dict[int, float],
     ):
         """#247 escape for the cached class, cluster-first: same-cluster
-        p-prefillers, then same-cluster n-prefillers, then global least-loaded
-        (terminal — matches the pre-#276 escape)."""
+        p-prefillers, then same-cluster n-prefillers, then non-p servers
+        globally — a fresh prefill never lands on a p-prefiller while a live
+        prefiller exists (issue #276)."""
         min_load = min(load_counts.get(server.id, 0) for server in available)
         for role in ("prefix-prefiller", "prefiller"):
             tier = [s for s in group_servers if self._server_role(s) == role]
@@ -448,7 +452,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             "[PrefixCachePreble] cached cluster exhausted; falling back to "
             "least loaded server"
         )
-        return self._pick_least_loaded(available, load_counts)
+        return self._choose_new(available, load_counts)
 
     def _choose_partial(self, available: Sequence[Any], group_servers: list[Any]):
         """Partial class (secondary < ratio <= primary): new-style placement,
@@ -464,7 +468,9 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         """Cold/new class: p-prefillers are reserved for prefix-cached traffic
         and never take new requests, even when all n-prefillers are busy and
         the p-prefillers idle (issue #276). Everything else — n-prefillers and
-        mixed servers — competes on plain least-loaded."""
+        mixed servers — competes on plain least-loaded. Also the escape target
+        for unclassifiable and overload paths, so a fresh prefill never lands
+        on a p-prefiller while a live prefiller exists."""
         if load_counts is None:
             load_counts = self._load_counts(available)
         non_p = [s for s in available if self._server_role(s) != "prefix-prefiller"]
@@ -490,7 +496,10 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 "falling back to least loaded server",
                 cached.id,
             )
-            return self._pick_least_loaded(available, load_counts)
+            # Escape over non-p servers only: p-prefillers hold none of this
+            # standalone's KV, so landing there would be a full new prefill
+            # on a reserved p-prefiller (issue #276).
+            return self._choose_new(available, load_counts)
         return cached
 
     def _has_new_prefill(self, server: Any) -> bool:

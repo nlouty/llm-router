@@ -253,3 +253,49 @@ class TestStandalonePoolUnchanged:
 
         selected = _choose(chooser, [m1, m2], _cache_hit_body())
         assert selected.id == m2.id
+
+
+class TestFreshPrefillNeverOnP:
+    """The #276 invariant under load: however busy the live prefillers are,
+    a request that must prefill from scratch never lands on a
+    prefix-prefiller while a live prefiller exists; p-prefillers take one
+    only when no live prefiller is left."""
+
+    def test_unclassifiable_body_stays_off_p(self, mock_redis):
+        # Non-UTF-8 body -> no extractable prefix text: choose() cannot
+        # classify the request and used to fall back to plain least-loaded,
+        # which happily picked the idle p-prefiller.
+        chooser = _chooser_with_workload({}, decoder_mins={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+
+        selected = chooser.choose([n1, p1], make_context(b"\xff\xfe not utf8"), set())
+        assert selected.id == n1.id
+
+    def test_standalone_overload_escape_stays_off_p(self, mock_redis):
+        # Cached on an overloaded standalone holder: the escape used to go
+        # global least-loaded, straight onto an idle p that holds none of the
+        # KV. It must queue on the busy live prefiller instead.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_mins={})
+        m1 = make_server(1, "http://m1", role="mixed", workload=10)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+        _seed(chooser, m1, _cached_request_body())
+
+        selected = _choose(chooser, [m1, p1], _cache_hit_body())
+        assert selected.id == m1.id
+
+    def test_cached_cluster_exhausted_stays_off_foreign_p(self, mock_redis):
+        # Winning cluster g1 exhausted (holder, p and sibling n all
+        # overloaded); the idle p of g2 used to win the terminal global pick
+        # and take a full new prefill.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_mins={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=10)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=9)
+        n2 = make_server(3, "http://n2", role="prefiller", group_id="g1", workload=8)
+        p2 = make_server(4, "http://p2", role="prefix-prefiller", group_id="g2", workload=0)
+        _seed(chooser, n1, _cached_request_body())
+
+        selected = _choose(chooser, [n1, p1, n2, p2], _cache_hit_body())
+        assert selected.id == n2.id
