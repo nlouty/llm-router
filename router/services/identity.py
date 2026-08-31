@@ -13,6 +13,8 @@ class RequestIdentity:
     ``user_ip_id`` is the real ``user_ips.id`` backing this request, or ``0``
     when no identity could be resolved (no apikey, and the IP is not in
     ``user_ips``). ``employee_no`` is the resolved employee number, or empty.
+    ``user_charge`` is the person-in-charge name from the ``user_ips`` row
+    (matched against ``whitelist.user_name`` by admission), or empty.
     ``is_vip`` is True only when the backing ``user_ips`` row is VIP.
     """
 
@@ -22,6 +24,7 @@ class RequestIdentity:
     department_id: int | None
     is_vip: bool
     is_apikey: bool
+    user_charge: str = ""
 
     @property
     def has_employee(self) -> bool:
@@ -70,4 +73,5 @@ class IdentityService:
             department_id=user_ip.department_id,
             is_vip=bool(user_ip.vip),
             is_apikey=is_apikey,
+            user_charge=user_ip.user_charge or "",
         )

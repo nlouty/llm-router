@@ -9,6 +9,7 @@ from django.core.exceptions import RequestDataTooBig
 from django.db import connection
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
@@ -16,7 +17,7 @@ from router.config import APP_CONFIG
 from router.repositories.ips import IPRepository
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
-from router.repositories.whitelist import WhitelistRepository
+from router.repositories.whitelist import UNSET, WhitelistRepository
 from router.services.admission import AdmissionService
 from router.services.cmdb import CMDBService
 from router.services.identity import IdentityService
@@ -187,7 +188,25 @@ def whitelist_update(request):
         return JsonResponse({"code": 400, "error": "is_allowed must be 0 or 1"}, status=400)
     if not employee_no or is_allowed not in (0, 1):
         return JsonResponse({"code": 400, "error": "employee_no and is_allowed are required"}, status=400)
-    row, created, changed = WhitelistRepository.upsert(employee_no, is_allowed, user_name)
+
+    # expire_time: absent keeps the stored value; empty/null clears it (never
+    # expires); otherwise an ISO 8601 or "YYYY-MM-DD HH:MM:SS" datetime,
+    # interpreted in the local timezone when naive.
+    expire_time = UNSET
+    raw_expire_time = data.get("expire_time")
+    if raw_expire_time is not None and raw_expire_time != "":
+        expire_time = parse_datetime(str(raw_expire_time).strip())
+        if expire_time is None:
+            return JsonResponse(
+                {"code": 400, "error": "expire_time must be an ISO 8601 or 'YYYY-MM-DD HH:MM:SS' datetime"},
+                status=400,
+            )
+        if timezone.is_naive(expire_time):
+            expire_time = timezone.make_aware(expire_time)
+    elif "expire_time" in data:
+        expire_time = None
+
+    row, created, changed = WhitelistRepository.upsert(employee_no, is_allowed, user_name, expire_time)
     message = "创建成功" if created else ("更新成功" if changed else "本次修改未生效")
     return JsonResponse(
         {
@@ -197,6 +216,7 @@ def whitelist_update(request):
                 "employee_no": row.employee_no,
                 "user_name": row.user_name,
                 "is_allowed": row.is_allowed,
+                "expire_time": timezone.localtime(row.expire_time).strftime("%Y-%m-%d %H:%M:%S") if row.expire_time else None,
                 "update_time": timezone.localtime(row.update_time).strftime("%Y-%m-%d %H:%M:%S") if row.update_time else None,
             },
         }

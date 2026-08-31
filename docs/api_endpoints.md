@@ -194,10 +194,12 @@ Upserts a whitelist entry by `employee_no`.
 ```bash
 curl -i -X POST http://localhost:8001/api/whitelist/update \
   -H 'Content-Type: application/json' \
-  -d '{"employee_no":"E001","is_allowed":1}'
+  -d '{"employee_no":"E001","is_allowed":1,"expire_time":"2026-12-31 23:59:59"}'
 ```
 
-`is_allowed` must be `0` or `1`.
+`is_allowed` must be `0` or `1`. Optional `user_name` sets the person-in-charge name matched against `user_ips.user_charge` by admission.
+
+`expire_time` is the entry's due time: the entry only grants access **before** this time. It accepts ISO 8601 or `YYYY-MM-DD HH:MM:SS` (interpreted in the router timezone when no offset is given). Omitting the field keeps the stored value; sending an empty value clears it (never expires). HTTP 400 on an unparseable datetime.
 
 ## API-Key Registration
 
@@ -213,7 +215,7 @@ curl -i -X POST http://localhost:8001/api/apikey \
   -d '{"apikey":"employee-key","employee_no":"E001"}'
 ```
 
-After validating the JSON fields, the endpoint rejects an `employee_no` that already has an active apikey with HTTP 409 before performing any write. Otherwise it delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 until an internal adapter provides this method.
+After validating the JSON fields, the endpoint rejects an `employee_no` that already has an active apikey with HTTP 409 before performing any write. If the `employee_no` has an active (unexpired) whitelist entry, the endpoint bypasses CMDB entirely and inserts the `user_ips` apikey row directly with `department_id = 0` and the whitelist `user_name` — the CMDB sync (`refresh_user_info`) overwrites the department once CMDB can resolve one. Otherwise it delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 for non-whitelisted employees until an internal adapter provides this method.
 
 ```json
 {
@@ -316,6 +318,7 @@ Response format with pagination:
       "employee_no": "E001",
       "user_name": "张三",
       "is_allowed": 1,
+      "expire_time": "2026-12-31 23:59:59",
       "update_time": "2026-06-25 10:00:00"
     },
     {
@@ -323,6 +326,7 @@ Response format with pagination:
       "employee_no": "E002",
       "user_name": "李四",
       "is_allowed": 0,
+      "expire_time": null,
       "update_time": "2026-06-24 15:30:00"
     }
   ],

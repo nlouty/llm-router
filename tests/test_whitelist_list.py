@@ -73,6 +73,19 @@ class TestWhitelistList:
         assert total == 0
         assert len(data) == 0
 
+    def test_list_all_includes_expire_time(self, db):
+        """测试返回数据包含到期时间"""
+        Whitelist.objects.create(
+            employee_no="E001",
+            is_allowed=1,
+            expire_time=timezone.datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.get_current_timezone()),
+            update_time=timezone.now(),
+        )
+
+        data, _total = WhitelistRepository.list_all()
+
+        assert data[0]["expire_time"] == "2026-12-31 23:59:59"
+
     def test_list_all_order(self, sample_whitelist_data):
         """测试数据按更新时间倒序排列"""
         # 更新一条记录的时间

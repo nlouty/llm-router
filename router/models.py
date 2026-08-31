@@ -212,6 +212,7 @@ class Whitelist(models.Model):
     employee_no = models.CharField(max_length=50, blank=True, default="")
     user_name = models.CharField(max_length=100, blank=True, default="")
     is_allowed = models.IntegerField(blank=True, null=True)
+    expire_time = models.DateTimeField(blank=True, null=True)
     update_time = models.DateTimeField(blank=True, null=True)
 
     class Meta:
