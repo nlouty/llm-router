@@ -232,6 +232,8 @@ ALTER TABLE requests ADD COLUMN router_result VARCHAR(300) NULL;
 ALTER TABLE requests ADD COLUMN estimate_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE requests ADD COLUMN model_choosing_latency BIGINT NULL;
 ALTER TABLE requests ADD COLUMN ttft BIGINT NULL;
+ALTER TABLE requests ADD COLUMN prefill_latency BIGINT NULL;
+ALTER TABLE requests ADD COLUMN decode_latency BIGINT NULL;
 ALTER TABLE requests ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE requests ADD COLUMN session VARCHAR(255) NULL;
 ```
@@ -249,6 +251,8 @@ ALTER TABLE requests ADD COLUMN session VARCHAR(255) NULL;
 `model_choosing_latency` stores elapsed milliseconds from request receipt (`send_time`) to the first send of the request to an LLM server (the prefill probe for pd-disaggregation requests). It is recorded once per request, on the first dispatch, for every request that reaches a server — not only auto-routed ones; requests that fail before dispatch (e.g. no candidates, blocked) leave it NULL. `ttft - model_choosing_latency` is therefore the LLM-side time to first token as observed by the router.
 
 `ttft` stores time-to-first-token in milliseconds, measured from request receipt (`send_time`). For streaming requests it ends at the first non-empty chunk received from the upstream server — for pd-disaggregation streaming requests this includes the prefill phase. For non-streaming pd-disaggregation requests it ends when the prefill probe completes (the probe generates exactly one token, so that completion is the first-token moment; see `_normal_decode` in `proxy_pd_forward.py` and `_stream_success` in `proxy.py`). Single-node non-streaming requests leave it NULL.
+
+`prefill_latency` and `decode_latency` split pd-disaggregation upstream processing time into its two phases, in milliseconds; single-node requests leave both NULL. `prefill_latency` is the wall time of the prefill probe (probe dispatch to probe response) and is persisted the moment prefill completes — together with `input_token_cnt`/`final_prefix_cache`, whose values are equally final at that point — so it survives a later decode failure. It stays NULL when prefill itself never completed. `decode_latency` is the wall time of the decode phase, from the first decoder dispatch to the terminal end of the phase (success, upstream error, timeout, or client disconnect), including KV-transfer wait, decoder re-selection, and all recompute rounds; it is persisted when the phase ends, whatever the outcome. Both record the last PD attempt — a retry overwrites them with the new attempt's phases. For profiling, `ttft - model_choosing_latency - prefill_latency` on a streaming PD row is the KV-transfer + decoder-queue + recompute overhead before the first delivered token.
 
 `session` stores the client session id extracted from the request headers (`x-session-id` and friends; see `router/utils/session.py`), capped at 255 chars, `NULL` when absent. Auto-routing uses it for session-sticky model selection (the most recent committed `router_result` for the session wins within a one-hour window). The `idx_requests_session_send` index on `(session, send_time)` backs that lookup and is declared in `RequestRecord._meta.indexes`; `check_db_schema` creates it when missing.
 

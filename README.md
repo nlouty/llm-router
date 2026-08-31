@@ -64,7 +64,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - `processing` row inserted at proxy start; admission denials inserted directly as `failed`
   - Per-attempt update of `attempt_count`, `target_pod_ip`, `prefix_cache` (best match ratio), `last_match` (matched request id)
   - Final state: `end_time`, `latency`, `status`, `task_status` (`success` / `failed` / `agent_disconnected` / `incomplete`), token counts, cached-token counts when the upstream reports them
-  - Auto-routing metadata: `router_result` and `estimate_tokens`; timing: `model_choosing_latency` (request receipt to first upstream send) and `ttft` (request receipt to first token; streaming and pd-disaggregation requests). Internal routing LLM calls are recorded as separate `ip_id = 0` rows
+  - Auto-routing metadata: `router_result` and `estimate_tokens`; timing: `model_choosing_latency` (request receipt to first upstream send), `ttft` (request receipt to first token; streaming and pd-disaggregation requests), and pd-disaggregation phase timings `prefill_latency` / `decode_latency`. Internal routing LLM calls are recorded as separate `ip_id = 0` rows
   - Per-request log file under `log_path/YYYY/MM/DD/HH/MM/<id>.log`; every event line is prefixed with `[YYYY-MM-DD HH:MM:SS.mmm]` (the configured `TIME_ZONE`, same clock as the folder buckets). `start_prod.sh` uses `/data/router_log` with verbose request logging off, while `start_test.sh` uses `.logs/requests` and records the full request body as pretty JSON
   - Stale `processing` cleanup flips rows to `incomplete` and decrements workload counters
 
