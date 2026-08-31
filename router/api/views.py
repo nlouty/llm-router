@@ -28,6 +28,7 @@ from router.models import Model, Server, ServerOperation
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
 from router.repositories.user_ips import UserIPRepository
+from router.repositories.whitelist import WhitelistRepository
 from router.services.cmdb import CMDBService
 
 DOWNLOAD_FILE_PATH = Path("/home/AI_Assistant/AI_Assistant.exe")
@@ -61,6 +62,29 @@ def register_apikey(request):
     if UserIPRepository.get_active_apikey_by_employee_no(employee_no):
         return JsonResponse(
             {"code": 409, "error": "employee already has an active apikey"}, status=409
+        )
+
+    # Whitelisted employees bypass CMDB: CMDB sometimes fails to resolve a
+    # department, and a whitelist entry (while unexpired) is enough to trust
+    # the employee. Insert the row directly with department_id = 0 before the
+    # CMDB sync runs; the sync overwrites the department once CMDB can
+    # resolve one (rows without CMDB data are skipped there).
+    whitelist_row = WhitelistRepository.get_active_by_employee_no(employee_no)
+    if whitelist_row is not None:
+        UserIPRepository.create_or_update_apikey(
+            apikey,
+            employee_no,
+            user_name=whitelist_row.user_name,
+            department_id=0,
+        )
+        return JsonResponse(
+            {
+                "code": 200,
+                "message": "success",
+                "data": {
+                    "employee_no": employee_no,
+                },
+            }
         )
 
     try:

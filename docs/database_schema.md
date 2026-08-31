@@ -55,10 +55,18 @@ ALTER TABLE ips ADD COLUMN concurrent_multiplier DOUBLE PRECISION NOT NULL DEFAU
 `departments.is_allowed`, `user_ips.department_id`, and `whitelist.is_allowed` form the permission chain:
 
 ```text
-user_ips -> departments.is_allowed -> whitelist.is_allowed
+user_ips -> departments.is_allowed -> whitelist (expire_time, user_name)
 ```
 
-When `admission.allow_when_user_info_missing` is true, missing `user_ips` data does not block the request.
+`whitelist` entries are due-time limited: an entry grants access only while `is_allowed = 1` and before `expire_time` (`NULL` = never expires). Admission matches a whitelist entry by `employee_no`, or by `user_name` against `user_ips.user_charge` (the person in charge CMDB recorded for the IP — some IPs resolve a `user_charge` but no department, leaving `department_id` NULL).
+
+Complete identities (a `user_ips` row with `employee_no` and a resolvable department) follow the department chain; an explicitly disallowed department is denied unless whitelisted. Incomplete identities — no `user_ips` row for the IP, no `employee_no`, or a department CMDB could not resolve (NULL, unknown id, or the whitelist apikey-bypass `0`) — are rescued only by the whitelist, then by `admission.allow_when_user_info_missing`. Registered API keys skip the permission check entirely (a valid key authorizes on its own).
+
+Whitelisted employees may also register an apikey without CMDB (`POST /api/apikey`): the `user_ips` apikey row is inserted directly with `department_id = 0`, and the CMDB sync overwrites the department once CMDB can resolve one.
+
+```sql
+ALTER TABLE whitelist ADD COLUMN expire_time TIMESTAMPTZ NULL;
+```
 
 ### API-Key Identity Foundation
 

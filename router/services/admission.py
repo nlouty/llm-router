@@ -36,18 +36,46 @@ class AdmissionService:
         self.auto_max_tokens = int(APP_CONFIG.get("proxy", {}).get("auto_max_tokens", 40000))
 
     def check_permission(self, identity) -> AdmissionResult:
-        if not identity.has_employee:
+        """Permission decision for a non-apikey identity.
+
+        Complete identities (``user_ips`` row with ``employee_no`` and a
+        resolvable department) follow the department chain: an allowed
+        department passes, otherwise the whitelist decides. Incomplete
+        identities (no ``user_ips`` row, no ``employee_no``, or a department
+        CMDB could not resolve — NULL or unknown, including the
+        whitelist-bypass ``0``) are rescued only by the whitelist, then by
+        ``admission.allow_when_user_info_missing``.
+        """
+        if self._user_info_incomplete(identity):
+            if self._whitelist_allows(identity):
+                return AdmissionResult(True)
             return AdmissionResult(True) if self.allow_missing_user_info else self._permission_denied()
-        if identity.department_id is None:
-            return AdmissionResult(True)
+
         department = DepartmentRepository.get(identity.department_id)
-        if department is None:
+        if department is not None and department.is_allowed == 1:
             return AdmissionResult(True)
-        if department.is_allowed == 1:
-            return AdmissionResult(True)
-        if WhitelistRepository.is_allowed(identity.employee_no):
+        if self._whitelist_allows(identity):
             return AdmissionResult(True)
         return self._permission_denied()
+
+    @staticmethod
+    def _user_info_incomplete(identity) -> bool:
+        if identity.user_ip_id == 0:
+            # The IP has no user_ips row (CMDB does not know it).
+            return True
+        if not identity.has_employee:
+            return True
+        if identity.department_id is None:
+            return True
+        # A department_id that resolves to no departments row (0 from the
+        # whitelist apikey bypass, or a stale id) counts as unresolved too.
+        return DepartmentRepository.get(identity.department_id) is None
+
+    @staticmethod
+    def _whitelist_allows(identity) -> bool:
+        if WhitelistRepository.is_allowed(identity.employee_no):
+            return True
+        return bool(identity.user_charge) and WhitelistRepository.is_allowed_user_name(identity.user_charge)
 
     def check_max_tokens(self, requested: int | None, model: Model | None, is_auto: bool = False) -> AdmissionResult:
         if requested is None:

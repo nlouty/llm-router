@@ -1,9 +1,11 @@
 import json
+from datetime import timedelta
 
 import pytest
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 
-from router.models import UserIP
+from router.models import UserIP, Whitelist
 from router.repositories.user_ips import UserIPRepository
 from router.services.cmdb import CMDBService
 
@@ -127,6 +129,65 @@ def test_register_apikey_rejects_duplicate_employee(client):
 
     assert response.status_code == 409
     assert response.json()["error"] == "employee already has an active apikey"
+
+
+# --- whitelist bypass (issue #281) ---
+
+
+@pytest.mark.django_db
+def test_whitelisted_employee_registers_without_cmdb(client, monkeypatch):
+    def fail(self, apikey, employee_no):
+        pytest.fail("CMDB must not be called for a whitelisted employee")
+
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", fail)
+    Whitelist.objects.create(
+        employee_no="E001", user_name="Alice", is_allowed=1, update_time=timezone.now()
+    )
+
+    response = _post(client)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 200, "message": "success", "data": {"employee_no": "E001"}}
+    row = UserIP.objects.get(apikey="key-1")
+    assert row.employee_no == "E001"
+    assert row.ip_id == 0
+    assert row.department_id == 0
+    assert row.user_name == "Alice"
+    assert row.is_valid is True
+
+
+@pytest.mark.django_db
+def test_expired_whitelist_entry_falls_back_to_cmdb(client):
+    Whitelist.objects.create(
+        employee_no="E001",
+        is_allowed=1,
+        expire_time=timezone.now() - timedelta(hours=1),
+        update_time=timezone.now(),
+    )
+
+    response = _post(client)
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "API key registration is not implemented"
+
+
+@pytest.mark.django_db
+def test_disallowed_whitelist_entry_falls_back_to_cmdb(client):
+    Whitelist.objects.create(employee_no="E001", is_allowed=0, update_time=timezone.now())
+
+    response = _post(client)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_whitelisted_employee_still_rejects_duplicate(client):
+    Whitelist.objects.create(employee_no="E001", is_allowed=1, update_time=timezone.now())
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001")
+
+    response = _post(client, apikey="key-2")
+
+    assert response.status_code == 409
 
 
 @pytest.mark.django_db
