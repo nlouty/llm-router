@@ -380,6 +380,7 @@ class PDForwardService:
         # The prefill probe generates exactly one token (max_tokens=1), so its
         # completion is the request's first-token moment.
         prefill_ttft = int((timezone.now() - record.send_time).total_seconds() * 1000)
+        prefill_ms = int((time.monotonic() - prefill_start) * 1000)
 
         append_request_log(record.id, json.dumps({
             "event": "pd_prefill_success",
@@ -388,17 +389,19 @@ class PDForwardService:
             "cached_tokens": cached_tokens,
             "prefix_cache_ratio": round(cached_tokens / prompt_tokens, 4) if prompt_tokens else 0.0,
             "has_kv_params": bool(kv_params),
-            "elapsed_ms": int((time.monotonic() - prefill_start) * 1000),
+            "elapsed_ms": prefill_ms,
             "ttft_ms": prefill_ttft,
         }, ensure_ascii=False))
 
         # Prefill succeeded: release prefiller and transition to neutral "processing".
         # cached_tokens is authoritative from the prefiller and fixed at this point, so
         # persist final_prefix_cache now alongside input_token_cnt rather than at decode end.
+        # prefill_latency is equally final here, so it persists even if decode later fails.
         record.task_status = "processing"
         record.input_token_cnt = prompt_tokens
         record.final_prefix_cache = cached_tokens
-        record.save(update_fields=["task_status", "input_token_cnt", "final_prefix_cache"])
+        record.prefill_latency = prefill_ms
+        record.save(update_fields=["task_status", "input_token_cnt", "final_prefix_cache", "prefill_latency"])
         self._release_prefiller(prefiller)
 
         if is_stream:
@@ -410,10 +413,18 @@ class PDForwardService:
                     state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
                 )
             )
-        return self._normal_decode(
-            path, headers, body, record, context, served_as_vip, model,
-            state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip, prefill_ttft,
-        )
+        decode_start = time.monotonic()
+        try:
+            return self._normal_decode(
+                path, headers, body, record, context, served_as_vip, model,
+                state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip, prefill_ttft,
+            )
+        finally:
+            # Decode phase ended (success, error, or retry handoff): the wall
+            # time covers KV-transfer wait, decoder (re)selection and all
+            # recompute rounds. A retry's next attempt overwrites it.
+            record.decode_latency = int((time.monotonic() - decode_start) * 1000)
+            record.save(update_fields=["decode_latency"])
 
     # ------------------------------------------------------------------
     # Phase 1: prefill
@@ -890,6 +901,14 @@ class PDForwardService:
                     pass
             finally:
                 release_current_decoder()
+                try:
+                    # Decode phase ended (success, error, or disconnect): mirror
+                    # the non-stream phase save in forward(). Best-effort, like
+                    # the unhandled-exception guard above.
+                    record.decode_latency = int((time.monotonic() - request_start) * 1000)
+                    record.save(update_fields=["decode_latency"])
+                except Exception:
+                    logger.exception("failed to persist decode_latency for request %s", record.id)
                 flush_request_log(record.id)
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")

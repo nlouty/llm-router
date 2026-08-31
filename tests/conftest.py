@@ -67,6 +67,10 @@ def api_test_tables(django_db_setup, django_db_blocker):
                 schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("model_choosing_latency"))
             if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "ttft"):
                 schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("ttft"))
+            # PD phase-latency columns
+            for col in ("prefill_latency", "decode_latency"):
+                if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", col):
+                    schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field(col))
             if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "vip"):
                 schema_editor.add_field(RequestRecord, RequestRecord._meta.get_field("vip"))
             if RequestRecord._meta.db_table in connection.introspection.table_names() and not has_column("requests", "session"):
