@@ -3,7 +3,7 @@ from datetime import timedelta
 import pytest
 from django.utils import timezone
 
-from router.models import Department, Whitelist
+from router.models import Department, UserIP, Whitelist
 from router.services.admission import AdmissionService
 from router.services.identity import RequestIdentity
 
@@ -193,3 +193,64 @@ def test_whitelist_cannot_rescue_an_ip_without_user_ips_row():
     identity = _identity()
 
     assert not _service(strict=True).check_permission(identity).allowed
+
+
+# --- apikey registration verification (department, then whitelist) ---
+
+
+def _user_ip(employee_no="E001", department_id=None, user_charge=""):
+    return UserIP(
+        ip_id=0,
+        apikey="key-1",
+        employee_no=employee_no,
+        department_id=department_id,
+        user_charge=user_charge,
+    )
+
+
+@pytest.mark.django_db
+def test_verify_apikey_registration_allows_allowed_department():
+    dept = _allowed_department()
+
+    assert AdmissionService.verify_apikey_registration(_user_ip(department_id=dept.id))
+
+
+@pytest.mark.django_db
+def test_verify_apikey_registration_denies_denied_department():
+    dept = _denied_department()
+
+    assert not AdmissionService.verify_apikey_registration(_user_ip(department_id=dept.id))
+
+
+@pytest.mark.django_db
+def test_verify_apikey_registration_denies_missing_department():
+    assert not AdmissionService.verify_apikey_registration(_user_ip(department_id=None))
+    # An id no departments row uses (e.g. the whitelist-bypass 0) fails too.
+    assert not AdmissionService.verify_apikey_registration(_user_ip(department_id=0))
+
+
+@pytest.mark.django_db
+def test_verify_apikey_registration_whitelist_employee_no_rescues():
+    dept = _denied_department()
+    _whitelist(employee_no="E001")
+
+    assert AdmissionService.verify_apikey_registration(_user_ip(department_id=dept.id))
+
+
+@pytest.mark.django_db
+def test_verify_apikey_registration_whitelist_user_charge_rescues():
+    # user_ips.user_charge is matched against whitelist.user_name.
+    dept = _denied_department()
+    _whitelist(employee_no="E999", user_name="Alice")
+
+    assert AdmissionService.verify_apikey_registration(
+        _user_ip(department_id=dept.id, user_charge="Alice")
+    )
+
+
+@pytest.mark.django_db
+def test_verify_apikey_registration_expired_whitelist_does_not_rescue():
+    dept = _denied_department()
+    _whitelist(employee_no="E001", expire_time=timezone.now() - timedelta(hours=1))
+
+    assert not AdmissionService.verify_apikey_registration(_user_ip(department_id=dept.id))

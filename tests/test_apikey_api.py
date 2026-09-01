@@ -5,9 +5,13 @@ import pytest
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from router.models import UserIP, Whitelist
+from router.models import Department, UserIP, Whitelist
 from router.repositories.user_ips import UserIPRepository
 from router.services.cmdb import CMDBService
+
+
+def _allowed_department() -> Department:
+    return Department.objects.create(dept1="allowed-dept", is_allowed=1)
 
 
 def _post(client, apikey="key-1", employee_no="E001"):
@@ -41,10 +45,13 @@ def test_public_cmdb_adapter_returns_404(client):
 @pytest.mark.django_db
 def test_register_apikey_delegates_write_to_cmdb(client, monkeypatch):
     calls = []
+    dept = _allowed_department()
 
     def fetch_and_save(self, apikey, employee_no):
         calls.append((apikey, employee_no))
-        UserIP.objects.create(ip_id=0, apikey=apikey, employee_no=employee_no)
+        UserIP.objects.create(
+            ip_id=0, apikey=apikey, employee_no=employee_no, department_id=dept.id
+        )
 
     monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", fetch_and_save)
 
@@ -239,11 +246,14 @@ def test_invalidate_apikey_missing_returns_404(client):
 
 @pytest.mark.django_db
 def test_invalidate_then_rotate(client, monkeypatch):
-    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001")
+    dept = _allowed_department()
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001", department_id=dept.id)
     _invalidate(client, "E001")
 
     def fetch_and_save(self, apikey, employee_no):
-        UserIP.objects.create(ip_id=0, apikey=apikey, employee_no=employee_no)
+        UserIP.objects.create(
+            ip_id=0, apikey=apikey, employee_no=employee_no, department_id=dept.id
+        )
 
     monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", fetch_and_save)
 
@@ -251,3 +261,86 @@ def test_invalidate_then_rotate(client, monkeypatch):
 
     assert response.status_code == 200
     assert UserIP.objects.filter(apikey="key-2", employee_no="E001").exists()
+
+
+# --- registration-time department/whitelist verification ---
+
+
+def _cmdb_saving(department_id, user_charge=""):
+    def fetch_and_save(self, apikey, employee_no):
+        UserIP.objects.create(
+            ip_id=0,
+            apikey=apikey,
+            employee_no=employee_no,
+            department_id=department_id,
+            user_charge=user_charge,
+        )
+
+    return fetch_and_save
+
+
+@pytest.mark.django_db
+def test_register_apikey_with_denied_department_returns_403_and_invalidates(client, monkeypatch):
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", _cmdb_saving(dept.id))
+
+    response = _post(client)
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "department is not allowed and employee is not whitelisted"
+    # The row is kept but soft-invalidated: the key exists yet cannot authenticate.
+    row = UserIP.objects.get(apikey="key-1", employee_no="E001")
+    assert row.is_valid is False
+    assert UserIPRepository.get_active_apikey_by_employee_no("E001") is None
+
+
+@pytest.mark.django_db
+def test_register_apikey_with_unresolvable_department_returns_403(client, monkeypatch):
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", _cmdb_saving(None))
+
+    response = _post(client)
+
+    assert response.status_code == 403
+    assert UserIP.objects.get(apikey="key-1").is_valid is False
+
+
+@pytest.mark.django_db
+def test_register_apikey_denied_department_whitelist_employee_rescued(client, monkeypatch):
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    Whitelist.objects.create(employee_no="E001", is_allowed=1, update_time=timezone.now())
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", _cmdb_saving(dept.id))
+
+    response = _post(client)
+
+    assert response.status_code == 200
+    assert UserIP.objects.get(apikey="key-1").is_valid is True
+
+
+@pytest.mark.django_db
+def test_register_apikey_denied_department_whitelist_user_charge_rescued(client, monkeypatch):
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    # user_ips.user_charge is matched against whitelist.user_name, not employee_no.
+    Whitelist.objects.create(employee_no="E999", user_name="Alice", is_allowed=1, update_time=timezone.now())
+    monkeypatch.setattr(
+        CMDBService, "fetch_and_save_apikey", _cmdb_saving(dept.id, user_charge="Alice")
+    )
+
+    response = _post(client)
+
+    assert response.status_code == 200
+    assert UserIP.objects.get(apikey="key-1").is_valid is True
+
+
+@pytest.mark.django_db
+def test_deactivated_employee_slot_can_be_re_registered(client, monkeypatch):
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    allowed = _allowed_department()
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", _cmdb_saving(dept.id))
+    assert _post(client).status_code == 403
+
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", _cmdb_saving(allowed.id))
+
+    response = _post(client, apikey="key-2")
+
+    assert response.status_code == 200
+    assert UserIP.objects.get(apikey="key-2", employee_no="E001").is_valid is True

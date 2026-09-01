@@ -8,7 +8,7 @@ from typing import ClassVar
 from django.utils import timezone
 
 from router.config import APP_CONFIG
-from router.models import Ips, Model
+from router.models import Ips, Model, UserIP
 from router.repositories.departments import DepartmentRepository
 from router.repositories.requests import RequestRepository
 from router.repositories.whitelist import WhitelistRepository
@@ -57,6 +57,25 @@ class AdmissionService:
         if self._whitelist_allows(identity):
             return AdmissionResult(True)
         return self._permission_denied()
+
+    @staticmethod
+    def verify_apikey_registration(user_ip: UserIP) -> bool:
+        """Registration-time permission check for a CMDB-synced apikey row.
+
+        CMDB reports the employee's ``user_name``/``user_charge``/department
+        but does not know whether that department may use the router, so the
+        decision is made here: an allowed department passes, otherwise the
+        whitelist rescues — ``user_ips.employee_no`` against
+        ``whitelist.employee_no``, or ``user_ips.user_charge`` against
+        ``whitelist.user_name`` (only while the entry is allowed and
+        unexpired). Both failing means the caller must invalidate the key.
+        """
+        department = DepartmentRepository.get(user_ip.department_id)
+        if department is not None and department.is_allowed == 1:
+            return True
+        if WhitelistRepository.is_allowed(user_ip.employee_no):
+            return True
+        return bool(user_ip.user_charge) and WhitelistRepository.is_allowed_user_name(user_ip.user_charge)
 
     @staticmethod
     def _user_info_incomplete(identity) -> bool:

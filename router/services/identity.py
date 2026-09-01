@@ -16,6 +16,10 @@ class RequestIdentity:
     ``user_charge`` is the person-in-charge name from the ``user_ips`` row
     (matched against ``whitelist.user_name`` by admission), or empty.
     ``is_vip`` is True only when the backing ``user_ips`` row is VIP.
+    ``invalid_apikey`` is True when the request presented a Bearer key that
+    exists in ``user_ips`` but is no longer valid (``is_valid = false``);
+    such keys are refused by the proxy instead of silently downgrading to
+    the weaker IP-based admission.
     """
 
     ip: Ips
@@ -25,6 +29,7 @@ class RequestIdentity:
     is_vip: bool
     is_apikey: bool
     user_charge: str = ""
+    invalid_apikey: bool = False
 
     @property
     def has_employee(self) -> bool:
@@ -50,6 +55,19 @@ class IdentityService:
             user_ip = UserIPRepository.get_active_by_apikey(apikey)
             if user_ip is not None:
                 return IdentityService._identity_from(ip, user_ip, is_apikey=True)
+            if UserIPRepository.get_by_apikey(apikey) is not None:
+                # Known but invalidated key (failed the department/whitelist
+                # check at registration): refuse it below instead of falling
+                # back to the IP identity, which a weaker path could allow.
+                return RequestIdentity(
+                    ip=ip,
+                    user_ip_id=0,
+                    employee_no="",
+                    department_id=None,
+                    is_vip=False,
+                    is_apikey=False,
+                    invalid_apikey=True,
+                )
 
         user_ip = UserIPRepository.get_by_ip_id(ip.id)
         if user_ip is not None:
