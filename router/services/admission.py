@@ -30,7 +30,11 @@ class AdmissionService:
     _cleanup_throttle_seconds: ClassVar[int] = 10
 
     def __init__(self):
-        self.allow_missing_user_info = bool(APP_CONFIG.get("admission", {}).get("allow_when_user_info_missing", True))
+        admission_config = APP_CONFIG.get("admission", {})
+        self.allow_missing_user_info = bool(admission_config.get("allow_when_user_info_missing", True))
+        self.missing_user_info_message = admission_config.get(
+            "user_info_missing_message", "Access denied, you do not have permission"
+        )
         self.stale_minutes = int(APP_CONFIG.get("proxy", {}).get("stale_processing_minutes", 20))
         self.unknown_model_max_tokens = int(APP_CONFIG.get("proxy", {}).get("unknown_model_max_tokens", 20480))
         self.auto_max_tokens = int(APP_CONFIG.get("proxy", {}).get("auto_max_tokens", 40000))
@@ -44,12 +48,17 @@ class AdmissionService:
         identities (no ``user_ips`` row, no ``employee_no``, or a department
         CMDB could not resolve — NULL or unknown, including the
         whitelist-bypass ``0``) are rescued only by the whitelist, then by
-        ``admission.allow_when_user_info_missing``.
+        ``admission.allow_when_user_info_missing``; a denial from that toggle
+        carries ``admission.user_info_missing_message``.
         """
         if self._user_info_incomplete(identity):
             if self._whitelist_allows(identity):
                 return AdmissionResult(True)
-            return AdmissionResult(True) if self.allow_missing_user_info else self._permission_denied()
+            return (
+                AdmissionResult(True)
+                if self.allow_missing_user_info
+                else self._permission_denied(self.missing_user_info_message)
+            )
 
         department = DepartmentRepository.get(identity.department_id)
         if department is not None and department.is_allowed == 1:
@@ -226,5 +235,5 @@ class AdmissionService:
         return row.get("model_id") == model_id
 
     @staticmethod
-    def _permission_denied() -> AdmissionResult:
-        return AdmissionResult(False, 403, "permission_denied", "Access denied, you do not have permission")
+    def _permission_denied(message: str = "Access denied, you do not have permission") -> AdmissionResult:
+        return AdmissionResult(False, 403, "permission_denied", message)

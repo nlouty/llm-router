@@ -163,6 +163,31 @@ def test_row_with_unresolvable_department_zero_follows_toggle():
 
 
 @pytest.mark.django_db
+def test_strict_denial_uses_configured_message():
+    service = _service(strict=True)
+    service.missing_user_info_message = "Custom denial message"
+
+    result = service.check_permission(_identity())
+
+    assert result.status_code == 403
+    assert result.error_type == "permission_denied"
+    assert result.message == "Custom denial message"
+
+
+@pytest.mark.django_db
+def test_department_denial_keeps_default_message():
+    dept = _denied_department()
+    service = AdmissionService()
+    service.missing_user_info_message = "Custom denial message"
+    identity = _identity(user_ip_id=1, employee_no="E001", department_id=dept.id)
+
+    result = service.check_permission(identity)
+
+    assert result.status_code == 403
+    assert result.message == "Access denied, you do not have permission"
+
+
+@pytest.mark.django_db
 def test_whitelisted_user_charge_rescues_missing_department_when_strict():
     _whitelist(employee_no="E999", user_name="Alice")
     identity = _identity(user_ip_id=1, employee_no="E001", department_id=None, user_charge="Alice")
