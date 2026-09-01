@@ -75,6 +75,8 @@ ALTER TABLE whitelist ADD COLUMN expire_time TIMESTAMPTZ NULL;
 
 `user_ips` supports separate IP-backed and API-key-backed rows. An IP-backed row has `ip_id > 0` and an empty `apikey`; an API-key-backed row has `ip_id = 0` and a nonempty `apikey`. Nonzero IP IDs and nonempty API keys are individually unique, and an employee can have only one active API-key row.
 
+`employee_no` resolution is apikey-first (issue #287): a valid Bearer key makes the API-key-backed row the identity and its `employee_no` wins over the IP-backed row's. A key row stored without an `employee_no` (e.g. inserted directly rather than via `/api/apikey`) borrows the IP-backed row's `employee_no`, so admission, whitelist matching and external-provider routing still resolve one. A Bearer key matching no `user_ips` row falls back to the IP-backed identity — unchanged behavior, but now with a warning logged, since a client presenting an unknown credential is almost always a misconfiguration.
+
 `user_ips.vip` now drives identity-based VIP routing: a request carrying a VIP `user_ips` row (apikey- or IP-backed) is routed through the VIP server pool on the normal port. `ips.vip` still gates VIP-port admission. VIP load accounting uses `requests.vip` (set for VIP-channel and VIP-identity requests); the old `requests.user_ip_id = 2` sentinel is retired. `requests.user_ip_id` now holds the real backing `user_ips.id`, or `0` when no identity resolves.
 
 Before applying the schema change, these preflight queries must return no rows:

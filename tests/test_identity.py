@@ -46,6 +46,63 @@ def test_resolve_apikey_identity():
 
 
 @pytest.mark.django_db
+def test_apikey_employee_no_wins_over_ip_row():
+    # Issue #287: when both an apikey-backed and an IP-backed row exist, the
+    # key row is the identity and its employee_no takes precedence.
+    ip = Ips.objects.create(ip="10.0.0.1")
+    UserIP.objects.create(ip_id=ip.id, employee_no="IP-EMP")
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="KEY-EMP")
+
+    identity = IdentityService.resolve(_request_with_auth("Bearer key-1"), ip)
+
+    assert identity.is_apikey is True
+    assert identity.employee_no == "KEY-EMP"
+
+
+@pytest.mark.django_db
+def test_apikey_row_without_employee_no_borrows_ip_row_employee_no():
+    # Issue #287 field report: a key row stored without an employee_no borrows
+    # the IP-backed row's so admission/whitelist/external routing resolve one.
+    ip = Ips.objects.create(ip="10.0.0.2")
+    UserIP.objects.create(ip_id=ip.id, employee_no="IP-EMP")
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="")
+
+    identity = IdentityService.resolve(_request_with_auth("Bearer key-1"), ip)
+
+    assert identity.is_apikey is True
+    # The key row is still the identity (user_ip_id points at it).
+    assert identity.user_ip_id == UserIP.objects.get(apikey="key-1").id
+    assert identity.employee_no == "IP-EMP"
+
+
+@pytest.mark.django_db
+def test_apikey_row_without_employee_no_and_no_ip_row():
+    ip = Ips.objects.create(ip="10.0.0.3")
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="")
+
+    identity = IdentityService.resolve(_request_with_auth("Bearer key-1"), ip)
+
+    assert identity.is_apikey is True
+    assert identity.employee_no == ""
+    assert identity.has_employee is False
+
+
+@pytest.mark.django_db
+def test_unknown_bearer_key_logs_the_ip_fallback(caplog):
+    # An unknown key silently downgrading to the IP identity was hard to
+    # diagnose in the field; the fallback still happens but is now logged.
+    ip = Ips.objects.create(ip="10.0.0.4")
+    UserIP.objects.create(ip_id=ip.id, employee_no="IP-EMP")
+
+    with caplog.at_level("WARNING", logger="router.services.identity"):
+        identity = IdentityService.resolve(_request_with_auth("Bearer no-such-key"), ip)
+
+    assert identity.is_apikey is False
+    assert identity.employee_no == "IP-EMP"
+    assert any("unknown Bearer apikey" in message for message in caplog.messages)
+
+
+@pytest.mark.django_db
 def test_resolve_bearer_prefix_is_case_insensitive():
     ip = Ips.objects.create(ip="10.0.0.1")
     UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001")

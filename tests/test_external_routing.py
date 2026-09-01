@@ -628,6 +628,62 @@ class TestAccounting:
 
 
 @pytest.mark.django_db
+class TestApikeyIdentity:
+    """Issue #287 field report: Bearer-apikey identities must divert exactly
+    like IP-backed identities. employee_no comes from the apikey row, or from
+    the IP-backed row when the key row has none."""
+
+    def test_apikey_identity_diverts_externally(self, monkeypatch):
+        ip = Ips.objects.create(ip=CLIENT_IP)
+        UserIP.objects.create(ip_id=ip.id, employee_no=EMPLOYEE, user_name="Ip Row")
+        key_row = UserIP.objects.create(ip_id=0, apikey="sk-user", employee_no=EMPLOYEE)
+        seed_route()
+        seed_mapping()
+        seed_internal_model("glm-5.2")
+
+        calls = []
+        patch_upstream(monkeypatch, calls, FakeUpstream(content=ok_body()))
+
+        response = Client().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Bearer sk-user",
+        )
+
+        assert response.status_code == 200
+        assert calls[0]["url"] == f"{PROVIDER_URL}/chat/completions"
+        headers = {k.lower(): v for k, v in calls[0]["kwargs"]["headers"].items()}
+        # The provider key (not the client's router apikey) goes upstream.
+        assert headers["authorization"] == "Bearer sk-emp-1"
+        record = RequestRecord.objects.last()
+        assert record.router_result == "external:vendor-a:glm-5.2"
+        assert record.user_ip_id == key_row.id
+
+    def test_apikey_row_without_employee_no_borrows_ip_row(self, monkeypatch):
+        ip = Ips.objects.create(ip=CLIENT_IP)
+        UserIP.objects.create(ip_id=ip.id, employee_no=EMPLOYEE)
+        UserIP.objects.create(ip_id=0, apikey="sk-user", employee_no="")
+        seed_route()
+        seed_mapping()
+        seed_internal_model("glm-5.2")
+
+        calls = []
+        patch_upstream(monkeypatch, calls, FakeUpstream(content=ok_body()))
+
+        response = Client().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Bearer sk-user",
+        )
+
+        assert response.status_code == 200
+        assert calls[0]["url"] == f"{PROVIDER_URL}/chat/completions"
+        assert RequestRecord.objects.last().router_result == "external:vendor-a:glm-5.2"
+
+
+@pytest.mark.django_db
 class TestModelsCapability:
     def test_mapped_employee_catalog_merges_provider_models(self):
         seed_identity()
