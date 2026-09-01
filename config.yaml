@@ -57,6 +57,7 @@ opencode:
 
 admission:
   allow_when_user_info_missing: true
+  user_info_missing_message: "Access denied, you do not have permission"
 
 tokenizer:
   enabled: false

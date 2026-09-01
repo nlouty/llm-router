@@ -63,7 +63,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "block_max_version": "1.2.26",
     },
-    "admission": {"allow_when_user_info_missing": True},
+    "admission": {
+        "allow_when_user_info_missing": True,
+        "user_info_missing_message": "Access denied, you do not have permission",
+    },
     "tokenizer": {"enabled": False},
     "cmdb": {"enabled": False, "dummy": True, "refresh_interval_between_ips_seconds": 1},
     "database": {
