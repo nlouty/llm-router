@@ -23,8 +23,9 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_context_overflow.py` | Context-overflow retry to a same-model larger-window server; no model switch; real error surfaces when exhausted |
 | `test_disconnect.py` | `DisconnectWatcher` event/callback semantics |
 | `test_errors.py` | Error payload shape and SSE timeout event format |
-| `test_external_routing.py` | External-provider routing (issue #287): mapping resolution, body/API-key rewrite, provider-only names, auto-entrance divert, VIP gating, provider circuit breaker, streaming, concurrency invisibility, and `/v1/models` merge |
+| `test_external_routing.py` | External-provider routing (issue #287): mapping resolution, body/API-key rewrite, provider-only names, auto-entrance divert, apikey-identity diversion, VIP gating, provider circuit breaker, streaming, concurrency invisibility, and `/v1/models` merge |
 | `test_headers.py` | Request-header filtering (hop-by-hop + bodyless `Content-Type`) |
+| `test_identity.py` | Identity resolution: apikey-first employee_no precedence and empty-key-row fallback, IP fallback for unknown Bearer keys, invalid-key refusal, admission bypass, CMDB provisioning |
 | `test_llm_choosing_timeout.py` | llm-choosing budget: attempt socket timeouts clamped to the remaining budget (single-node + PD), deadline exhaustion skips the upstream and falls back, choosing-request timeouts do not accumulate `consecutive_failures` |
 | `test_manage.py` | `manage.py prod`/`test` argument parsing and DB port selection |
 | `test_management_api.py` | Whitelist upsert messages and `refresh_user_info` thread launch |
