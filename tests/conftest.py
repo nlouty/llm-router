@@ -11,7 +11,7 @@ from django.db import connection
 
 django.setup()
 
-from router.models import Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP, Department, CodehubReview
+from router.models import Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP, Department, CodehubReview, ExternalRoute, ExternalModelMapping
 from router.route_algorithm.prefix_cache_preble import PrefixCachePrebleServerChooser
 
 
@@ -25,7 +25,7 @@ def api_test_tables(django_db_setup, django_db_blocker):
             ):
                 schema_editor.delete_model(UserIP)
                 schema_editor.create_model(UserIP)
-            for model in (Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP, Department, CodehubReview):
+            for model in (Ips, Model, RequestRecord, Server, Whitelist, ServerOperation, MrLiveReview, DailyMrReview, UserIP, Department, CodehubReview, ExternalRoute, ExternalModelMapping):
                 if model._meta.db_table not in existing_tables:
                     schema_editor.create_model(model)
             if Ips._meta.db_table in connection.introspection.table_names() and not has_column("ips", "vip"):
@@ -185,6 +185,8 @@ def clean_api_tables(api_test_tables):
             UserIP.objects.all().delete()
             Department.objects.all().delete()
             CodehubReview.objects.all().delete()
+            ExternalRoute.objects.all().delete()
+            ExternalModelMapping.objects.all().delete()
             break
         except OperationalError:
             if attempt == 2:

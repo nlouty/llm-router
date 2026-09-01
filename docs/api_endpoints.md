@@ -26,6 +26,7 @@ Request handling includes:
 - normal-port small-request routing
 - VIP-channel eligibility and pool scaling
 - retry, circuit breaker, workload accounting, and request lifecycle logging
+- external-provider routing for mapped employees (issue #287): a concrete model name mapped on the employee's provider is forwarded there (model name and API key rewritten); `model: auto` routes internally first and diverts only if the resolved model is mapped. Unmapped names serve internally; VIP-port requests always stay internal
 
 Example:
 
@@ -50,6 +51,8 @@ curl -i http://localhost:8001/v1/chat/completions \
 - `data[].max_output_tokens`: output-token ceiling enforced by admission (`models.max_tokens`; `auto_max_tokens` for `auto`)
 - `data[].concurrent_limit`: effective per-IP concurrency ceiling (base `concurrent_limit` × `ips.concurrent_multiplier`, ×4 during the off-peak boost window); `null` on the VIP port where the concurrency check is skipped
 - top-level `ip`, and `employee_no` when the identity resolved
+
+For an employee with an active external route (issue #287), the normal-port list also merges their provider's mapped model names (owned_by `external:{provider}`) with null capability limits; a mapped name shadows the internal entry, unmapped internal models stay listed, and `auto` is kept. The VIP-port list stays internal-only.
 
 Gateway internals (port, VIP channel state, multiplier, boost window) are deliberately not exposed. Deprecated models (`models.deprecation` set) are hidden on the normal port but listed on the VIP port. The response is OpenAI-compatible (`object: "list"`) so existing clients keep working. Other methods on `/v1/models` keep the legacy behavior: the request is proxied to a random online routable server.
 

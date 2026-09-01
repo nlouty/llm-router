@@ -35,6 +35,7 @@ from router.repositories.servers import ServerRepository
 from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.circuit_breaker import CircuitBreakerService
 from router.services.disconnect import DisconnectWatcher
+from router.services.external_route import ExternalRouteService
 from router.services.opencode import OpencodeVersionService
 from router.services.parser import ParsedRequest, RequestParser
 from router.services import proxy_logging, proxy_response
@@ -119,7 +120,7 @@ class ProxyService:
         # window) within it reuse the first result instead of re-querying.
         self._candidate_cache: dict = {}
 
-    def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False, skip_auto_selection: bool = False):
+    def forward(self, django_request, path: str, parsed, ip_id: int | None, model, user_agent: str | None, is_vip_channel: bool = False, user_ip_id: int = 0, is_identity_vip: bool = False, skip_auto_selection: bool = False, employee_no: str = ""):
         headers = filter_request_headers(dict(django_request.headers), django_request.method)
         normalized = path.rstrip("/")
         session = extract_session_id(dict(django_request.headers)) if normalized == "chat/completions" else None
@@ -142,7 +143,7 @@ class ProxyService:
             }, ensure_ascii=False))
             if normalized == "chat/completions":
                 return self._forward_chat(
-                    django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip, skip_auto_selection
+                    django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel, is_identity_vip, skip_auto_selection, employee_no
                 )
             if normalized == "embeddings":
                 return self._forward_embeddings(
@@ -239,7 +240,7 @@ class ProxyService:
             logger.exception("failed to finish processing record %s after unhandled exception", record.id)
         return error_response(502, "502 Bad Gateway", "server_error")
 
-    def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False, skip_auto_selection: bool = False):
+    def _forward_chat(self, django_request, path, headers, record, ip_id, model, parsed, user_agent, is_vip_channel: bool, is_identity_vip: bool = False, skip_auto_selection: bool = False, employee_no: str = ""):
         auto_model_selection = False
         if not skip_auto_selection:
             auto_model_selection = self.auto_router.should_auto_select(
@@ -267,6 +268,17 @@ class ProxyService:
         model = decision.model
 
         self._count_tokens_after_selection(parsed, record, model)
+
+        # Issue #287: auto routing ran first; if the resolved model is mapped
+        # on the employee's external provider, divert the request there
+        # instead of internal servers. VIP-port requests never go external.
+        if employee_no and not is_vip_channel and model is not None:
+            external = ExternalRouteService().resolve(employee_no, model.model_name)
+            if external is not None:
+                route, mapping = external
+                return self._external_proxy_service().forward_resolved(
+                    django_request, path, headers, record, parsed, route, mapping
+                )
 
         candidates, served_as_vip = self._select_candidates(path, model, is_vip_channel, is_identity_vip)
         if served_as_vip:
@@ -1266,6 +1278,11 @@ class ProxyService:
         from router.services.proxy_pd_forward import PDForwardService
 
         return PDForwardService(self)
+
+    def _external_proxy_service(self):
+        from router.services.external_proxy import ExternalProxyService
+
+        return ExternalProxyService()
 
     @staticmethod
     def _target_identifier(server) -> str | None:

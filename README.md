@@ -84,6 +84,12 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - `POST /api/mr_live_review` and `POST /api/codehub_review` — ingest review records for reporting
   - `GET /api/download/ai_assistant` — download `AI_Assistant.exe`
 
+- **External Provider Routing** (issue #287)
+  - Employees with an active `external_routes` row (matched by `employee_no`) are forwarded to their third-party OpenAI-compatible provider: the request is recorded, the body `model` is rewritten via `external_model_mappings` (`policy_id` grouping; exact match, case-sensitive), and the per-employee provider `api_key` replaces the client credential
+  - Concrete mapped names divert before internal validation (provider-only model names work); `model: auto` and `auto = TRUE` models route internally first and divert only when the (resolved) model is mapped; unmapped names keep the internal pipeline or the standard unknown-model 400
+  - Provider circuit breaker grouped by `base_url` (transport errors and 5xx trip; 4xx passes through): open circuit or `is_active = FALSE` falls routing back to internal servers instantly
+  - VIP-port requests always stay internal; identity VIP does not affect the normal port; `GET /v1/models` merges mapped names (`owned_by: external:<provider>`) for mapped employees
+
 - **Management Commands**
   - `init_db` — validate DB connectivity and required tables
   - `check_db_schema` — diff live schema against Django models; `--fix` emits/executes corrective DDL
@@ -99,7 +105,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - WSGI entrypoint validates DB connectivity on boot; `ClientDisconnectMiddleware` registered globally
 
 - **Tests**
-  - 33 pytest files covering proxy, parser, headers, SSE, errors, auto routing, context overflow, token/context-window filtering, Redis prefix cache, server choosers, circuit breaker, cancellable upstream, disconnect tracking, request logger, requests repository, workload accounting, schema check, management API, downloads, statistics API, MR/CodeHub APIs, opencode policy, manage.py wrapper, config env overrides, and VIP channel
+  - 34 pytest files covering proxy, parser, headers, SSE, errors, external provider routing, auto routing, context overflow, token/context-window filtering, Redis prefix cache, server choosers, circuit breaker, cancellable upstream, disconnect tracking, request logger, requests repository, workload accounting, schema check, management API, downloads, statistics API, MR/CodeHub APIs, opencode policy, manage.py wrapper, config env overrides, and VIP channel
 
 ## Notes
 
