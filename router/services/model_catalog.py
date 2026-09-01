@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from router.config import APP_CONFIG
 from router.models import Ips
+from router.repositories.external import ExternalRouteRepository
 from router.repositories.models import ModelRepository
 from router.repositories.servers import ServerRepository
 from router.services.admission import AdmissionService
@@ -56,6 +57,11 @@ class ModelCatalogService:
         ]
         data = [self._model_entry(model, ip, is_vip_channel) for model in models]
         data.append(self._auto_entry(ip, is_vip_channel))
+        # Issue #287: a mapped employee's effective catalog on the normal port
+        # includes their provider's mapped model names. VIP-port requests never
+        # go external, so the VIP-port catalog stays internal-only.
+        if employee_no and not is_vip_channel:
+            data = self._merge_external_entries(data, employee_no)
 
         payload = {
             "object": "list",
@@ -65,6 +71,41 @@ class ModelCatalogService:
         if employee_no:
             payload["employee_no"] = employee_no
         return payload
+
+    @staticmethod
+    def _merge_external_entries(data: list[dict], employee_no: str) -> list[dict]:
+        """Overlay the employee's provider mappings on the internal list.
+
+        A mapped name shadows the internal entry (the mapping wins at request
+        time); internal models without a mapping stay listed because the
+        router still serves them as fallback. The router enforces no limits
+        for external calls, so mapped entries advertise null capabilities.
+        """
+        route = ExternalRouteRepository.get_active_route(employee_no)
+        if route is None:
+            return data
+        mappings = ExternalRouteRepository.list_enabled_mappings(route.model_mapping_policy)
+        if not mappings:
+            return data
+        mapped_names = {m.internal_model_name.casefold() for m in mappings}
+        data = [
+            entry
+            for entry in data
+            if entry["id"] == "auto" or entry["id"].casefold() not in mapped_names
+        ]
+        for m in mappings:
+            data.append(
+                {
+                    "id": m.internal_model_name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": f"external:{route.name}",
+                    "max_context": None,
+                    "max_output_tokens": None,
+                    "concurrent_limit": None,
+                }
+            )
+        return data
 
     def _model_entry(self, model, ip: Ips, is_vip_channel: bool) -> dict:
         return {

@@ -11,6 +11,8 @@ The database schema is intentionally not owned by Django migrations. Router mode
 - `user_ips`
 - `models`
 - `servers`
+- `external_routes`
+- `external_model_mappings`
 - `requests`
 - `whitelist`
 - `server_operations`
@@ -30,6 +32,7 @@ Row counts this router serves in production (as of 2026-08; update when the magn
 | --- | --- | --- |
 | `models` | < 10 | hot-path lookups per request |
 | `servers`, `departments`, `whitelist` | < 100 each | `servers` rows are updated per request |
+| `external_routes`, `external_model_mappings` | < 100 each | one indexed equality lookup per chat request; circuit updates write the whole `base_url` group |
 | `ips`, `user_ips` | ~1,000 | |
 | `requests` | ~7,000,000, expected to reach ~100,000,000 | ~12k requests/hour, no retention job; append-heavy with several UPDATEs per row |
 
@@ -225,6 +228,60 @@ ALTER TABLE servers ALTER COLUMN role TYPE varchar(32);
 ```
 
 `active_tokens` is a decoder-only load estimate (router-managed): reserved when a decoder is chosen after prefill and released when its decode phase ends.
+
+## External Routing Tables (issue #287)
+
+Employees routed to external third-party OpenAI-compatible providers are configured in two tables, deliberately separate from `servers` (providers never join server selection, health probing, workload, or VIP logic). `requests` is unchanged: external requests reuse its columns with the conventions at the end of this section.
+
+`external_routes` holds one row per (provider, employee) — the provider fields are denormalized because every employee uses their own `api_key`. The circuit-breaker fields are per row in storage but always updated for the whole `base_url` group, so every employee of a provider sees the same circuit state. `check_db_schema --fix` creates both tables and their partial unique indexes (expect multiple passes on first run: tables first, then identity/constraints/indexes).
+
+```sql
+CREATE TABLE external_routes (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,                 -- provider label; appears in router_result, keep short
+    base_url VARCHAR(500) NOT NULL,             -- ends with /v1, same convention as servers
+    employee_no VARCHAR(50) NOT NULL,
+    api_key VARCHAR(500) NOT NULL DEFAULT '',   -- per-employee provider credential
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,    -- admin kill-switch; FALSE => fallback to internal
+    model_mapping_policy INTEGER NOT NULL,      -- groups external_model_mappings rows
+    circuit_state VARCHAR(20) NOT NULL DEFAULT 'closed',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_state_change_at TIMESTAMPTZ NULL,
+    cooldown_seconds INTEGER NOT NULL DEFAULT 30,
+    created_at TIMESTAMPTZ NULL,
+    updated_at TIMESTAMPTZ NULL,
+    deleted_at TIMESTAMPTZ NULL
+);
+CREATE UNIQUE INDEX CONCURRENTLY uniq_external_routes_active
+    ON external_routes (employee_no) WHERE is_active AND deleted_at IS NULL;
+
+CREATE TABLE external_model_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    policy_id INTEGER NOT NULL,
+    internal_model_name VARCHAR(100) NOT NULL,  -- name clients request; == models.model_name when served internally
+    external_model_name VARCHAR(200) NOT NULL,  -- exact name this provider expects (case-sensitive)
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NULL,
+    updated_at TIMESTAMPTZ NULL,
+    deleted_at TIMESTAMPTZ NULL
+);
+CREATE UNIQUE INDEX CONCURRENTLY uniq_external_model_mappings_active
+    ON external_model_mappings (policy_id, internal_model_name) WHERE deleted_at IS NULL;
+```
+
+Model-name resolution is exact-match only — the GLM-5.2 vs glm-5.2 casing difference is an explicit mapping row, not fuzzy logic. `internal_model_name` must equal `models.model_name` exactly whenever the model is also served internally; provider-only models (e.g. `deepseek-v4-pro`) have no `models` row and their `internal_model_name` is simply the exposed alias (there is no FK, so admin tooling should validate the exact-match rule on insert). Write mapping rows even for identical names so each provider's catalog is explicit.
+
+Routing rules (VIP-port requests never go external; identity VIP does not matter on the normal port):
+
+- Concrete model name with a mapping → forwarded to the provider: body `model` rewritten to `external_model_name`, client `Authorization`/`x-api-key`/`api-key` stripped, `Authorization: Bearer <api_key>` sent. Deprecation / max_tokens / concurrency checks are skipped (they govern internal capacity).
+- Concrete name without a mapping → internal pipeline as usual (unknown names keep the standard 400).
+- Concrete name whose model has `auto = TRUE` → the mapping wins; without one, the request enters auto routing as usual.
+- `model: auto` → auto routing runs first; if the resolved model is mapped, the request is diverted to the provider, otherwise it serves internally.
+- Circuit open or `is_active = FALSE` → `ExternalRouteService.resolve` returns None and the request falls back to the internal pipeline (provider-only names then get the standard 400).
+
+The provider circuit mirrors `servers` (`load_balancer.circuit_breaker.*` thresholds): transport errors and HTTP >= 500 count as failures; 4xx passes through without tripping (a bad per-employee key must not open the circuit for colleagues). Open → half-open probe after `cooldown_seconds` (no probe limit — there is no workload counter; a failed probe doubles the cooldown), success closes. On a failure the whole `base_url` group is updated in one statement.
+
+Recording conventions: `router_result = "external:{name}:{internal_model_name}"` — the `external:` prefix must stay first because `AdmissionService` buckets in-flight rows by the prefix before the first colon (any other format would count external requests toward an internal model's or the auto concurrency bucket); it is persisted at dispatch, never NULL in flight. `target_pod_ip` stores the provider `base_url` (matches no `servers` row, so stale cleanup's workload decrement is a no-op). `model_id` is the internal model's id when one exists, else 0 — provider-only names never get a `models` row created. `GET /v1/models` merges the mapped names (owned_by `external:{name}`, null capability limits) over the internal list for mapped employees on the normal port; mapped names shadow the internal entries.
 
 ## `requests` Table
 

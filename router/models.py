@@ -119,6 +119,66 @@ class Server(TimestampedSoftDeleteModel):
         db_table = "servers"
 
 
+class ExternalRoute(TimestampedSoftDeleteModel):
+    """One employee's passthrough route to an external provider (issue #287).
+
+    Provider fields (``name``, ``base_url``) are denormalized per row — one
+    row per (provider, employee), because every employee uses their own
+    ``api_key`` — and the circuit-breaker fields are always updated for the
+    whole ``base_url`` group so every employee of a provider sees the same
+    circuit state.
+    """
+
+    name = models.CharField(max_length=100)
+    base_url = models.CharField(max_length=500)
+    employee_no = models.CharField(max_length=50)
+    api_key = models.CharField(max_length=500, blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    model_mapping_policy = models.IntegerField()
+    circuit_state = models.CharField(max_length=20, default="closed")
+    consecutive_failures = models.IntegerField(default=0)
+    last_state_change_at = models.DateTimeField(blank=True, null=True)
+    cooldown_seconds = models.IntegerField(default=30)
+
+    class Meta:
+        managed = False
+        db_table = "external_routes"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee_no"],
+                condition=Q(is_active=True, deleted_at__isnull=True),
+                name="uniq_external_routes_active",
+            ),
+        ]
+
+
+class ExternalModelMapping(TimestampedSoftDeleteModel):
+    """Model-name mapping for one external provider policy (issue #287).
+
+    ``internal_model_name`` is the router-facing name clients request: exactly
+    ``models.model_name`` when the model is also served internally, or the
+    exposed alias for a provider-only model (which has no ``models`` row).
+    Rows are grouped by ``policy_id``; ``external_routes.model_mapping_policy``
+    references the same value.
+    """
+
+    policy_id = models.IntegerField()
+    internal_model_name = models.CharField(max_length=100)
+    external_model_name = models.CharField(max_length=200)
+    is_enabled = models.BooleanField(default=True)
+
+    class Meta:
+        managed = False
+        db_table = "external_model_mappings"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["policy_id", "internal_model_name"],
+                condition=Q(deleted_at__isnull=True),
+                name="uniq_external_model_mappings_active",
+            ),
+        ]
+
+
 PREFILLER_ROLES = ("prefiller", "prefix-prefiller")
 
 

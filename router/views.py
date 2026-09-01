@@ -20,6 +20,8 @@ from router.repositories.requests import RequestRepository
 from router.repositories.whitelist import UNSET, WhitelistRepository
 from router.services.admission import AdmissionService
 from router.services.cmdb import CMDBService
+from router.services.external_proxy import ExternalProxyService
+from router.services.external_route import ExternalRouteService
 from router.services.identity import IdentityService
 from router.services.opencode import OpencodeVersionService
 from router.services.parser import RequestParser
@@ -132,6 +134,22 @@ def proxy(request, path: str):
         model = None if input_is_auto else ModelRepository.get_by_name(input_model_name)
         is_auto = input_is_auto or ModelRepository.should_auto_select(model)
 
+        # Issue #287: an employee with an active external route is forwarded
+        # to their provider when the requested (concrete, non-auto) model name
+        # is mapped there. Runs before the unknown-model check so provider-only
+        # model names work, and returning here skips deprecation / max_tokens /
+        # concurrency, which are internal-capacity controls. VIP-port requests
+        # never go external.
+        if (identity.has_employee and not input_is_auto and not is_vip_channel
+                and normalized_path == "chat/completions" and request.method == "POST"):
+            external = ExternalRouteService().resolve(identity.employee_no, input_model_name)
+            if external is not None:
+                route, mapping = external
+                return ExternalProxyService().forward(
+                    request, path, parsed, ip.id, route, mapping, user_agent,
+                    user_ip_id=identity.user_ip_id,
+                )
+
         if input_model_name and not input_is_auto and model is None:
             message = f"Model {input_model_name} is not supported."
             RequestRepository.create_blocked(ip.id, 0, parsed.stream, user_agent, 400, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
@@ -159,7 +177,7 @@ def proxy(request, path: str):
                 RequestRepository.create_blocked(ip.id, model.id if model else 0, parsed.stream, user_agent, 429, message, user_ip_id=identity.user_ip_id, estimate_tokens=parsed.estimated_full_body_tokens)
                 return error_response(concurrency.status_code, message, concurrency.error_type or "concurrent_limit_exceeded")
 
-        return ProxyService().forward(request, path, parsed, ip.id, model, user_agent, is_vip_channel=is_vip_channel, user_ip_id=identity.user_ip_id, is_identity_vip=identity.is_vip)
+        return ProxyService().forward(request, path, parsed, ip.id, model, user_agent, is_vip_channel=is_vip_channel, user_ip_id=identity.user_ip_id, is_identity_vip=identity.is_vip, employee_no=identity.employee_no)
     except Exception as exc:
         fail_reason = f"unhandled {type(exc).__name__}: {exc}"[:200]
         model_id = model.id if model else 0
