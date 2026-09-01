@@ -73,12 +73,28 @@ def proxy(request, path: str):
     try:
         ip, created = IPRepository.get_or_create(client_ip)
         # Only fetch user info via CMDB when it is enabled; in dummy mode the
-        # ips row created above is all the provisioning there is, and the
-        # fire-and-forget thread would race the request thread on the database.
+        # ips row created above is all the provisioning there is. The fetch is
+        # blocking on purpose: identity resolution below then sees the freshly
+        # inserted user_ips row, so admission verifies the department chain on
+        # the very first request from this IP instead of waving it through as
+        # "missing user info". A CMDB failure degrades to that incomplete
+        # identity path (governed by admission.allow_when_user_info_missing)
+        # rather than failing the request.
         if created and APP_CONFIG.get("cmdb", {}).get("enabled", False):
-            threading.Thread(target=CMDBService().fetch_and_save_user, args=(client_ip,), daemon=True).start()
+            try:
+                CMDBService().fetch_and_save_user(client_ip)
+            except Exception:
+                logger.exception("CMDB user fetch failed for first-time IP %s", client_ip)
 
         identity = IdentityService.resolve(request, ip)
+
+        # A key that exists but is no longer valid (is_valid = false, e.g. it
+        # failed the department/whitelist check at registration) is refused
+        # outright rather than downgraded to IP-based admission.
+        if identity.invalid_apikey:
+            message = "API key is invalid or revoked"
+            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message)
+            return error_response(403, message, "invalid_apikey")
 
         admission = AdmissionService()
 

@@ -217,6 +217,8 @@ curl -i -X POST http://localhost:8001/api/apikey \
 
 After validating the JSON fields, the endpoint rejects an `employee_no` that already has an active apikey with HTTP 409 before performing any write. If the `employee_no` has an active (unexpired) whitelist entry, the endpoint bypasses CMDB entirely and inserts the `user_ips` apikey row directly with `department_id = 0` and the whitelist `user_name` — the CMDB sync (`refresh_user_info`) overwrites the department once CMDB can resolve one. Otherwise it delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 for non-whitelisted employees until an internal adapter provides this method.
 
+CMDB only reports the employee's `user_name`/`user_charge`/department — it does not know whether the department may use the router — so after the CMDB write the saved `user_ips` row is verified (`AdmissionService.verify_apikey_registration`): an allowed department passes; a denied or unresolvable department is rescued only by the whitelist, matched by `user_ips.employee_no` against `whitelist.employee_no` or `user_ips.user_charge` against `whitelist.user_name` (allowed and unexpired entries only). When both fail the row is kept but stored with `is_valid = false` and the endpoint responds with HTTP 403 — such a key is refused by the proxy (see below) while the employee slot stays re-registrable once their department or whitelist status changes.
+
 ```json
 {
   "code": 200,
@@ -236,7 +238,16 @@ When the employee already has an active apikey:
 }
 ```
 
-This first-stage endpoint only stores credentials. Proxy requests do not resolve or apply registered API keys yet.
+When the department is not allowed and the employee is not whitelisted:
+
+```json
+{
+  "code": 403,
+  "error": "department is not allowed and employee is not whitelisted"
+}
+```
+
+Proxy requests resolve the `Authorization: Bearer <apikey>` header against active `user_ips` key rows: a valid key authorizes the request on its own (it skips the VIP-port gate and the permission check). A key whose row exists but has `is_valid = false` is refused outright with HTTP 403 (`invalid_apikey`) — it does not silently downgrade to IP-based admission. Unknown keys (no row at all) fall back to the IP identity and normal admission.
 
 ## API-Key Lookup
 

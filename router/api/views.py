@@ -29,6 +29,7 @@ from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
 from router.repositories.user_ips import UserIPRepository
 from router.repositories.whitelist import WhitelistRepository
+from router.services.admission import AdmissionService
 from router.services.cmdb import CMDBService
 
 DOWNLOAD_FILE_PATH = Path("/home/AI_Assistant/AI_Assistant.exe")
@@ -96,6 +97,21 @@ def register_apikey(request):
     except Exception:
         logger.exception("CMDB API key registration failed for employee %s", employee_no)
         return JsonResponse({"code": 502, "error": "CMDB API key registration failed"}, status=502)
+
+    # CMDB only reports the department; whether that department may use the
+    # router is decided here. A denied department with no whitelist entry
+    # leaves the key stored but invalid (refused by the proxy).
+    user_ip = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
+    if user_ip is None:
+        logger.error("CMDB registered no apikey row for employee %s", employee_no)
+        return JsonResponse({"code": 502, "error": "CMDB API key registration failed"}, status=502)
+
+    if not AdmissionService.verify_apikey_registration(user_ip):
+        UserIPRepository.deactivate_apikey_by_employee_no(employee_no)
+        return JsonResponse(
+            {"code": 403, "error": "department is not allowed and employee is not whitelisted"},
+            status=403,
+        )
 
     return JsonResponse(
         {

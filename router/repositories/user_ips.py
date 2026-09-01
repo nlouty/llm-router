@@ -55,6 +55,22 @@ class UserIPRepository:
         ).first()
 
     @staticmethod
+    def get_by_apikey(apikey: str) -> UserIP | None:
+        """Any non-deleted row for the key, valid or not."""
+        return UserIP.objects.filter(apikey=apikey, deleted_at__isnull=True).first()
+
+    @staticmethod
+    def deactivate_apikey_by_employee_no(employee_no: str) -> bool:
+        """Set ``is_valid = false`` on the employee's active key (soft)."""
+        obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
+        if obj is None:
+            return False
+        obj.is_valid = False
+        obj.updated_at = timezone.now()
+        obj.save(update_fields=["is_valid", "updated_at"])
+        return True
+
+    @staticmethod
     def invalidate_apikey_by_employee_no(employee_no: str) -> bool:
         obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
         if obj is None:
