@@ -61,6 +61,12 @@ ALTER TABLE ips ADD COLUMN concurrent_multiplier DOUBLE PRECISION NOT NULL DEFAU
 user_ips -> departments.is_allowed -> whitelist (expire_time, user_name)
 ```
 
+`departments.manager` is admin-managed and holds the department manager's name. It plays no role in the permission chain:
+
+```sql
+ALTER TABLE departments ADD COLUMN manager VARCHAR(100) NOT NULL DEFAULT '';
+```
+
 `whitelist` entries are due-time limited: an entry grants access only while `is_allowed = 1` and before `expire_time` (`NULL` = never expires). Admission matches a whitelist entry by `employee_no`, or by `user_name` against `user_ips.user_charge` (the person in charge CMDB recorded for the IP — some IPs resolve a `user_charge` but no department, leaving `department_id` NULL).
 
 Complete identities (a `user_ips` row with `employee_no` and a resolvable department) follow the department chain; an explicitly disallowed department is denied unless whitelisted. Incomplete identities — no `user_ips` row for the IP, no `employee_no`, or a department CMDB could not resolve (NULL, unknown id, or the whitelist apikey-bypass `0`) — are rescued only by the whitelist, then by `admission.allow_when_user_info_missing`. Registered API keys skip the permission check entirely (a valid key authorizes on its own); their gate is registration-time: after CMDB writes the key row, an allowed department passes, otherwise only a whitelist entry rescues (`employee_no` against `whitelist.employee_no`, `user_charge` against `whitelist.user_name`), and a key that fails both is stored with `is_valid = false`. The proxy refuses requests presenting such a key with HTTP 403 (`invalid_apikey`) instead of falling back to IP-based admission.

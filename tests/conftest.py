@@ -88,6 +88,9 @@ def api_test_tables(django_db_setup, django_db_blocker):
             for col in ("csb_token", "api_key"):
                 if Server._meta.db_table in connection.introspection.table_names() and not has_column("servers", col):
                     schema_editor.add_field(Server, Server._meta.get_field(col))
+            # Department manager column
+            if Department._meta.db_table in connection.introspection.table_names() and not has_column("departments", "manager"):
+                schema_editor.add_field(Department, Department._meta.get_field("manager"))
         yield
 
 
