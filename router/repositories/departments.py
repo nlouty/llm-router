@@ -14,6 +14,10 @@ class DepartmentRepository:
         return Department.objects.filter(id=department_id, deleted_at__isnull=True).first()
 
     @staticmethod
+    def get_by_manager(manager: str) -> Department | None:
+        return Department.objects.filter(manager=manager, deleted_at__isnull=True).first()
+
+    @staticmethod
     def get_or_create(
         dept1: str = "",
         dept2: str = "",
