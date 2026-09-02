@@ -5,7 +5,7 @@ import pytest
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from router.models import Department, UserIP, Whitelist
+from router.models import Department, Ips, RequestRecord, UserIP, Whitelist
 from router.repositories.user_ips import UserIPRepository
 from router.services.cmdb import CMDBService
 
@@ -302,6 +302,23 @@ def test_register_apikey_with_unresolvable_department_returns_403(client, monkey
 
     assert response.status_code == 403
     assert UserIP.objects.get(apikey="key-1").is_valid is False
+
+
+@pytest.mark.django_db
+def test_register_apikey_denial_records_blocked_request_row(client, monkeypatch):
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", _cmdb_saving(dept.id))
+
+    response = _post(client)
+
+    assert response.status_code == 403
+    record = RequestRecord.objects.get()
+    assert record.task_status == "failed"
+    assert record.status == "403 Forbidden"
+    assert record.fail_reason == "department is not allowed and employee is not whitelisted"
+    assert record.user_ip_id == UserIP.objects.get(apikey="key-1").id
+    assert record.ip_id == Ips.objects.get(ip="127.0.0.1").id
+    assert record.model_id == 0
 
 
 @pytest.mark.django_db

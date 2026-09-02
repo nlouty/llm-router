@@ -25,6 +25,7 @@ from router.api.stats import (
     parse_time_range,
 )
 from router.models import Model, Server, ServerOperation
+from router.repositories.ips import IPRepository
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
 from router.repositories.user_ips import UserIPRepository
@@ -108,10 +109,16 @@ def register_apikey(request):
 
     if not AdmissionService.verify_apikey_registration(user_ip):
         UserIPRepository.deactivate_apikey_by_employee_no(employee_no)
-        return JsonResponse(
-            {"code": 403, "error": "department is not allowed and employee is not whitelisted"},
-            status=403,
+        # Declined registrations are recorded like every other admission
+        # refusal, so they are visible in the requests table.
+        message = "department is not allowed and employee is not whitelisted"
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
+        client_ip = forwarded.split(",")[0].strip() if forwarded else request.META.get("REMOTE_ADDR", "0.0.0.0")
+        ip, _ = IPRepository.get_or_create(client_ip)
+        RequestRepository.create_blocked(
+            ip.id, 0, None, request.headers.get("User-Agent", ""), 403, message, user_ip_id=user_ip.id
         )
+        return JsonResponse({"code": 403, "error": message}, status=403)
 
     return JsonResponse(
         {
