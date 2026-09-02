@@ -26,6 +26,7 @@ class Department(TimestampedSoftDeleteModel):
     dept2 = models.CharField(max_length=100, blank=True, default="")
     dept3 = models.CharField(max_length=100, blank=True, default="")
     dept4 = models.CharField(max_length=100, blank=True, default="")
+    manager = models.CharField(max_length=100, blank=True, default="")
     is_allowed = models.IntegerField(blank=True, null=True)
 
     class Meta:
