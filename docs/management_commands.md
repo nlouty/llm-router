@@ -55,9 +55,11 @@ Refresh `user_ips` table from the CMDB source. Requires `cmdb.enabled` to be tru
 - **IP-backed rows** (`ip`/`ip_id` fixed, `apikey` empty): iterates active IPs, calls `CMDBService.fetch_user_data(ip) -> dict`.
 - **API-key-backed rows** (`apikey`/`employee_no` fixed, `ip_id = 0`): iterates active API-key rows, calls `CMDBService.fetch_user_data_by_employee_no(employee_no) -> dict`.
 
-Both lookups return `user_name`, `user_charge`, `employee_no`, `department_id`, and `vip`; `None` when there is no CMDB record. The public adapter is a dummy, so each pass exits with an explanatory error until an internal adapter provides the corresponding method. Supports dry-run mode to generate SQL without applying changes and `--ip` to refresh a single IP-backed address (the API-key pass only runs in a full refresh).
+Both lookups return `user_name`, `user_charge`, `employee_no`, `department_id`, and `vip`; `None` when there is no CMDB record. The public adapter is a dummy, so each pass exits with an explanatory error until an internal adapter provides the corresponding method. Supports dry-run mode to generate SQL without applying changes. Row-kind flags select which passes run: bare `--ip` refreshes every active IP-backed row, `--ip <address>` a single IP-backed address, and `--apikey` every API-key-backed row; with no flags both passes run. The flags compose — `--ip --apikey` behaves like the default full refresh, and `--ip <address> --apikey` refreshes that one address plus the API-key rows.
 
 ```bash
 python manage.py prod refresh_user_info --dry-run
-python manage.py prod refresh_user_info --ip 127.0.0.1
+python manage.py prod refresh_user_info --ip            # all IP-backed rows
+python manage.py prod refresh_user_info --ip 127.0.0.1  # one IP-backed row
+python manage.py prod refresh_user_info --apikey        # all API-key-backed rows
 ```

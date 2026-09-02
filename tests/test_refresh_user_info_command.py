@@ -160,3 +160,131 @@ def test_refresh_user_info_apikey_reports_unimplemented(monkeypatch):
     output = out.getvalue()
     assert "does not implement 'fetch_user_data_by_employee_no(employee_no) -> dict'" in output
     assert "Implement it in 'router/services/cmdb.py'" in output
+
+@pytest.mark.django_db
+def test_refresh_user_info_apikey_flag_skips_ip_pass(monkeypatch):
+    # --apikey refreshes only API-key-backed rows, even with active IPs present.
+    monkeypatch.setitem(APP_CONFIG, "cmdb", {"enabled": True, "dummy": True})
+
+    from router.services.cmdb import CMDBService
+    from router.models import UserIP
+
+    def mock_fetch_by_emp(self, employee_no):
+        return {
+            "user_name": "Alice",
+            "user_charge": "lead",
+            "employee_no": employee_no,
+            "department_id": 7,
+            "vip": True,
+        }
+
+    monkeypatch.setattr(CMDBService, "fetch_user_data_by_employee_no", mock_fetch_by_emp, raising=False)
+
+    IPRepository.get_or_create("192.168.1.1")
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E0001", user_name="old")
+
+    out = StringIO()
+    call_command("refresh_user_info", "--apikey", stdout=out)
+
+    # If the IP pass had run, the dummy adapter's unimplemented fetch_user_data
+    # would abort the command before the apikey row was refreshed.
+    assert UserIP.objects.get(apikey="key-1").user_name == "Alice"
+    assert UserIP.objects.filter(ip_id__gt=0).count() == 0
+
+@pytest.mark.django_db
+def test_refresh_user_info_ip_flag_refreshes_all_ips_only(monkeypatch):
+    # Bare --ip refreshes every IP-backed row and skips the API-key pass.
+    monkeypatch.setitem(APP_CONFIG, "cmdb", {"enabled": True, "dummy": True})
+
+    from router.services.cmdb import CMDBService
+    from router.models import UserIP
+
+    def mock_fetch(self, ip):
+        return {
+            "user_name": f"user_{ip.replace('.', '_')}",
+            "user_charge": "default_charge",
+            "employee_no": f"E{ip.split('.')[-1].zfill(5)}",
+            "department_id": 1,
+            "vip": True,
+        }
+
+    monkeypatch.setattr(CMDBService, "fetch_user_data", mock_fetch, raising=False)
+
+    IPRepository.get_or_create("192.168.1.1")
+    IPRepository.get_or_create("192.168.1.2")
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E0001", user_name="old")
+
+    out = StringIO()
+    call_command("refresh_user_info", "--ip", stdout=out)
+
+    # If the apikey pass had run, the dummy adapter's unimplemented
+    # fetch_user_data_by_employee_no would abort the command.
+    assert "Successfully refreshed 192.168.1.1" in out.getvalue()
+    assert "Successfully refreshed 192.168.1.2" in out.getvalue()
+    assert UserIP.objects.filter(ip_id__gt=0).count() == 2
+    assert UserIP.objects.get(apikey="key-1").user_name == "old"
+
+@pytest.mark.django_db
+def test_refresh_user_info_ip_flag_single_address(monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "cmdb", {"enabled": True, "dummy": True})
+
+    from router.services.cmdb import CMDBService
+
+    def mock_fetch(self, ip):
+        return {
+            "user_name": f"user_{ip.replace('.', '_')}",
+            "user_charge": "default_charge",
+            "employee_no": f"E{ip.split('.')[-1].zfill(5)}",
+            "department_id": 1,
+            "vip": True,
+        }
+
+    monkeypatch.setattr(CMDBService, "fetch_user_data", mock_fetch, raising=False)
+
+    ip_row, _ = IPRepository.get_or_create("192.168.1.1")
+    IPRepository.get_or_create("192.168.1.2")
+
+    out = StringIO()
+    call_command("refresh_user_info", "--ip", "192.168.1.1", stdout=out)
+
+    from router.models import UserIP
+    assert UserIP.objects.get(ip_id=ip_row.id).user_name == "user_192_168_1_1"
+    assert UserIP.objects.filter(ip_id__gt=0).count() == 1
+    assert "Successfully refreshed 192.168.1.1" in out.getvalue()
+
+@pytest.mark.django_db
+def test_refresh_user_info_ip_and_apikey_flags_run_both_passes(monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "cmdb", {"enabled": True, "dummy": True})
+
+    from router.services.cmdb import CMDBService
+    from router.models import UserIP
+
+    def mock_fetch(self, ip):
+        return {
+            "user_name": "Bob",
+            "user_charge": "lead",
+            "employee_no": "E0002",
+            "department_id": 3,
+            "vip": False,
+        }
+
+    def mock_fetch_by_emp(self, employee_no):
+        return {
+            "user_name": "Alice",
+            "user_charge": "lead",
+            "employee_no": employee_no,
+            "department_id": 7,
+            "vip": True,
+        }
+
+    monkeypatch.setattr(CMDBService, "fetch_user_data", mock_fetch, raising=False)
+    monkeypatch.setattr(CMDBService, "fetch_user_data_by_employee_no", mock_fetch_by_emp, raising=False)
+
+    ip_row, _ = IPRepository.get_or_create("192.168.1.1")
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E0001", user_name="old")
+
+    out = StringIO()
+    call_command("refresh_user_info", "--ip", "--apikey", stdout=out)
+
+    assert UserIP.objects.get(ip_id=ip_row.id).user_name == "Bob"
+    assert UserIP.objects.get(apikey="key-1").user_name == "Alice"
