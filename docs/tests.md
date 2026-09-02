@@ -42,7 +42,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_proxy_unhandled_exception.py` | View catch-all: 502 + self-describing `fail_reason`, one-line main log, full traceback in per-request log file |
 | `test_proxy_usage.py` | JSON usage parsing, including cached token counts |
 | `test_redis_prefix_cache.py` | Redis prefix-cache write/read flow and match ratios |
-| `test_refresh_user_info_command.py` | CMDB refresh command dry-run and single-IP behavior |
+| `test_refresh_user_info_command.py` | CMDB refresh command dry-run, single-IP behavior, and `--ip`/`--apikey` pass selection |
 | `test_request_logger.py` | Per-request log file append, timestamp prefix, and relative-path resolution |
 | `test_requests_repository.py` | Request attempt metadata, model choosing latency, cleanup, and repository counts |
 | `test_server_chooser.py` | Least-connection and prefix-cache-Preble chooser selection logic |

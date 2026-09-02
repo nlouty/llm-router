@@ -11,7 +11,13 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--dry-run", action="store_true", help="Do not update DB, just print the SQL commands.")
-        parser.add_argument("--ip", type=str, help="Specific IP to refresh (IP-backed rows only).")
+        parser.add_argument(
+            "--ip",
+            nargs="?",
+            const="all",
+            help="Refresh only IP-backed rows: every active IP when bare, or one address with --ip <address>.",
+        )
+        parser.add_argument("--apikey", action="store_true", help="Refresh only API-key-backed rows.")
 
     def handle(self, *args, **options):
         if not APP_CONFIG.get("cmdb", {}).get("enabled", False):
@@ -20,14 +26,18 @@ class Command(BaseCommand):
 
         dry_run = options.get("dry_run")
         ip_filter = options.get("ip")
+        apikey_only = bool(options.get("apikey"))
+        single_ip = bool(ip_filter) and ip_filter != "all"
 
-        if ip_filter:
+        if single_ip:
             ip_rows = [ip for ip in IPRepository.all_active() if ip.ip == ip_filter]
             if not ip_rows:
                 self.stdout.write(self.style.WARNING(f"IP {ip_filter} not found or inactive."))
                 return
-        else:
+        elif ip_filter or not apikey_only:
             ip_rows = IPRepository.all_active()
+        else:
+            ip_rows = []
 
         service = CMDBService()
         now = timezone.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -37,9 +47,11 @@ class Command(BaseCommand):
         if not self._refresh_ip_backed(service, ip_rows, dry_run, now, sql_commands):
             return
 
-        # API-key-backed rows: apikey / employee_no fixed, ip_id = 0 (full refresh only)
-        if not ip_filter and not self._refresh_apikey_backed(service, dry_run, now, sql_commands):
-            return
+        # API-key-backed rows: apikey / employee_no fixed, ip_id = 0
+        # (full refresh with no --ip, or on explicit --apikey request)
+        if apikey_only or not ip_filter:
+            if not self._refresh_apikey_backed(service, dry_run, now, sql_commands):
+                return
 
         if dry_run and sql_commands:
             self.stdout.write("\n-- GENERATED SQL COMMANDS --")
