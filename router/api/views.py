@@ -1668,7 +1668,7 @@ def update_ai_assistant_user_feedback(request):
 @require_http_methods(["GET"])
 def access_stats_by_department(request):
     """
-    根据部门和时间范围查询IP访问统计。
+    按部门和<employee_no, ip>维度统计token用量（issue #295）。
 
     查询参数：
     - start_time: 开始时间（北京时间，格式：YYYY-MM-DD HH:MM:SS）
@@ -1677,14 +1677,18 @@ def access_stats_by_department(request):
     - dept2: 二级部门（可选，"all"表示所有部门）
     - dept3: 三级部门（可选，"all"表示所有部门）
     - dept4: 四级部门（可选，"all"表示所有部门）
-    - employee_no: 工号（可选，支持多个值，逗号分隔或多次传参）
+    - employee_no: 工号（可选，匹配解析后的工号，支持多个值，逗号分隔或多次传参）
     - user_name: 用户名（可选，支持多个值，逗号分隔或多次传参）
     - ip: IP地址（可选，支持多个值，逗号分隔或多次传参）
 
     返回：
-    - 按IP聚合的访问统计，包含用户信息、部门信息和token统计
+    - 按 <employee_no, ip> 聚合的访问统计，包含用户信息、部门信息和token统计
+    - employee_no 解析优先级：请求 apikey 的工号 > IP 的工号 > "stale"
+    - ip_employee_no: IP 的工号，用于核对 apikey 与 IP 是否属于同一人
+    - 部门信息取自解析后工号对应的用户
     - input_token: input_token_cnt 的总和
     - output_token: output_token_cnt 的总和
+    - prefix_cache: final_prefix_cache 的总和（前缀缓存命中 token）
     """
     parsed = _time_range_or_error(request)
     if isinstance(parsed, JsonResponse):
@@ -1727,7 +1731,7 @@ def access_stats_by_department(request):
     ip = parse_multi_value(ip_raw)
 
     # 查询数据
-    results = RequestRepository.count_success_by_ip_with_user_info(
+    results = RequestRepository.summarize_success_by_employee_and_ip(
         start, end, dept1, dept2, dept3, dept4, employee_no, user_name, ip
     )
 
@@ -1752,12 +1756,12 @@ def export_access_stats_csv(request):
     - dept2: 二级部门（可选，"all"表示所有部门）
     - dept3: 三级部门（可选，"all"表示所有部门）
     - dept4: 四级部门（可选，"all"表示所有部门）
-    - employee_no: 工号（可选，支持多个值，逗号分隔或多次传参）
+    - employee_no: 工号（可选，匹配解析后的工号，支持多个值，逗号分隔或多次传参）
     - user_name: 用户名（可选，支持多个值，逗号分隔或多次传参）
     - ip: IP地址（可选，支持多个值，逗号分隔或多次传参）
 
     返回：
-    - CSV文件下载，包含IP访问统计、用户信息、部门信息和token统计
+    - CSV文件下载，按 <employee_no, ip> 聚合的访问统计、用户信息、部门信息和token统计
     - 文件名格式：access_stats_{start_time}_{end_time}.csv
     """
     parsed = _time_range_or_error(request)
@@ -1801,7 +1805,7 @@ def export_access_stats_csv(request):
     ip = parse_multi_value(ip_raw)
 
     # 查询数据
-    results = RequestRepository.count_success_by_ip_with_user_info(
+    results = RequestRepository.summarize_success_by_employee_and_ip(
         start, end, dept1, dept2, dept3, dept4, employee_no, user_name, ip
     )
 
@@ -1824,12 +1828,14 @@ def export_access_stats_csv(request):
         "输入Token",
         "输出Token",
         "用户姓名",
-        "用户职务",
+        "资产挂账人",
         "员工工号",
         "一级部门",
         "二级部门",
         "三级部门",
         "四级部门",
+        "IP工号",
+        "前缀缓存Token",
     ])
 
     # 写入数据行
@@ -1846,6 +1852,8 @@ def export_access_stats_csv(request):
             row.get("dept2", ""),
             row.get("dept3", ""),
             row.get("dept4", ""),
+            row.get("ip_employee_no", ""),
+            row.get("prefix_cache", 0),
         ])
 
     return response
