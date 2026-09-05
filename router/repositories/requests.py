@@ -592,7 +592,7 @@ class RequestRepository:
         }
 
     @staticmethod
-    def count_success_by_ip_with_user_info(
+    def summarize_success_by_employee_and_ip(
         start: datetime,
         end: datetime,
         dept1: str | None = None,
@@ -604,7 +604,16 @@ class RequestRepository:
         ip: list[str] | None = None,
     ) -> list[dict]:
         """
-        聚合查询每个IP的成功请求数，关联用户和部门信息。
+        聚合成功请求的token用量，按 <employee_no, ip> 作为分组键（issue #295）。
+
+        employee_no 的解析优先级：
+        1. 请求所用 apikey 对应 user_ips 行的 employee_no
+           （请求的 user_ip_id 指向 apikey 行；行不存在或为空则降级）
+        2. 请求 IP 对应 user_ips 行的 employee_no
+        3. 仍缺失时用 "stale"
+
+        每行同时返回 ip_employee_no（IP 的 employee_no），用于核对
+        apikey 与 IP 是否属于同一人。
 
         Args:
             start: 开始时间
@@ -613,18 +622,23 @@ class RequestRepository:
             dept2: 二级部门，"all"表示所有
             dept3: 三级部门，"all"表示所有
             dept4: 四级部门，"all"表示所有
-            employee_no: 工号过滤列表（可选）
+            employee_no: 工号过滤列表（匹配解析后的 employee_no，可选）
             user_name: 用户名过滤列表（可选）
             ip: IP地址过滤列表（可选）
 
         Returns:
-            包含ip、access_count、input_token、output_token、user_name、user_charge、employee_no、dept1-4的字典列表
+            按 (employee_no, ip) 聚合的字典列表，包含 access_count、
+            prefix_cache、input_token、output_token、ip_employee_no，
+            以及 employee_no 所属用户的 user_name、user_charge、dept1-4。
+            access_count = 成功请求数
+            prefix_cache = final_prefix_cache 的总和（前缀缓存命中 token）
             input_token = input_token_cnt 的总和
             output_token = output_token_cnt 的总和
         """
         from router.models import Ips, UserIP, Department
 
-        # 构建基础查询
+        # 按 (user_ip_id, ip_id) 聚合：user_ip_id 是请求时使用的凭证行
+        # （带 apikey 请求指向 apikey 行），ip_id 是真实客户端 IP。
         qs = (
             RequestRepository.external_requests()
             .filter(
@@ -633,105 +647,113 @@ class RequestRepository:
                 task_status="success",
                 ip_id__isnull=False,
             )
-            .values("ip_id")
+            .values("user_ip_id", "ip_id")
             .annotate(
                 access_count=models.Count("id"),
+                prefix_cache=models.Sum("final_prefix_cache"),
                 input_token=models.Sum("input_token_cnt"),
                 output_token=models.Sum("output_token_cnt"),
             )
         )
 
-        # 获取聚合结果
-        ip_counts = {
-            row["ip_id"]: {
-                "access_count": row["access_count"],
-                "input_token": row["input_token"] or 0,
-                "output_token": row["output_token"] or 0,
-            }
-            for row in qs
-        }
-
-        if not ip_counts:
+        groups = list(qs)
+        if not groups:
             return []
 
-        # 构建关联查询：ips -> user_ips -> departments
-        ip_ids = list(ip_counts.keys())
+        ip_ids = sorted({row["ip_id"] for row in groups})
+        user_ip_ids = sorted({row["user_ip_id"] for row in groups if row["user_ip_id"]})
 
-        # 查询ips表获取ip地址
-        ips_query = Ips.objects.filter(id__in=ip_ids, deleted_at__isnull=True)
-        ips_map = {ip.id: ip.ip for ip in ips_query}
-
-        # 查询user_ips表
-        user_ips_query = UserIP.objects.filter(
-            ip_id__in=ip_ids,
-            is_valid=True,
-            deleted_at__isnull=True
-        ).select_related()
-
-        user_ips_map = {
-            user_ip.ip_id: {
-                "user_name": user_ip.user_name,
-                "user_charge": user_ip.user_charge,
-                "employee_no": user_ip.employee_no,
-                "department_id": user_ip.department_id,
-            }
-            for user_ip in user_ips_query
+        # IP 地址
+        ips_map = {
+            obj.id: obj.ip
+            for obj in Ips.objects.filter(id__in=ip_ids, deleted_at__isnull=True)
         }
 
-        # 获取所有涉及的部门ID
-        dept_ids = [info["department_id"] for info in user_ips_map.values() if info["department_id"]]
+        # 请求使用的凭证行（含 apikey 行）；软删除视为 apikey 不存在
+        credential_rows = UserIP.objects.filter(id__in=user_ip_ids, deleted_at__isnull=True)
+        credentials_map = {obj.id: obj for obj in credential_rows}
 
-        # 查询departments表
-        departments_query = Department.objects.filter(id__in=dept_ids, deleted_at__isnull=True)
-        departments_map = {
-            dept.id: {
-                "dept1": dept.dept1,
-                "dept2": dept.dept2,
-                "dept3": dept.dept3,
-                "dept4": dept.dept4,
-            }
-            for dept in departments_query
+        # IP 归属的 user_ips 行：提供 ip_employee_no，以及 employee_no 降级来源
+        ip_user_map = {
+            obj.ip_id: obj
+            for obj in UserIP.objects.filter(
+                ip_id__in=ip_ids,
+                is_valid=True,
+                deleted_at__isnull=True,
+            )
         }
 
-        # 组装结果并应用部门过滤
-        results = []
-        for ip_id, stats in ip_counts.items():
-            user_info = user_ips_map.get(ip_id, {})
-            department_id = user_info.get("department_id")
-            dept_info = departments_map.get(department_id, {}) if department_id else {}
+        # 解析每个聚合组的 employee_no 及其归属行（用户/部门信息取自该行）
+        def resolve_owner(credential, ip_user) -> UserIP | None:
+            if credential is not None and credential.apikey and credential.employee_no:
+                return credential
+            if ip_user is not None and ip_user.employee_no:
+                return ip_user
+            return None
 
-            # 应用部门过滤条件
-            if dept1 and dept1 != "all" and dept_info.get("dept1") != dept1:
-                continue
-            if dept2 and dept2 != "all" and dept_info.get("dept2") != dept2:
-                continue
-            if dept3 and dept3 != "all" and dept_info.get("dept3") != dept3:
-                continue
-            if dept4 and dept4 != "all" and dept_info.get("dept4") != dept4:
-                continue
+        STALE = "stale"
 
-            # 应用新增的过滤条件
-            if employee_no and user_info.get("employee_no") not in employee_no:
-                continue
-            if user_name and user_info.get("user_name") not in user_name:
-                continue
-            ip_addr = ips_map.get(ip_id, "")
-            if ip and ip_addr not in ip:
-                continue
+        # 同一 (employee_no, ip) 可能来自多个 user_ip_id（如多把空工号 key
+        # 降级到同一 IP），在 Python 内二次归并
+        merged: dict[tuple[str, str], dict] = {}
+        for row in groups:
+            ip_id = row["ip_id"]
+            credential = credentials_map.get(row["user_ip_id"])
+            ip_user = ip_user_map.get(ip_id)
+            owner = resolve_owner(credential, ip_user)
+            resolved_employee_no = owner.employee_no if owner is not None else STALE
 
-            results.append({
-                "ip": ips_map.get(ip_id, ""),
-                "access_count": stats["access_count"],
-                "input_token": stats["input_token"],
-                "output_token": stats["output_token"],
-                "user_name": user_info.get("user_name", ""),
-                "user_charge": user_info.get("user_charge", ""),
-                "employee_no": user_info.get("employee_no", ""),
-                "dept1": dept_info.get("dept1", ""),
-                "dept2": dept_info.get("dept2", ""),
-                "dept3": dept_info.get("dept3", ""),
-                "dept4": dept_info.get("dept4", ""),
+            key = (resolved_employee_no, ips_map.get(ip_id, ""))
+            entry = merged.setdefault(key, {
+                "employee_no": resolved_employee_no,
+                "ip": key[1],
+                "ip_employee_no": ip_user.employee_no if ip_user is not None else "",
+                "access_count": 0,
+                "prefix_cache": 0,
+                "input_token": 0,
+                "output_token": 0,
+                "owner": owner,
             })
+            entry["access_count"] += row["access_count"]
+            entry["prefix_cache"] += row["prefix_cache"] or 0
+            entry["input_token"] += row["input_token"] or 0
+            entry["output_token"] += row["output_token"] or 0
+
+        # 部门信息取自 employee_no 归属行
+        dept_ids = [entry["owner"].department_id for entry in merged.values() if entry["owner"] and entry["owner"].department_id]
+        departments_map = {
+            dept.id: dept
+            for dept in Department.objects.filter(id__in=dept_ids, deleted_at__isnull=True)
+        }
+
+        # 应用过滤条件并组装结果
+        results = []
+        for entry in merged.values():
+            owner = entry.pop("owner")
+            dept = departments_map.get(owner.department_id) if owner and owner.department_id else None
+
+            if dept1 and dept1 != "all" and (dept.dept1 if dept else "") != dept1:
+                continue
+            if dept2 and dept2 != "all" and (dept.dept2 if dept else "") != dept2:
+                continue
+            if dept3 and dept3 != "all" and (dept.dept3 if dept else "") != dept3:
+                continue
+            if dept4 and dept4 != "all" and (dept.dept4 if dept else "") != dept4:
+                continue
+            if employee_no and entry["employee_no"] not in employee_no:
+                continue
+            if user_name and ((owner.user_name if owner else "") or "") not in user_name:
+                continue
+            if ip and entry["ip"] not in ip:
+                continue
+
+            entry["user_name"] = owner.user_name if owner else ""
+            entry["user_charge"] = owner.user_charge if owner else ""
+            entry["dept1"] = dept.dept1 if dept else ""
+            entry["dept2"] = dept.dept2 if dept else ""
+            entry["dept3"] = dept.dept3 if dept else ""
+            entry["dept4"] = dept.dept4 if dept else ""
+            results.append(entry)
 
         # 按访问次数从高到低排序
         results.sort(key=lambda x: x["access_count"], reverse=True)

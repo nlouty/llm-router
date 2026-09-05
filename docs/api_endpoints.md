@@ -126,7 +126,7 @@ The range is inclusive. Bucketed endpoints choose granularity automatically: hou
 | `/api/model_request_count_by_period` | GET | `start_time`, `end_time` | `model_name`; omit for all models | Bucketed successful request count, optionally filtered by model. |
 | `/api/model_ip_count_by_period` | GET | `start_time`, `end_time` | `model_name`; omit for all models | Bucketed distinct IP count, optionally filtered by model. |
 | `/api/model_latency_boxplot` | GET | `start_time`, `end_time` | `model_names` comma list | Per-model latency boxplot data. Drops latencies above 890 seconds from quartiles and reports their ratio. |
-| `/api/access_stats_by_department` | GET | `start_time`, `end_time` | `dept1`, `dept2`, `dept3`, `dept4`, `employee_no`, `user_name`, `ip`; use `all` or omit department params for any department. `employee_no`, `user_name`, `ip` support multiple values via comma-separated (`employee_no=EMP001,EMP002`) or repeated params (`employee_no=EMP001&employee_no=EMP002`) | Aggregates successful requests by IP with user and department info. Filters by department levels and optional user/IP filters when provided. |
+| `/api/access_stats_by_department` | GET | `start_time`, `end_time` | `dept1`, `dept2`, `dept3`, `dept4`, `employee_no`, `user_name`, `ip`; use `all` or omit department params for any department. `employee_no`, `user_name`, `ip` support multiple values via comma-separated (`employee_no=EMP001,EMP002`) or repeated params (`employee_no=EMP001&employee_no=EMP002`) | Aggregates successful requests by `<employee_no, ip>` with token usage (count, prefix-cache, input, output). Employee number resolved from the request's apikey first, then the IP's, else `stale`. Filters by department levels and optional user/IP filters when provided. |
 
 ### Input Token Cache Statistics
 
@@ -1701,7 +1701,13 @@ curl -i -X POST http://localhost:8001/api/ai_assistant_user_feedback/update \
 GET /api/access_stats_by_department
 ```
 
-Aggregates successful request counts by IP address with associated user and department information. Filters results by department levels when provided. Results are sorted by access_count in descending order (highest access count first).
+Aggregates successful requests by `<employee_no, ip>` with token usage and associated user and department information. Filters results by department levels when provided. Results are sorted by access_count in descending order (highest access count first).
+
+Employee number resolution priority (issue #295):
+
+1. The employee number of the apikey used by the request (`requests.user_ip_id` pointing to an apikey-backed `user_ips` row)
+2. If the apikey row does not exist (or carries no employee number): the employee number of the request IP's `user_ips` row
+3. If still absent: the literal `"stale"`
 
 Query parameters:
 
@@ -1711,18 +1717,19 @@ Query parameters:
 - `dept2`: Level 2 department filter (optional; use `all` or omit to include all)
 - `dept3`: Level 3 department filter (optional; use `all` or omit to include all)
 - `dept4`: Level 4 department filter (optional; use `all` or omit to include all)
-- `employee_no`: Employee number filter (optional; exact match)
+- `employee_no`: Employee number filter, matched against the resolved employee number (optional; exact match)
 - `user_name`: User name filter (optional; exact match)
 - `ip`: IP address filter (optional; exact match)
 
 The endpoint performs the following:
 
 1. Queries successful requests (`task_status="success"`) within the time range
-2. Aggregates by `ip_id` to count requests per IP
-3. Joins `ips` table to retrieve IP addresses
-4. Joins `user_ips` table to retrieve user information (`user_name`, `user_charge`, `employee_no`)
-5. Joins `departments` table to retrieve department hierarchy (`dept1`-`dept4`)
-6. Filters results by department parameters when provided
+2. Aggregates by `(user_ip_id, ip_id)` to count requests and sum tokens per credential and IP
+3. Resolves the employee number per group (apikey's employee number first, then the IP's, else `"stale"`) and merges groups sharing the same `(employee_no, ip)` key
+4. Joins `ips` table to retrieve IP addresses
+5. Joins `user_ips` table to retrieve the resolved user's information (`user_name`, `user_charge`, `employee_no`) and the IP's employee number (`ip_employee_no`)
+6. Joins `departments` table to retrieve the resolved user's department hierarchy (`dept1`-`dept4`)
+7. Filters results by department parameters when provided
 
 Response format:
 
@@ -1735,22 +1742,26 @@ Response format:
       "access_count": 1520,
       "input_token": 1250000,
       "output_token": 380000,
+      "prefix_cache": 940000,
       "user_name": "张三",
-      "user_charge": "产品经理",
+      "user_charge": "王五",
       "employee_no": "EMP001",
+      "ip_employee_no": "EMP001",
       "dept1": "技术部",
       "dept2": "研发中心",
       "dept3": "后端组",
       "dept4": "平台研发"
     },
     {
-      "ip": "192.168.1.101",
+      "ip": "192.168.1.100",
       "access_count": 890,
       "input_token": 780000,
       "output_token": 210000,
+      "prefix_cache": 512000,
       "user_name": "李四",
-      "user_charge": "开发工程师",
+      "user_charge": "赵六",
       "employee_no": "EMP002",
+      "ip_employee_no": "EMP001",
       "dept1": "技术部",
       "dept2": "研发中心",
       "dept3": "前端组",
@@ -1766,13 +1777,15 @@ Response format:
 Field descriptions:
 
 - `ip`: IP address
-- `access_count`: Number of successful requests from this IP
-- `input_token`: Total input tokens (input_token_cnt) for this IP
-- `output_token`: Total output tokens (output_token_cnt) for this IP
-- `user_name`: User name associated with this IP
-- `user_charge`: User role/position
-- `employee_no`: Employee number
-- `dept1`-`dept4`: Department hierarchy levels
+- `access_count`: Number of successful requests in this `(employee_no, ip)` group
+- `input_token`: Total input tokens (input_token_cnt) for this group
+- `output_token`: Total output tokens (output_token_cnt) for this group
+- `prefix_cache`: Total prefix-cache hit tokens (final_prefix_cache) for this group
+- `user_name`: User name of the resolved employee number
+- `user_charge`: Asset charge person (资产挂账人) of the resolved employee number
+- `employee_no`: Resolved employee number (apikey's → IP's → `stale`)
+- `ip_employee_no`: Employee number of the IP's `user_ips` row, for verifying whether the apikey and the IP belong to the same person
+- `dept1`-`dept4`: Department hierarchy levels of the resolved employee number
 
 Example - query all departments:
 
@@ -1844,7 +1857,9 @@ Notes:
   - Both formats can be mixed
 - Multiple values are combined with OR logic (any match includes the result)
 - All filters can be combined together with AND logic
-- Only valid, non-deleted user and department records are included
+- Rows are keyed by `(employee_no, ip)`: one IP can appear in multiple rows (e.g. several employees' apikeys used from one machine), so `ip` is not unique per row
+- `employee_no`, `user_name`, `user_charge`, and `dept1`-`dept4` describe the resolved employee number's user, not the IP's
+- The IP's `user_ips` row must be valid and non-deleted to contribute `ip_employee_no` or act as the employee-number fallback; a soft-deleted apikey row is treated as "apikey does not exist"
 - Internal routing requests (`ip_id=0`) are excluded from results
 
 ## Export Access Stats by Department API
@@ -1853,7 +1868,7 @@ Notes:
 GET /api/access_stats_by_department/export
 ```
 
-Exports access statistics by department as a CSV file. Uses the same query logic as the `access_stats_by_department` endpoint but returns a downloadable CSV instead of JSON.
+Exports access statistics by department as a CSV file. Uses the same query logic as the `access_stats_by_department` endpoint (grouped by `<employee_no, ip>`) but returns a downloadable CSV instead of JSON.
 
 Query parameters:
 
@@ -1863,7 +1878,7 @@ Query parameters:
 - `dept2`: Level 2 department filter (optional; use `all` or omit to include all)
 - `dept3`: Level 3 department filter (optional; use `all` or omit to include all)
 - `dept4`: Level 4 department filter (optional; use `all` or omit to include all)
-- `employee_no`: Employee number filter (optional; supports multiple values via comma-separated or repeated params)
+- `employee_no`: Employee number filter, matched against the resolved employee number (optional; supports multiple values via comma-separated or repeated params)
 - `user_name`: User name filter (optional; supports multiple values via comma-separated or repeated params)
 - `ip`: IP address filter (optional; supports multiple values via comma-separated or repeated params)
 
@@ -1877,13 +1892,15 @@ CSV file format:
 | 访问次数 | Number of successful requests |
 | 输入Token | Total input tokens (input_token_cnt) |
 | 输出Token | Total output tokens (output_token_cnt) |
-| 用户姓名 | User name |
-| 用户职务 | User role/position |
-| 员工工号 | Employee number |
+| 用户姓名 | User name of the resolved employee number |
+| 资产挂账人 | Asset charge person (user_charge) of the resolved employee number |
+| 员工工号 | Resolved employee number (apikey's → IP's → `stale`) |
 | 一级部门 | Level 1 department |
 | 二级部门 | Level 2 department |
 | 三级部门 | Level 3 department |
 | 四级部门 | Level 4 department |
+| IP工号 | Employee number of the IP's `user_ips` row (apikey-vs-IP ownership check) |
+| 前缀缓存Token | Total prefix-cache hit tokens (final_prefix_cache) |
 
 File naming: `access_stats_{start_time}_{end_time}.csv` (timestamps formatted as `YYYYMMDD_HHMMSS`)
 
