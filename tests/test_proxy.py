@@ -712,7 +712,8 @@ def test_auto_route_prefix_cache_uses_only_auto_selectable_models():
     model, router_result = service._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
-        MagicMock(),
+        # No session id: the prefix-cache pre-check only runs for such requests.
+        MagicMock(session=None),
     )
 
     assert model == target_model
@@ -737,7 +738,8 @@ def test_auto_route_prefix_cache_can_select_auto_false_target():
     model, router_result = service._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
-        MagicMock(),
+        # No session id: the prefix-cache pre-check only runs for such requests.
+        MagicMock(session=None),
     )
 
     assert model == low_model
@@ -770,7 +772,8 @@ def test_auto_route_prefix_cache_multiple_hits_uses_routing_llm():
     model, router_result = service._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
-        MagicMock(),
+        # No session id: the prefix-cache pre-check only runs for such requests.
+        MagicMock(session=None),
     )
 
     assert model == low_model
@@ -791,11 +794,49 @@ def test_auto_route_single_user_prompt_skips_prefix_cache_and_uses_routing_llm(m
     model, router_result = AutoRouteAlgorithm(_FailingPrefixCacheChooser(), proxy=_StubProxy(fake_post))._get_auto_route_model(
         b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}',
         MagicMock(id=123),
-        MagicMock(),
+        # No session id: this test isolates the single-user-prompt skip, which
+        # is a separate skip condition from the session one.
+        MagicMock(session=None),
     )
 
     assert model == target_model
     assert router_result == "complexity:5"
+
+
+def test_auto_route_session_sticky_miss_skips_prefix_cache_and_uses_routing_llm():
+    # Issue #299: the Redis prefix cache is keyed by prompt prefix, not
+    # session, so a session-sticky miss must not reuse it — a different task
+    # from the same agent scaffold would inherit the previous task's model.
+    # The failing chooser proves prefix ratios are never queried.
+    low_model = Model.objects.create(
+        model_name="low-model",
+        auto=False,
+        complexity_min=1,
+        complexity_max=3,
+    )
+    Model.objects.create(
+        model_name="high-model",
+        auto=True,
+        complexity_min=7,
+        complexity_max=10,
+    )
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
+
+    def fake_post(url, json, headers, timeout):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": '{"complexity":1}'}}]}
+        return response
+
+    model, router_result = AutoRouteAlgorithm(_FailingPrefixCacheChooser(), proxy=_StubProxy(fake_post))._get_auto_route_model(
+        b'{"model":"auto","messages":[{"role":"user","content":"earlier"},{"role":"user","content":"hello"}]}',
+        MagicMock(id=123),
+        MagicMock(session="sess-1"),
+    )
+
+    assert model == low_model
+    assert router_result == "complexity:1"
 
 
 def test_case_insensitive_auto_request_selects_target_model(monkeypatch):
