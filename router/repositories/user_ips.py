@@ -25,6 +25,21 @@ class UserIPRepository:
         ).first()
 
     @staticmethod
+    def list_active_by_employee_no(employee_no: str) -> list[UserIP]:
+        """Every active row of one employee: his apikey row and his IP-backed row.
+
+        Defines an employee's concurrency footprint (issue #301): requests on
+        any of his rows and from any of his bound IPs share one bucket.
+        """
+        return list(
+            UserIP.objects.filter(
+                employee_no=employee_no,
+                is_valid=True,
+                deleted_at__isnull=True,
+            ).order_by("id")
+        )
+
+    @staticmethod
     def exists_by_ip_id(ip_id: int) -> bool:
         return UserIP.objects.filter(ip_id=ip_id, deleted_at__isnull=True).exists()
 

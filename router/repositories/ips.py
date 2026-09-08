@@ -24,6 +24,8 @@ class IPRepository:
 
     @staticmethod
     def update_concurrent_multiplier(ip_id: int, multiplier: float) -> Ips:
+        # TODO(#301 phase 2): deprecated — admission ignores the column this
+        # writes. Remove together with the column drop.
         now = timezone.now()
         ip = Ips.objects.get(id=ip_id)
         ip.concurrent_multiplier = multiplier

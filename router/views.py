@@ -171,6 +171,7 @@ def proxy(request, path: str):
                 ip,
                 model,
                 is_auto=is_auto,
+                identity=identity,
             )
             if not concurrency.allowed:
                 message = concurrency.message or "concurrent limit exceeded"
@@ -273,6 +274,7 @@ def _models_capability_response(request, ip, identity, is_vip_channel):
         ip=ip,
         is_vip_channel=is_vip_channel,
         employee_no=identity.employee_no if identity.has_employee else None,
+        is_identity_vip=identity.is_vip,
     )
     return JsonResponse(payload)
 

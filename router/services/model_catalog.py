@@ -18,10 +18,10 @@ class ModelCatalogService:
       model's online servers (``null`` = unlimited).
     - ``max_output_tokens``: the output-token ceiling admission enforces
       for the model (``models.max_tokens``).
-    - ``concurrent_limit``: the per-IP concurrency ceiling admission
-      enforces right now (base ``concurrent_limit`` scaled by the IP's
-      ``concurrent_multiplier`` and the off-peak 4x boost). ``null`` on the
-      VIP port, where the concurrency check is skipped.
+    - ``concurrent_limit``: the concurrency ceiling admission enforces right
+      now (base ``concurrent_limit``, ×4 during the off-peak boost).
+      ``null`` when there is no ceiling: the VIP port, or a VIP identity
+      (``user_ips.vip``), where the concurrency check is skipped.
 
     A synthetic ``auto`` entry reports the auto-routing entrance: the global
     ``auto_max_tokens`` cap, a context ceiling every possible auto target can
@@ -31,8 +31,8 @@ class ModelCatalogService:
     among all models auto may redirect to.
 
     The payload exposes only the model list, the caller's IP, and per-model
-    capabilities — gateway internals (port, VIP channel state, multiplier,
-    boost window) are intentionally not included.
+    capabilities — gateway internals (port, VIP channel state, boost window)
+    are intentionally not included.
     """
 
     def __init__(self):
@@ -47,6 +47,7 @@ class ModelCatalogService:
         ip: Ips,
         is_vip_channel: bool,
         employee_no: str | None = None,
+        is_identity_vip: bool = False,
     ) -> dict:
         # Deprecation is an access-control word on the normal port: deprecated
         # models are blocked there but still served to VIP users / auto routing.
@@ -55,8 +56,9 @@ class ModelCatalogService:
             for model in ModelRepository.list_online()
             if is_vip_channel or not model.deprecation
         ]
-        data = [self._model_entry(model, ip, is_vip_channel) for model in models]
-        data.append(self._auto_entry(ip, is_vip_channel))
+        limit_exempt = is_vip_channel or is_identity_vip
+        data = [self._model_entry(model, limit_exempt) for model in models]
+        data.append(self._auto_entry(limit_exempt))
         # Issue #287: a mapped employee's effective catalog on the normal port
         # includes their provider's mapped model names. VIP-port requests never
         # go external, so the VIP-port catalog stays internal-only.
@@ -107,7 +109,7 @@ class ModelCatalogService:
             )
         return data
 
-    def _model_entry(self, model, ip: Ips, is_vip_channel: bool) -> dict:
+    def _model_entry(self, model, limit_exempt: bool) -> dict:
         return {
             "id": model.model_name,
             "object": "model",
@@ -116,11 +118,11 @@ class ModelCatalogService:
             "max_context": self._max_context(ServerRepository.list_by_model_id(model.id)),
             "max_output_tokens": model.max_tokens,
             "concurrent_limit": None
-            if is_vip_channel
-            else AdmissionService.compute_concurrent_limit(ip, model.concurrent_limit),
+            if limit_exempt
+            else AdmissionService.compute_concurrent_limit(model.concurrent_limit),
         }
 
-    def _auto_entry(self, ip: Ips, is_vip_channel: bool) -> dict:
+    def _auto_entry(self, limit_exempt: bool) -> dict:
         return {
             "id": "auto",
             "object": "model",
@@ -129,8 +131,8 @@ class ModelCatalogService:
             "max_context": self._auto_max_context(),
             "max_output_tokens": self.auto_max_tokens,
             "concurrent_limit": None
-            if is_vip_channel
-            else AdmissionService.compute_concurrent_limit(ip, self.auto_concurrent_limit),
+            if limit_exempt
+            else AdmissionService.compute_concurrent_limit(self.auto_concurrent_limit),
         }
 
     def _auto_max_context(self) -> int | None:

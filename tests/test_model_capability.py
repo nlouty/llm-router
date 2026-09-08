@@ -148,8 +148,8 @@ def test_deprecated_model_hidden_on_normal_port_but_visible_on_vip_port():
     assert entry["max_output_tokens"] == 20480
 
 
-def test_vip_port_reports_unlimited_concurrency_and_skips_multiplier():
-    Ips.objects.create(ip="10.0.0.3", concurrent_multiplier=2.5, vip=True)
+def test_vip_port_reports_unlimited_concurrency():
+    Ips.objects.create(ip="10.0.0.3", vip=True)
     model = Model.objects.create(model_name="model-a", concurrent_limit=3, max_tokens=20480)
     _make_server(model)
 
@@ -171,14 +171,33 @@ def test_non_vip_ip_blocked_on_vip_port():
     assert response.json()["error"]["message"] == "Port 8008 is closed, please use port 8001"
 
 
-def test_concurrent_multiplier_scales_limit():
+def test_concurrent_multiplier_is_ignored():
+    # issue #301: the column is deprecated — even 2.5 must not scale the limit.
     Ips.objects.create(ip="10.0.0.5", concurrent_multiplier=2.5, vip=False)
     model = Model.objects.create(model_name="model-a", concurrent_limit=3, max_tokens=20480)
     _make_server(model)
 
     payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.5").json()
 
-    assert _entry_by_id(payload, "model-a")["concurrent_limit"] == 8  # ceil(3 * 2.5)
+    assert _entry_by_id(payload, "model-a")["concurrent_limit"] == 3
+
+
+def test_vip_identity_reports_unlimited_concurrency_on_normal_port():
+    # A VIP user_ips row removes the concurrency limit entirely (issue #301),
+    # so the capability payload must advertise no ceiling for it.
+    UserIP.objects.create(apikey="sk-vip-1", employee_no="E001", ip_id=0, vip=True, is_valid=True)
+    model = Model.objects.create(model_name="model-a", concurrent_limit=3, max_tokens=20480)
+    _make_server(model)
+
+    payload = Client().get(
+        "/v1/models",
+        SERVER_PORT="8001",
+        REMOTE_ADDR="10.0.0.7",
+        HTTP_AUTHORIZATION="Bearer sk-vip-1",
+    ).json()
+
+    assert _entry_by_id(payload, "model-a")["concurrent_limit"] is None
+    assert _entry_by_id(payload, "auto")["concurrent_limit"] is None
 
 
 def test_off_peak_boost_window_quadruples_limit(_fixed_clock):

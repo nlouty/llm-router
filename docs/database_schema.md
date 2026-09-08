@@ -55,6 +55,14 @@ ALTER TABLE ips ADD COLUMN vip BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE ips ADD COLUMN concurrent_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0;
 ```
 
+`ips.concurrent_multiplier` is **deprecated** (issue #301): admission no longer reads it. Concurrency is now scoped by `user_ips` instead of inflated per IP:
+
+- A `user_ips` row with `vip = TRUE` means the employee is VIP and has **no concurrency limit**, on any port (VIP-port requests were already exempt; `requests.vip = TRUE` keeps VIP traffic out of everyone's counts).
+- Every other employee gets the base limit of the entrance model (`models.concurrent_limit`, or `router.auto_concurrent_limit` for `auto`; ×4 during the off-peak boost window). In-flight requests counted against him are those on any of his `user_ips` rows (apikey- or IP-backed) **or** from his bound IPs — a request with both his apikey and from his IP counts once. Employees sharing one NAT IP therefore keep independent quotas.
+- Traffic with no resolvable identity (unknown IP, no apikey) keeps the plain per-IP bucket.
+
+TODO(#301 phase 2): drop the `concurrent_multiplier` column (`check_db_schema --fix`), remove the Django field, `IPRepository.update_concurrent_multiplier`, the `/api/concurrent_multiplier/update` endpoint, and the multiplier column of `/api/ip/list`.
+
 `departments.is_allowed`, `user_ips.department_id`, and `whitelist.is_allowed` form the permission chain:
 
 ```text

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from typing import ClassVar
@@ -11,6 +10,7 @@ from router.config import APP_CONFIG
 from router.models import Ips, Model, UserIP
 from router.repositories.departments import DepartmentRepository
 from router.repositories.requests import RequestRepository
+from router.repositories.user_ips import UserIPRepository
 from router.repositories.whitelist import WhitelistRepository
 
 
@@ -124,7 +124,12 @@ class AdmissionService:
             )
         return AdmissionResult(True)
 
-    def check_concurrency(self, ip: Ips, model: Model | None, is_auto: bool = False) -> AdmissionResult:
+    def check_concurrency(self, ip: Ips, model: Model | None, is_auto: bool = False, identity=None) -> AdmissionResult:
+        if identity is not None and identity.is_vip:
+            # A VIP ``user_ips`` row removes the concurrency limit entirely,
+            # on any port (issue #301).
+            return AdmissionResult(True)
+
         if model is None and not is_auto:
             return AdmissionResult(True)
 
@@ -153,14 +158,20 @@ class AdmissionService:
             RequestRepository.cleanup_stale(model_id=model_id_for_cleanup, threshold_minutes=self.stale_minutes)
             self._last_cleanup[model_id_for_cleanup] = now
 
-        limit = self.compute_concurrent_limit(ip, limit_base)
+        limit = self.compute_concurrent_limit(limit_base)
 
-        current = self._count_inflight(ip.id, matches_entrance)
+        user_ip_ids, ip_ids = self._concurrency_scope(ip, identity)
+        current = self._count_inflight(user_ip_ids, ip_ids, matches_entrance)
 
         if current >= limit:
-            cleaned = RequestRepository.cleanup_stale(model_id=model_id_for_cleanup, threshold_minutes=self.stale_minutes, ip_id=ip.id)
+            cleaned = RequestRepository.cleanup_stale(
+                model_id=model_id_for_cleanup,
+                threshold_minutes=self.stale_minutes,
+                user_ip_ids=user_ip_ids,
+                ip_ids=ip_ids,
+            )
             if cleaned > 0:
-                current = self._count_inflight(ip.id, matches_entrance)
+                current = self._count_inflight(user_ip_ids, ip_ids, matches_entrance)
 
         if current >= limit:
             return AdmissionResult(
@@ -192,25 +203,56 @@ class AdmissionService:
         )
 
     @staticmethod
-    def compute_concurrent_limit(ip: Ips, limit_base: int | None, beijing_time=None) -> int | None:
-        """Effective per-IP concurrency ceiling for a model with ``limit_base``.
+    def compute_concurrent_limit(limit_base: int | None, beijing_time=None) -> int | None:
+        """Effective concurrency ceiling for a model with ``limit_base``.
 
         The exact formula enforced by :meth:`check_concurrency`: the base
-        limit scaled by the IP's ``concurrent_multiplier``, multiplied by 4
-        during the off-peak boost window. ``None`` when no base limit is set
-        (no ceiling). Shared with the capability endpoint so the advertised
-        limit can never drift from what admission actually enforces.
+        limit, multiplied by 4 during the off-peak boost window. ``None`` when
+        no base limit is set (no ceiling). Shared with the capability endpoint
+        so the advertised limit can never drift from what admission enforces.
         """
         if limit_base is None:
             return None
-        limit = max(1, math.ceil(limit_base * (ip.concurrent_multiplier or 1.0)))
+        limit = limit_base
         if AdmissionService.off_peak_boost_active(beijing_time):
             limit *= 4
         return limit
 
     @staticmethod
-    def _count_inflight(ip_id: int, predicate) -> int:
-        return sum(1 for row in RequestRepository.list_processing_for_concurrency(ip_id) if predicate(row))
+    def _concurrency_scope(ip: Ips, identity) -> tuple[list[int], list[int]]:
+        """(user_ip_ids, ip_ids) whose in-flight rows count against this request.
+
+        A resolved identity scopes concurrency to the employee (issue #301):
+        every active ``user_ips`` row of his ``employee_no`` contributes its
+        id and, when IP-backed, its ``ip_id`` — traffic on his apikey and from
+        his bound IP share one bucket, while other users behind the same NAT
+        keep their own. A key row stored without ``employee_no`` is covered by
+        seeding the scope with the identity's own ``user_ip_id`` (its
+        ``employee_no`` may have been borrowed from the IP-backed row).
+        Anonymous traffic (no ``user_ips`` row) keeps the plain per-IP bucket.
+        """
+        if identity is None or not identity.user_ip_id:
+            return [], [ip.id]
+
+        user_ip_ids = {identity.user_ip_id}
+        ip_ids: set[int] = set()
+        if identity.employee_no:
+            for row in UserIPRepository.list_active_by_employee_no(identity.employee_no):
+                user_ip_ids.add(row.id)
+                if row.ip_id > 0:
+                    ip_ids.add(row.ip_id)
+        if not identity.is_apikey:
+            # IP-backed identity: the request's IP is by construction his.
+            ip_ids.add(ip.id)
+        return sorted(user_ip_ids), sorted(ip_ids)
+
+    @staticmethod
+    def _count_inflight(user_ip_ids: list[int], ip_ids: list[int], predicate) -> int:
+        return sum(
+            1
+            for row in RequestRepository.list_processing_for_concurrency(user_ip_ids, ip_ids)
+            if predicate(row)
+        )
 
     @staticmethod
     def _entrance_name(router_result: str | None) -> str | None:
