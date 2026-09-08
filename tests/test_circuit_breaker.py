@@ -314,3 +314,100 @@ class TestCircuitBreakerHalfOpenProbeLimit:
             cooldown_seconds=30,
         )
         assert server in ServerRepository.list_all_online()
+
+
+class TestCircuitBreakerIncidentEscalation:
+    """Cooldown escalates per recovery cycle, not per failed request (issue #300).
+
+    A server that crashes with many in-flight requests receives one
+    record_failure per casualty. Those failures must not ramp the cooldown
+    to max or re-stamp last_state_change_at, or a single incident keeps the
+    server unreachable far longer than the outage itself.
+    """
+
+    def _open_circuit(self, base_url):
+        """Trip the breaker from closed with three failures; returns the server row."""
+        server = Server.objects.create(base_url=base_url, is_online=True)
+        cb = CircuitBreakerService()
+        for _ in range(3):
+            cb.record_failure(server)
+        return server
+
+    def test_pending_request_failures_do_not_escalate_cooldown(self):
+        """One crash incident with a large in-flight backlog keeps cooldown at base."""
+        server = self._open_circuit("http://incident.example")
+        cb = CircuitBreakerService()
+
+        server.refresh_from_db()
+        assert server.circuit_state == "open"
+        assert server.cooldown_seconds == 30
+        opened_at = server.last_state_change_at
+
+        # Each casualty holds the snapshot from its dispatch time, when the
+        # server was still healthy ("closed") — simulate that stale copy.
+        victim = Server.objects.get(id=server.id)
+        victim.circuit_state = "closed"
+        for _ in range(97):
+            cb.record_failure(victim)
+
+        server.refresh_from_db()
+        assert server.circuit_state == "open"
+        assert server.consecutive_failures == 100
+        assert server.cooldown_seconds == 30  # not ramped to max
+        assert server.last_state_change_at == opened_at  # open window not extended
+
+    def test_cooldown_escalates_only_through_failed_probe_cycles(self):
+        """Escalation sequence is base on open, doubled per failed probe: 30 -> 60 -> 120."""
+        server = self._open_circuit("http://escalate.example")
+        cb = CircuitBreakerService()
+        server.refresh_from_db()
+        assert server.cooldown_seconds == 30
+
+        for expected in (60, 120):
+            ServerRepository.transition_to_half_open(server)
+            cb.record_failure(server)
+            server.refresh_from_db()
+            assert server.circuit_state == "open"
+            assert server.cooldown_seconds == expected
+
+    def test_stale_failure_during_half_open_does_not_double_cooldown(self):
+        """A casualty dispatched pre-crash must not consume the half_open probe cycle."""
+        server = Server.objects.create(
+            base_url="http://stale-probe.example",
+            is_online=True,
+            circuit_state="half_open",
+            consecutive_failures=2,
+            cooldown_seconds=60,
+        )
+        opened_at = server.last_state_change_at = timezone.now() - timedelta(seconds=90)
+        Server.objects.filter(id=server.id).update(last_state_change_at=opened_at)
+
+        # Stale copy dispatched while the server was closed.
+        victim = Server.objects.get(id=server.id)
+        victim.circuit_state = "closed"
+        CircuitBreakerService().record_failure(victim)
+
+        server.refresh_from_db()
+        assert server.circuit_state == "half_open"
+        assert server.cooldown_seconds == 60
+        assert server.last_state_change_at == opened_at
+
+    def test_second_concurrent_probe_failure_does_not_double_again(self):
+        """Two half_open snapshots racing to fail only double the cooldown once."""
+        server = Server.objects.create(
+            base_url="http://race-probe.example",
+            is_online=True,
+            circuit_state="half_open",
+            consecutive_failures=2,
+            cooldown_seconds=30,
+        )
+        cb = CircuitBreakerService()
+        probe_a = Server.objects.get(id=server.id)
+        probe_b = Server.objects.get(id=server.id)
+
+        cb.record_failure(probe_a)
+        cb.record_failure(probe_b)
+
+        server.refresh_from_db()
+        assert server.circuit_state == "open"
+        assert server.cooldown_seconds == 60  # doubled once, not twice

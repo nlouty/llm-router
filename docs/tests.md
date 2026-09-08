@@ -17,7 +17,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_api_stats.py` | Stats endpoints, hour/day/month bucketing, boxplot edge cases |
 | `test_cancellable_upstream.py` | `CancellableUpstreamRequest.cancel()` shuts down in-flight HTTP via socket close |
 | `test_check_db_schema.py` | `check_db_schema` drift detection and `--fix` on PostgreSQL |
-| `test_circuit_breaker.py` | Failure counting, threshold, open/half_open transitions, exponential cooldown |
+| `test_circuit_breaker.py` | Failure counting, threshold, open/half_open transitions, cooldown escalation per probe cycle (not per failure, issue #300) |
 | `test_codehub_review.py` | CodeHub review create, invalid-field, and invalid-date validation |
 | `test_config.py` | `PREFIX_CACHE_*` env overrides applied by `load_config` |
 | `test_context_overflow.py` | Context-overflow retry to a same-model larger-window server; no model switch; real error surfaces when exhausted |

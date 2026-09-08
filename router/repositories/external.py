@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from django.db.models import F
+from django.db.models import F, Value
+from django.db.models.functions import Least
 from django.utils import timezone
 
 from router.models import ExternalModelMapping, ExternalRoute
@@ -94,7 +95,15 @@ class ExternalRouteRepository:
         base_cooldown_seconds: int,
         max_cooldown_seconds: int,
     ) -> None:
-        """Count a provider failure; open the circuit at the threshold."""
+        """Count a provider failure; open the circuit at the threshold.
+
+        Cooldown escalation is per recovery cycle, not per failure: once the
+        circuit is open, further failures are casualties of requests sent
+        before the outage was detected and must not escalate the cooldown or
+        re-stamp ``last_state_change_at`` (issue #300). Each transition is a
+        compare-and-set on the group's current DB state, so stale in-memory
+        snapshots cannot re-apply it.
+        """
         now = timezone.now()
         group = ExternalRoute.objects.filter(base_url=route.base_url, deleted_at__isnull=True)
         group.update(consecutive_failures=F("consecutive_failures") + 1, updated_at=now)
@@ -103,22 +112,30 @@ class ExternalRouteRepository:
         if route.consecutive_failures < failure_threshold:
             return
         if route.circuit_state == "half_open":
-            # Failed during probe: double cooldown
+            # A probe request failed: double the cooldown of this recovery cycle.
             new_cooldown = min(route.cooldown_seconds * 2, max_cooldown_seconds)
-        else:
-            new_cooldown = min(
-                base_cooldown_seconds * (2 ** (route.consecutive_failures - failure_threshold)),
-                max_cooldown_seconds,
+            updated = group.filter(circuit_state="half_open").update(
+                circuit_state="open",
+                last_state_change_at=now,
+                cooldown_seconds=Least(F("cooldown_seconds") * 2, Value(max_cooldown_seconds)),
+                updated_at=now,
             )
-        group.update(
-            circuit_state="open",
-            last_state_change_at=now,
-            cooldown_seconds=new_cooldown,
-            updated_at=now,
-        )
-        route.circuit_state = "open"
-        route.last_state_change_at = now
-        route.cooldown_seconds = new_cooldown
+        else:
+            # Threshold crossed from closed: open with the base cooldown. The
+            # compare-and-set on "closed" skips groups already open or
+            # half_open — a half_open group is only re-opened by its own
+            # probe failing.
+            new_cooldown = base_cooldown_seconds
+            updated = group.filter(circuit_state="closed").update(
+                circuit_state="open",
+                last_state_change_at=now,
+                cooldown_seconds=base_cooldown_seconds,
+                updated_at=now,
+            )
+        if updated:
+            route.circuit_state = "open"
+            route.last_state_change_at = now
+            route.cooldown_seconds = new_cooldown
 
     @staticmethod
     def record_success(route: ExternalRoute, base_cooldown_seconds: int) -> None:
