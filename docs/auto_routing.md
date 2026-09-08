@@ -94,7 +94,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
 5. Check prefix-cache model hits.
 
-   When the active chooser supports `get_all_model_prefix_ratios`, the router checks Redis prefix-cache ratios for every text target model. This pre-check is skipped for requests with exactly one user message.
+   When the active chooser supports `get_all_model_prefix_ratios`, the router checks Redis prefix-cache ratios for every text target model. This pre-check is skipped for requests with exactly one user message, and for requests that carry a session id whose session-sticky lookup missed (issue #299): the Redis cache is keyed by prompt prefix, not session, so a different task sharing the same agent prefix must be routed by complexity estimation instead of inheriting the previous task's model.
 
    A model is selected immediately only when exactly one text target has a prefix ratio greater than `0.7`. The result is `cache_hit`.
 

@@ -215,9 +215,13 @@ class AutoRouteAlgorithm:
         if sticky_model is not None:
             return sticky_model, "session-sticky"
 
-        cached_model = self._check_cache_hit(body, auto_models, model_names, body_data)
-        if cached_model:
-            return cached_model, "cache_hit"
+        # The prefix cache is keyed by prompt prefix, not session, so a sticky
+        # miss with a session id must go to complexity estimation instead of
+        # pinning a different task that shares the same agent prefix (#299).
+        if not getattr(context, "session", None):
+            cached_model = self._check_cache_hit(body, auto_models, model_names, body_data)
+            if cached_model:
+                return cached_model, "cache_hit"
 
         return self._query_routing_llm(
             body,
