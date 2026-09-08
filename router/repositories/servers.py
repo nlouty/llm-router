@@ -4,7 +4,7 @@ import json
 from datetime import timedelta
 
 from django.db.models import Count, F, Q, Value
-from django.db.models.functions import Greatest
+from django.db.models.functions import Greatest, Least
 from django.utils import timezone
 
 from router.config import APP_CONFIG
@@ -97,7 +97,17 @@ class ServerRepository:
 
     @staticmethod
     def record_failure(server: Server, failure_threshold: int, base_cooldown_seconds: int, max_cooldown_seconds: int) -> None:
-        """Increment failure counter. If threshold reached, open the circuit (or re-open with doubled cooldown)."""
+        """Increment failure counter. Open the circuit at the threshold; escalate cooldown per recovery cycle, not per failure.
+
+        A server that crashes with many in-flight requests receives one
+        ``record_failure`` per casualty. Once the circuit is open, those
+        failures describe an outage that was already detected: they must not
+        escalate the cooldown or re-stamp ``last_state_change_at``, or a
+        single incident maxes the cooldown (issue #300). Escalation happens
+        only on state transitions, each guarded by a compare-and-set on the
+        current DB state so a stale in-memory snapshot (a request dispatched
+        while the server was still healthy) cannot re-apply it.
+        """
         now = timezone.now()
         Server.objects.filter(id=server.id).update(
             consecutive_failures=F("consecutive_failures") + 1,
@@ -108,28 +118,42 @@ class ServerRepository:
         server.last_failure_at = now
         server.updated_at = now
 
-        if server.consecutive_failures >= failure_threshold:
-            if server.circuit_state == "half_open":
-                # Failed during probe: double cooldown
-                new_cooldown = min(server.cooldown_seconds * 2, max_cooldown_seconds)
-            else:
-                new_cooldown = min(
-                    base_cooldown_seconds * (2 ** (server.consecutive_failures - failure_threshold)),
-                    max_cooldown_seconds,
-                )
-            update_fields = {
-                "circuit_state": "open",
-                "last_state_change_at": now,
-                "cooldown_seconds": new_cooldown,
-            }
-            if server.vip:
-                update_fields["vip"] = False
-                update_fields["vip_cooldown"] = None
-            Server.objects.filter(id=server.id).update(**update_fields)
+        if server.consecutive_failures < failure_threshold:
+            return
+
+        vip_demotion = {}
+        if server.vip:
+            vip_demotion = {"vip": False, "vip_cooldown": None}
+
+        if server.circuit_state == "half_open":
+            # A probe request failed: double the cooldown of this recovery cycle.
+            new_cooldown = min(server.cooldown_seconds * 2, max_cooldown_seconds)
+            updated = Server.objects.filter(id=server.id, circuit_state="half_open").update(
+                circuit_state="open",
+                last_state_change_at=now,
+                cooldown_seconds=Least(F("cooldown_seconds") * 2, Value(max_cooldown_seconds)),
+                updated_at=now,
+                **vip_demotion,
+            )
+        else:
+            # Threshold crossed from closed: open with the base cooldown. The
+            # compare-and-set on "closed" skips rows already open or
+            # half_open — those failures are casualties of requests
+            # dispatched before the outage was detected, and a half_open row
+            # is only re-opened by its own probe failing.
+            new_cooldown = base_cooldown_seconds
+            updated = Server.objects.filter(id=server.id, circuit_state="closed").update(
+                circuit_state="open",
+                last_state_change_at=now,
+                cooldown_seconds=base_cooldown_seconds,
+                updated_at=now,
+                **vip_demotion,
+            )
+        if updated:
             server.circuit_state = "open"
             server.last_state_change_at = now
             server.cooldown_seconds = new_cooldown
-            if server.vip:
+            if vip_demotion:
                 server.vip = False
                 server.vip_cooldown = None
 

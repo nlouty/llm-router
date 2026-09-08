@@ -717,3 +717,79 @@ class TestModelsCapability:
         ids = {entry["id"] for entry in payload["data"]}
         assert ids == {"glm-5.2", "auto"}
         assert payload.get("employee_no") == "E2002"
+
+
+@pytest.mark.django_db
+class TestExternalCircuitBreakerEscalation:
+    """Provider cooldown escalates per recovery cycle, not per failed request (issue #300).
+
+    Mirrors the Server breaker: casualties of requests sent before the
+    provider outage was detected must not ramp the cooldown or re-stamp
+    last_state_change_at.
+    """
+
+    def _record_failure(self, route):
+        ExternalRouteRepository.record_failure(
+            route,
+            failure_threshold=3,
+            base_cooldown_seconds=30,
+            max_cooldown_seconds=3000,
+        )
+
+    def _trip(self):
+        """Open the provider's circuit from closed with three failures."""
+        route = seed_route()
+        seed_route(employee_no="E2002", api_key="sk-emp-2")
+        for _ in range(3):
+            self._record_failure(route)
+        return route
+
+    def test_pending_failures_do_not_escalate_cooldown(self):
+        route = self._trip()
+        route.refresh_from_db()
+        assert route.circuit_state == "open"
+        assert route.cooldown_seconds == 30
+        opened_at = route.last_state_change_at
+
+        # Stale copy: dispatched while the provider was still healthy.
+        victim = ExternalRoute.objects.get(id=route.id)
+        victim.circuit_state = "closed"
+        for _ in range(50):
+            self._record_failure(victim)
+
+        route.refresh_from_db()
+        assert route.circuit_state == "open"
+        assert route.consecutive_failures == 53
+        assert route.cooldown_seconds == 30  # not ramped to max
+        assert route.last_state_change_at == opened_at  # open window not extended
+        # The whole provider group behaves identically.
+        other = ExternalRoute.objects.get(employee_no="E2002")
+        assert other.circuit_state == "open"
+        assert other.cooldown_seconds == 30
+
+    def test_cooldown_escalates_only_through_failed_probe_cycles(self):
+        """Escalation sequence is base on open, doubled per failed probe: 30 -> 60 -> 120."""
+        route = self._trip()
+        route.refresh_from_db()
+        assert route.cooldown_seconds == 30
+
+        for expected in (60, 120):
+            ExternalRouteRepository.transition_to_half_open(route)
+            self._record_failure(route)
+            route.refresh_from_db()
+            assert route.circuit_state == "open"
+            assert route.cooldown_seconds == expected
+
+    def test_second_concurrent_probe_failure_does_not_double_again(self):
+        """Two half_open snapshots racing to fail only double the cooldown once."""
+        route = self._trip()
+        ExternalRouteRepository.transition_to_half_open(route)
+        probe_a = ExternalRoute.objects.get(id=route.id)
+        probe_b = ExternalRoute.objects.get(id=route.id)
+
+        self._record_failure(probe_a)
+        self._record_failure(probe_b)
+
+        route.refresh_from_db()
+        assert route.circuit_state == "open"
+        assert route.cooldown_seconds == 60  # doubled once, not twice
