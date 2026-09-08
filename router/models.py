@@ -13,6 +13,10 @@ class TimestampedSoftDeleteModel(models.Model):
 
 class Ips(TimestampedSoftDeleteModel):
     ip = models.CharField(max_length=50, unique=True)
+    # TODO(#301 phase 2): deprecated — admission no longer reads this column
+    # (concurrency is scoped by user_ips now). Remove the field, drop the
+    # column via check_db_schema --fix, and remove the
+    # /api/concurrent_multiplier/update endpoint plus its repo plumbing.
     concurrent_multiplier = models.FloatField(default=1.0)
     vip = models.BooleanField(default=False)
 

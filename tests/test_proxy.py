@@ -1033,7 +1033,7 @@ def test_auto_entrance_concurrency_uses_requested_model_then_routes_by_complexit
 
     concurrency_calls = []
 
-    def fake_check_concurrency(self, ip, model, is_auto=False):
+    def fake_check_concurrency(self, ip, model, is_auto=False, identity=None):
         concurrency_calls.append((model, is_auto))
         return AdmissionResult(True)
 

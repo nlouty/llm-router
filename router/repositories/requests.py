@@ -20,6 +20,18 @@ def is_processing_q() -> models.Q:
     return models.Q(task_status__in=["processing", "prefilling", "decoding"])
 
 
+def concurrency_scope_q(user_ip_ids: list[int] | None, ip_ids: list[int] | None) -> models.Q:
+    """Rows belonging to a concurrency scope: any of the ``user_ips`` row ids
+    OR any of the bound IP ids (issue #301). Falsy when both lists are empty;
+    callers must skip filtering then (``.filter(Q())`` would match every row)."""
+    scope = models.Q()
+    if user_ip_ids:
+        scope |= models.Q(user_ip_id__in=user_ip_ids)
+    if ip_ids:
+        scope |= models.Q(ip_id__in=ip_ids)
+    return scope
+
+
 _EXTRA_STATUS_PHRASES = {
     499: "Client Closed Request",
 }
@@ -207,7 +219,12 @@ class RequestRepository:
         record.save(update_fields=["model_choosing_latency"])
 
     @staticmethod
-    def cleanup_stale(model_id: int | None = None, threshold_minutes: int = 20, ip_id: int | None = None) -> int:
+    def cleanup_stale(
+        model_id: int | None = None,
+        threshold_minutes: int = 20,
+        user_ip_ids: list[int] | None = None,
+        ip_ids: list[int] | None = None,
+    ) -> int:
         from django.db import transaction
 
         from router.models import Server
@@ -217,8 +234,9 @@ class RequestRepository:
         qs = RequestRecord.objects.filter(send_time__lt=cutoff).filter(is_processing_q())
         if model_id:
             qs = qs.filter(model_id=model_id)
-        if ip_id:
-            qs = qs.filter(ip_id=ip_id)
+        scope = concurrency_scope_q(user_ip_ids, ip_ids)
+        if scope:
+            qs = qs.filter(scope)
 
         with transaction.atomic():
             stale_records = list(qs.select_for_update(skip_locked=True)[:100])
@@ -284,15 +302,24 @@ class RequestRepository:
             return len(record_ids)
 
     @staticmethod
-    def list_processing_for_concurrency(ip_id: int) -> list[dict]:
-        """In-flight rows for an IP, excluding VIP traffic (``vip = TRUE``).
+    def list_processing_for_concurrency(user_ip_ids: list[int], ip_ids: list[int]) -> list[dict]:
+        """In-flight rows inside a concurrency scope, excluding VIP traffic (``vip = TRUE``).
 
-        VIP-channel requests are accounted separately by VIP scaling, so they
-        must not be counted against a user's normal concurrency buckets.
+        The scope is an employee footprint (issue #301): his ``user_ips`` row
+        ids (apikey or IP-backed) OR the ip ids of his bound IPs. The OR is
+        per row, so a request carrying his apikey *and* coming from his IP
+        still counts exactly once. Anonymous traffic passes its single IP.
+        VIP-channel and VIP-identity requests are accounted separately by VIP
+        scaling, so they must not be counted against a user's concurrency
+        bucket.
         """
+        scope = concurrency_scope_q(user_ip_ids, ip_ids)
+        if not scope:
+            return []
         return list(
-            RequestRecord.objects.filter(ip_id=ip_id).filter(is_processing_q())
+            RequestRecord.objects.filter(is_processing_q())
             .exclude(vip=True)
+            .filter(scope)
             .values("model_id", "router_result")
         )
 

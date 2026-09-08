@@ -49,12 +49,12 @@ curl -i http://localhost:8001/v1/chat/completions \
 - `data[].id`: model name (plus a synthetic `auto` entry for the auto-routing entrance)
 - `data[].max_context`: largest `servers.context_window` among the model's online servers (`null` = unlimited). For `auto`, the smallest such value among all models auto may redirect to (auto-selectable models with `complexity_min`/`complexity_max` set, plus the multimodal model), so the advertised ceiling holds whichever target auto picks
 - `data[].max_output_tokens`: output-token ceiling enforced by admission (`models.max_tokens`; `auto_max_tokens` for `auto`)
-- `data[].concurrent_limit`: effective per-IP concurrency ceiling (base `concurrent_limit` × `ips.concurrent_multiplier`, ×4 during the off-peak boost window); `null` on the VIP port where the concurrency check is skipped
+- `data[].concurrent_limit`: concurrency ceiling admission enforces right now (base `concurrent_limit`, ×4 during the off-peak boost window); `null` when there is no ceiling — the VIP port, or a VIP identity (`user_ips.vip`), where the concurrency check is skipped. Concurrency is counted per employee (issue #301): in-flight requests on any of his `user_ips` rows (apikey or IP-backed) or from his bound IPs share one bucket; anonymous traffic is counted per client IP
 - top-level `ip`, and `employee_no` when the identity resolved
 
 For an employee with an active external route (issue #287), the normal-port list also merges their provider's mapped model names (owned_by `external:{provider}`) with null capability limits; a mapped name shadows the internal entry, unmapped internal models stay listed, and `auto` is kept. The VIP-port list stays internal-only.
 
-Gateway internals (port, VIP channel state, multiplier, boost window) are deliberately not exposed. Deprecated models (`models.deprecation` set) are hidden on the normal port but listed on the VIP port. The response is OpenAI-compatible (`object: "list"`) so existing clients keep working. Other methods on `/v1/models` keep the legacy behavior: the request is proxied to a random online routable server.
+Gateway internals (port, VIP channel state, boost window) are deliberately not exposed. Deprecated models (`models.deprecation` set) are hidden on the normal port but listed on the VIP port. The response is OpenAI-compatible (`object: "list"`) so existing clients keep working. Other methods on `/v1/models` keep the legacy behavior: the request is proxied to a random online routable server.
 
 ```bash
 curl -i http://localhost:8001/v1/models
@@ -1570,6 +1570,8 @@ curl -i -X POST http://localhost:8001/api/live_review_requests \
 ```
 
 ## Concurrent Multiplier Update API
+
+> **Deprecated** (issue #301): admission no longer reads `ips.concurrent_multiplier` — concurrency is scoped by `user_ips` (VIP employees unlimited, others the model base limit). The endpoint still writes the column but has no effect on admission; TODO(#301 phase 2) removes it together with the column.
 
 ```http
 POST /api/concurrent_multiplier/update

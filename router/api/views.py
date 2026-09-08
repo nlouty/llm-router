@@ -1332,6 +1332,8 @@ def _parse_pagination(request, default_page_size: int = 10, max_page_size: int =
 
 @require_http_methods(["POST"])
 def update_concurrent_multiplier(request):
+    # TODO(#301 phase 2): deprecated — admission ignores the column this
+    # endpoint writes. Remove the endpoint and its URL when the column drops.
     from router.repositories.ips import IPRepository
     from router.repositories.user_ips import UserIPRepository
 
