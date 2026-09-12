@@ -44,16 +44,16 @@ def test_parser_does_not_inject_chat_params_for_embeddings():
 
 
 def test_parser_bumps_up_max_tokens_when_below_default():
-    parsed = RequestParser(default_max_tokens=28528).parse(
+    parsed = RequestParser(default_max_tokens=58528).parse(
         b'{"model":"m1","max_tokens":1000}', "chat/completions"
     )
     data = json.loads(parsed.body.decode())
-    assert parsed.max_tokens == 28528
-    assert data["max_tokens"] == 28528
+    assert parsed.max_tokens == 58528
+    assert data["max_tokens"] == 58528
 
 
 def test_parser_does_not_bump_up_max_tokens_for_vip():
-    parsed = RequestParser(default_max_tokens=28528).parse(
+    parsed = RequestParser(default_max_tokens=58528).parse(
         b'{"model":"m1","max_tokens":1000}', "chat/completions", is_vip=True
     )
     data = json.loads(parsed.body.decode())
@@ -62,27 +62,27 @@ def test_parser_does_not_bump_up_max_tokens_for_vip():
 
 
 def test_parser_does_not_bump_up_when_max_tokens_above_default():
-    parsed = RequestParser(default_max_tokens=28528).parse(
-        b'{"model":"m1","max_tokens":30000}', "chat/completions"
+    parsed = RequestParser(default_max_tokens=58528).parse(
+        b'{"model":"m1","max_tokens":60000}', "chat/completions"
     )
     data = json.loads(parsed.body.decode())
-    assert parsed.max_tokens == 30000
-    assert data["max_tokens"] == 30000
+    assert parsed.max_tokens == 60000
+    assert data["max_tokens"] == 60000
 
 
 def test_parser_does_not_bump_up_when_max_tokens_equal_default():
-    parsed = RequestParser(default_max_tokens=28528).parse(
-        b'{"model":"m1","max_tokens":28528}', "chat/completions"
+    parsed = RequestParser(default_max_tokens=58528).parse(
+        b'{"model":"m1","max_tokens":58528}', "chat/completions"
     )
     data = json.loads(parsed.body.decode())
-    assert parsed.max_tokens == 28528
-    assert data["max_tokens"] == 28528
+    assert parsed.max_tokens == 58528
+    assert data["max_tokens"] == 58528
 
 
 def test_parser_uses_max_completion_tokens_as_effective_limit():
     # vLLM honors max_completion_tokens over max_tokens, so the effective
     # limit (and the admission check) must follow it, even above the default.
-    parsed = RequestParser(default_max_tokens=28528).parse(
+    parsed = RequestParser(default_max_tokens=58528).parse(
         b'{"model":"m1","max_completion_tokens":100000}', "chat/completions"
     )
     data = json.loads(parsed.body.decode())
@@ -92,7 +92,7 @@ def test_parser_uses_max_completion_tokens_as_effective_limit():
 
 
 def test_parser_max_completion_tokens_overrides_max_tokens():
-    parsed = RequestParser(default_max_tokens=28528).parse(
+    parsed = RequestParser(default_max_tokens=58528).parse(
         b'{"model":"m1","max_tokens":5000,"max_completion_tokens":100000}', "chat/completions"
     )
     data = json.loads(parsed.body.decode())
@@ -103,16 +103,16 @@ def test_parser_max_completion_tokens_overrides_max_tokens():
 
 
 def test_parser_bumps_up_max_completion_tokens_when_below_default():
-    parsed = RequestParser(default_max_tokens=28528).parse(
+    parsed = RequestParser(default_max_tokens=58528).parse(
         b'{"model":"m1","max_completion_tokens":1000}', "chat/completions"
     )
     data = json.loads(parsed.body.decode())
-    assert parsed.max_tokens == 28528
-    assert data["max_completion_tokens"] == 28528
+    assert parsed.max_tokens == 58528
+    assert data["max_completion_tokens"] == 58528
 
 
 def test_parser_does_not_bump_up_max_completion_tokens_for_vip():
-    parsed = RequestParser(default_max_tokens=28528).parse(
+    parsed = RequestParser(default_max_tokens=58528).parse(
         b'{"model":"m1","max_completion_tokens":1000}', "chat/completions", is_vip=True
     )
     data = json.loads(parsed.body.decode())

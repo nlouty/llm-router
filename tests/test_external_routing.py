@@ -106,7 +106,7 @@ def seed_mapping(internal="glm-5.2", external="GLM-5.2", enabled=True):
 def seed_internal_model(name="glm-5.2", online=True, base_url=INTERNAL_URL, **extra):
     # max_tokens above the parser-injected default so the internal path's
     # max-token admission never interferes with routing assertions.
-    extra.setdefault("max_tokens", 40000)
+    extra.setdefault("max_tokens", 65536)
     model = Model.objects.create(model_name=name, **extra)
     Server.objects.create(model_id=model.id, base_url=base_url, is_online=online)
     return model
