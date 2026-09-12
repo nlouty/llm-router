@@ -112,7 +112,7 @@ def _seed_online_model(monkeypatch):
     # Disable the background CMDB thread so it cannot collide on sqlite writes
     # during the test, and allow the parser's injected default max_tokens.
     monkeypatch.setattr("router.views.CMDBService.fetch_and_save_user", lambda self, ip: None)
-    model = Model.objects.create(model_name="m", max_tokens=40000)
+    model = Model.objects.create(model_name="m", max_tokens=65536)
     Server.objects.create(model_id=model.id, base_url="http://up.example", is_online=True)
     return model
 

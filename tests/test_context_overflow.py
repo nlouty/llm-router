@@ -270,3 +270,126 @@ def test_sync_500_error_returns_real_body_when_retries_exhausted(monkeypatch):
     assert response.status_code == 429
     assert b"rate limited by upstream" in response.content
 
+
+def _seed_single_small_window_model():
+    model = Model.objects.create(model_name="Other-Model", max_tokens=65536)
+    Server.objects.create(
+        model_id=model.id,
+        base_url="http://other.example",
+        is_online=True,
+        context_window=1000,
+    )
+    return model
+
+
+@pytest.mark.django_db
+def test_context_overflow_reduces_output_tokens_when_no_larger_window(monkeypatch):
+    # Issue #306: with no larger-window same-model server, step the output
+    # budget down (58528 -> 38528) and retry the same server; the smaller
+    # request fits and succeeds.
+    _seed_single_small_window_model()
+
+    sent = []
+    def fake_request(self_inner, method, url, **kwargs):
+        body = json.loads(kwargs["data"].decode())
+        sent.append(body["max_tokens"])
+        upstream = MagicMock()
+        upstream.headers = {"content-type": "application/json"}
+        if body["max_tokens"] > 38528:
+            upstream.status_code = 400
+            upstream.reason = "Bad Request"
+            upstream.content = b'{"error": {"message": "context window 1000 exceeded"}}'
+        else:
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices": [{"message": {"content": "ok"}}]}'
+        return upstream
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fake_request,
+    )
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "Other-Model", "messages": [{"role": "user", "content": "hello"}]}),
+        content_type="application/json",
+        HTTP_X_FORWARDED_FOR="1.2.3.4",
+    )
+
+    assert response.status_code == 200
+    assert sent == [58528, 38528]
+
+
+@pytest.mark.django_db
+def test_context_overflow_output_ladder_exhausted_returns_real_error(monkeypatch):
+    # Issue #306: when even the 18528 rung cannot be processed, the real
+    # upstream overflow error is returned to the user.
+    _seed_single_small_window_model()
+
+    sent = []
+    def fake_request(self_inner, method, url, **kwargs):
+        body = json.loads(kwargs["data"].decode())
+        sent.append(body["max_tokens"])
+        upstream = MagicMock()
+        upstream.status_code = 400
+        upstream.reason = "Bad Request"
+        upstream.content = b'{"error": {"message": "context window 1000 exceeded"}}'
+        upstream.headers = {"content-type": "application/json"}
+        return upstream
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fake_request,
+    )
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "Other-Model", "messages": [{"role": "user", "content": "hello"}]}),
+        content_type="application/json",
+        HTTP_X_FORWARDED_FOR="1.2.3.4",
+    )
+
+    assert response.status_code == 400
+    assert b"context window 1000 exceeded" in response.content
+    assert sent == [58528, 38528, 18528]
+
+
+@pytest.mark.django_db
+def test_context_overflow_reduction_rewrites_max_completion_tokens(monkeypatch):
+    # vLLM honors max_completion_tokens over max_tokens, so the reduction must
+    # rewrite that field and never inject a max_tokens key.
+    _seed_single_small_window_model()
+
+    sent = []
+    def fake_request(self_inner, method, url, **kwargs):
+        body = json.loads(kwargs["data"].decode())
+        sent.append(body)
+        upstream = MagicMock()
+        upstream.headers = {"content-type": "application/json"}
+        if body["max_completion_tokens"] > 38528:
+            upstream.status_code = 400
+            upstream.reason = "Bad Request"
+            upstream.content = b'{"error": {"message": "context window 1000 exceeded"}}'
+        else:
+            upstream.status_code = 200
+            upstream.reason = "OK"
+            upstream.content = b'{"choices": [{"message": {"content": "ok"}}]}'
+        return upstream
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fake_request,
+    )
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "Other-Model", "max_completion_tokens": 1000, "messages": [{"role": "user", "content": "hello"}]}),
+        content_type="application/json",
+        HTTP_X_FORWARDED_FOR="1.2.3.4",
+    )
+
+    assert response.status_code == 200
+    assert [body["max_completion_tokens"] for body in sent] == [58528, 38528]
+    assert all("max_tokens" not in body for body in sent)
+

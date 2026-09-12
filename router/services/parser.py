@@ -23,7 +23,7 @@ class ParsedRequest:
 
 
 class RequestParser:
-    def __init__(self, default_max_tokens: int = 28528):
+    def __init__(self, default_max_tokens: int = 58528):
         self.default_max_tokens = default_max_tokens
 
     def parse(self, body: bytes, path: str = "", *, is_vip: bool = False) -> ParsedRequest:

@@ -37,7 +37,7 @@ class AdmissionService:
         )
         self.stale_minutes = int(APP_CONFIG.get("proxy", {}).get("stale_processing_minutes", 20))
         self.unknown_model_max_tokens = int(APP_CONFIG.get("proxy", {}).get("unknown_model_max_tokens", 20480))
-        self.auto_max_tokens = int(APP_CONFIG.get("proxy", {}).get("auto_max_tokens", 40000))
+        self.auto_max_tokens = int(APP_CONFIG.get("proxy", {}).get("auto_max_tokens", 65536))
 
     def check_permission(self, identity) -> AdmissionResult:
         """Permission decision for a non-apikey identity.

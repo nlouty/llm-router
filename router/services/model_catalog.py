@@ -37,7 +37,7 @@ class ModelCatalogService:
 
     def __init__(self):
         proxy_config = APP_CONFIG.get("proxy", {})
-        self.auto_max_tokens = int(proxy_config.get("auto_max_tokens", 40000))
+        self.auto_max_tokens = int(proxy_config.get("auto_max_tokens", 65536))
         self.auto_concurrent_limit = int(
             APP_CONFIG.get("router", {}).get("auto_concurrent_limit", 6)
         )
