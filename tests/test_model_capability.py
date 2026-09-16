@@ -76,7 +76,7 @@ def test_normal_port_capabilities():
     assert entry_b["concurrent_limit"] == 10
 
     auto = _entry_by_id(payload, "auto")
-    assert auto["max_output_tokens"] == 40000
+    assert auto["max_output_tokens"] == 65536
     assert auto["max_context"] == 200000  # min over auto targets (only model-a)
     assert auto["concurrent_limit"] == 6
 

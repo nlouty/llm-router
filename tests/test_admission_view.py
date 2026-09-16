@@ -49,24 +49,24 @@ def test_max_tokens_fail_reason_matches():
 
 def test_auto_max_tokens_uses_global_limit():
     admission = AdmissionService()
-    assert admission.check_max_tokens(40000, None, is_auto=True).allowed is True
-    result = admission.check_max_tokens(40001, None, is_auto=True)
+    assert admission.check_max_tokens(65536, None, is_auto=True).allowed is True
+    result = admission.check_max_tokens(65537, None, is_auto=True)
     assert result.allowed is False
-    assert "Max allowed is 40000" in result.message
+    assert "Max allowed is 65536" in result.message
 
 
 @pytest.mark.django_db
 def test_auto_request_over_global_limit_returns_400():
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "auto", "max_tokens": 50000}),
+        data=json.dumps({"model": "auto", "max_tokens": 70000}),
         content_type="application/json",
     )
 
     assert response.status_code == 400
     data = response.json()
     assert data["error"]["type"] == "invalid_request_error"
-    assert "Max allowed is 40000" in data["error"]["message"]
+    assert "Max allowed is 65536" in data["error"]["message"]
 
     from router.models import RequestRecord
     record = RequestRecord.objects.last()
@@ -108,12 +108,12 @@ def test_auto_flagged_model_over_global_limit_returns_400():
 
     response = Client().post(
         "/v1/chat/completions",
-        data=json.dumps({"model": "source-model", "max_tokens": 50000}),
+        data=json.dumps({"model": "source-model", "max_tokens": 70000}),
         content_type="application/json",
     )
 
     assert response.status_code == 400
-    assert "Max allowed is 40000" in response.json()["error"]["message"]
+    assert "Max allowed is 65536" in response.json()["error"]["message"]
 
 
 @pytest.mark.django_db
@@ -129,7 +129,7 @@ def test_auto_request_over_global_limit_via_max_completion_tokens_returns_400():
     assert response.status_code == 400
     data = response.json()
     assert data["error"]["type"] == "invalid_request_error"
-    assert "Max allowed is 40000" in data["error"]["message"]
+    assert "Max allowed is 65536" in data["error"]["message"]
 
     from router.models import RequestRecord
     record = RequestRecord.objects.last()

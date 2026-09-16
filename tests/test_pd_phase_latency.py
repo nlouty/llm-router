@@ -27,7 +27,7 @@ def _disable_cmdb(monkeypatch):
 
 def _seed_single_node(monkeypatch):
     _disable_cmdb(monkeypatch)
-    model = Model.objects.create(model_name="phase-model", max_tokens=40000)
+    model = Model.objects.create(model_name="phase-model", max_tokens=65536)
     Server.objects.create(model_id=model.id, base_url="http://phase-up.example", is_online=True)
     return model
 

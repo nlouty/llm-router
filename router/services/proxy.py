@@ -80,6 +80,10 @@ class _RetryState:
     last_upstream: Any = None
     last_content: bytes = b""
     last_fail_reason: str | None = None
+    # Position in context_overflow_output_fallbacks for the output-token
+    # reduction ladder (issue #306); advances once per step-down so a request
+    # can only descend the ladder, never cycle through it.
+    overflow_reduction_index: int = 0
 
 
 @dataclass
@@ -89,6 +93,38 @@ class _RouteAttemptResult:
     candidates: Any = None
     model: Any = None
     body: bytes | None = None
+
+
+def _effective_output_tokens(body: bytes) -> int | None:
+    """The generation limit the upstream will honor for this body (vLLM:
+    max_completion_tokens takes precedence over max_tokens)."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        if data.get("max_completion_tokens") is not None:
+            return int(data.get("max_completion_tokens"))
+        return int(data.get("max_tokens"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _with_output_tokens(body: bytes, value: int) -> bytes | None:
+    """Body copy with the generation limit lowered to ``value``, rewriting the
+    field the upstream will actually honor. None when the body is not a JSON
+    object."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    token_key = "max_completion_tokens" if data.get("max_completion_tokens") is not None else "max_tokens"
+    data[token_key] = value
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 class ProxyService:
@@ -108,6 +144,9 @@ class ProxyService:
         )
         self.llm_choosing_timeout = float(proxy_config.get("llm_choosing_timeout_seconds", 10))
         self.stream_total_timeout = float(proxy_config.get("stream_total_timeout_seconds", 900))
+        self.context_overflow_output_fallbacks = [
+            int(v) for v in proxy_config.get("context_overflow_output_fallbacks", [38528, 18528])
+        ]
         self.client_disconnect_check_interval = float(proxy_config.get("client_disconnect_check_interval_seconds", 0.5))
         self.opencode_failure_delay = float(proxy_config.get("opencode_failure_delay_seconds", 30))
         self.circuit_breaker = CircuitBreakerService()
@@ -183,7 +222,7 @@ class ProxyService:
         normal_read_timeout_seconds per attempt.
         """
         parsed = RequestParser(
-            int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 28528))
+            int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 58528))
         ).parse(body, path, is_vip=False)
         internal_request = HttpRequest()
         internal_request.method = "POST"
@@ -867,8 +906,10 @@ class ProxyService:
         # On a real context overflow, retry on a same-model server with a
         # strictly larger context window (the chooser excludes already-tried
         # servers). The router never switches to a different model on overflow
-        # (issue #224); if no larger-window same-model server exists the real
-        # upstream error surfaces. Issue #153: never pre-decide by estimated tokens.
+        # (issue #224); if no larger-window same-model server exists, step the
+        # output-token budget down the configured ladder and retry (issue #306);
+        # once that ladder is exhausted the real upstream error surfaces.
+        # Issue #153: never pre-decide by estimated tokens.
         if (
             self.auto_router.check_context_overflow(status_code, failed_context_window, fail_reason)
             and failed_context_window
@@ -883,6 +924,11 @@ class ProxyService:
                     model=model,
                     body=body,
                 )
+            reduction = self._overflow_reduction_retry(
+                record, context, served_as_vip, model, body, state,
+            )
+            if reduction is not None:
+                return reduction
 
         proxy_response.finish_upstream_error(
             record,
@@ -906,6 +952,43 @@ class ProxyService:
         return _RouteAttemptResult(
             response=proxy_response.response_from_upstream(upstream, content, status_code)
         )
+
+    def _overflow_reduction_retry(self, record, context, served_as_vip, model, body, state: _RetryState):
+        """Issue #306: with no larger-window same-model server left, step the
+        output-token budget down context_overflow_output_fallbacks (38528,
+        then 18528 by default) and retry the normal candidate pool. Each
+        step-down is a materially new request, so the attempt budget and the
+        tried-server set reset — the same servers may fit with the smaller
+        output budget. Rungs not lower than the current budget are skipped
+        (a small explicit budget cannot be raised to fix an overflow); when no
+        rung applies the ladder is exhausted and None is returned so the real
+        upstream error surfaces."""
+        current = _effective_output_tokens(body)
+        while state.overflow_reduction_index < len(self.context_overflow_output_fallbacks):
+            value = self.context_overflow_output_fallbacks[state.overflow_reduction_index]
+            state.overflow_reduction_index += 1
+            if current is None or value >= current:
+                continue
+            new_body = _with_output_tokens(body, value)
+            if new_body is None:
+                return None
+            append_request_log(record.id, json.dumps({
+                "event": "context_overflow_output_reduction",
+                "from_max_tokens": current,
+                "to_max_tokens": value,
+            }, ensure_ascii=False))
+            candidates, _ = self._select_candidates(context.path, model, served_as_vip)
+            if not candidates:
+                return None
+            state.attempts = 0
+            state.attempted_server_ids.clear()
+            return _RouteAttemptResult(
+                should_retry=True,
+                candidates=candidates,
+                model=model,
+                body=new_body,
+            )
+        return None
 
     def _normal_success_response(self, upstream, content, record, model, context, status_code, reason, target_pod_ip, attempts, served_as_vip):
         proxy_response.finish_normal_success(

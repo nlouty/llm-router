@@ -127,7 +127,7 @@ def proxy(request, path: str):
         if normalized_path == "models" and request.method == "GET":
             return _models_capability_response(request, ip, identity, is_vip_channel)
 
-        parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 28528)))
+        parser = RequestParser(int(APP_CONFIG.get("proxy", {}).get("default_max_tokens", 58528)))
         parsed = parser.parse(body, path, is_vip=is_vip_channel)
         input_model_name = parsed.model_name
         input_is_auto = ModelRepository.is_auto_model_name(input_model_name)
