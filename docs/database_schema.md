@@ -299,6 +299,8 @@ The provider circuit mirrors `servers` (`load_balancer.circuit_breaker.*` thresh
 
 Recording conventions: `router_result = "external:{name}:{internal_model_name}"` — the `external:` prefix must stay first because `AdmissionService` buckets in-flight rows by the prefix before the first colon (any other format would count external requests toward an internal model's or the auto concurrency bucket); it is persisted at dispatch, never NULL in flight. `target_pod_ip` stores the provider `base_url` (matches no `servers` row, so stale cleanup's workload decrement is a no-op). `model_id` is the internal model's id when one exists, else 0 — provider-only names never get a `models` row created. `GET /v1/models` merges the mapped names (owned_by `external:{name}`, null capability limits) over the internal list for mapped employees on the normal port; mapped names shadow the internal entries.
 
+Statistics (issue #308): the `external:` prefix also marks provider rows for the stats API. Latency queries (`request_time_stats`, `model_request_time_stats`, `model_latency_boxplot`) and `model_request_count_by_period` exclude them via `internal_only_q()` in `router/repositories/requests.py` (NULL-safe: a NULL or non-`external:` `router_result` counts as internally served); every other stats query — request counts, token sums, distinct IPs, per-employee access stats — keeps them.
+
 ## `requests` Table
 
 Current request-tracking columns include:

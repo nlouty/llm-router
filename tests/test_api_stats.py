@@ -11,7 +11,7 @@ def _dt(value):
     return timezone.make_aware(datetime.strptime(value, "%Y-%m-%d %H:%M:%S"), ZoneInfo("Asia/Shanghai"))
 
 
-def _request(model, send_time, task_status="success", latency=100, ip_id=1):
+def _request(model, send_time, task_status="success", latency=100, ip_id=1, router_result=None):
     return RequestRecord.objects.create(
         user_ip_id=1,
         ip_id=ip_id,
@@ -20,6 +20,7 @@ def _request(model, send_time, task_status="success", latency=100, ip_id=1):
         latency=latency,
         model_id=model.id,
         task_status=task_status,
+        router_result=router_result,
         input_token_cnt=0,
         output_token_cnt=0,
     )
@@ -223,3 +224,68 @@ def test_granularity_thresholds():
     assert daily.json()["stats"][1]["time"] == "2026-01-02"
     assert monthly.json()["stats"][0]["time"] == "2026-01"
     assert monthly.json()["stats"][1]["time"] == "2026-02"
+
+
+def test_latency_and_period_count_stats_exclude_external_provider_rows():
+    client = Client()
+    model = Model.objects.create(model_name="model-a", concurrent_limit=3)
+    for latency in [100, 200, 300, 400]:
+        _request(model, "2026-01-01 00:10:00", latency=latency)
+    # Issue #308: a provider-diverted row shares model_id and carries a wild
+    # latency; it must stay out of the latency charts and the period count.
+    # (Below the boxplot's 890s drop threshold, so the exclusion itself is
+    # what keeps it out, not the over-limit filter.)
+    _request(
+        model,
+        "2026-01-01 00:20:00",
+        latency=5000,
+        router_result="external:prov-a:model-a",
+    )
+
+    time_response = client.get(
+        "/api/request_time_stats",
+        {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00"},
+    )
+    model_time_response = client.get(
+        "/api/model_request_time_stats",
+        {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00", "model_name": "model-a"},
+    )
+    boxplot_response = client.get(
+        "/api/model_latency_boxplot",
+        {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00", "model_names": "model-a"},
+    )
+    count_response = client.get(
+        "/api/model_request_count_by_period",
+        {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00", "model_name": "model-a"},
+    )
+
+    assert time_response.json()["stats"][0]["avg_duration_ms"] == 250.0
+    assert model_time_response.json()["stats"][0]["avg_duration_ms"] == 250.0
+    assert boxplot_response.json()["model_data"]["model-a"] == {
+        "time_labels": ["00:00"],
+        "boxplot_data": [[100.0, 150.0, 200.0, 250.0, 300.0]],
+        "over_threshold_count": [0],
+        "over_threshold_ratio": [0.0],
+    }
+    assert count_response.json()["stats"][0]["count"] == 4
+
+
+def test_other_stats_keep_external_provider_rows():
+    client = Client()
+    model = Model.objects.create(model_name="model-a", concurrent_limit=3)
+    _request(model, "2026-01-01 00:10:00", ip_id=1)
+    _request(model, "2026-01-01 00:20:00", ip_id=2, router_result="external:prov-a:model-a")
+
+    total = client.get("/api/total_request_count", {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00"})
+    by_model = client.get(
+        "/api/model_request_stats",
+        {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00", "model_name": "model-a"},
+    )
+    ips_by_period = client.get(
+        "/api/model_ip_count_by_period",
+        {"start_time": "2026-01-01 00:00:00", "end_time": "2026-01-01 01:00:00", "model_name": "model-a"},
+    )
+
+    assert total.json()["total_count"] == 2
+    assert by_model.json()["total_count"] == 2
+    assert ips_by_period.json()["stats"][0]["count"] == 2

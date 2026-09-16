@@ -20,6 +20,15 @@ def is_processing_q() -> models.Q:
     return models.Q(task_status__in=["processing", "prefilling", "decoding"])
 
 
+def internal_only_q() -> models.Q:
+    """Rows served by internal servers only (issue #308): external-provider
+    rows carry ``router_result = "external:<provider>:<model>"``; NULL or any
+    other prefix (``auto:``, ``user-model:``, ...) means internal serving."""
+    return models.Q(router_result__isnull=True) | ~models.Q(
+        router_result__startswith="external:"
+    )
+
+
 def concurrency_scope_q(user_ip_ids: list[int] | None, ip_ids: list[int] | None) -> models.Q:
     """Rows belonging to a concurrency scope: any of the ``user_ips`` row ids
     OR any of the bound IP ids (issue #301). Falsy when both lists are empty;
@@ -416,7 +425,7 @@ class RequestRepository:
             send_time__lte=end,
             task_status="success",
             latency__isnull=False,
-        )
+        ).filter(internal_only_q())
         if model_id is not None:
             qs = qs.filter(model_id=model_id)
         return {
@@ -430,7 +439,7 @@ class RequestRepository:
             send_time__gte=start,
             send_time__lte=end,
             task_status="success",
-        )
+        ).filter(internal_only_q())
         if model_id is not None:
             qs = qs.filter(model_id=model_id)
         
@@ -466,13 +475,16 @@ class RequestRepository:
         if not model_ids:
             return []
         return list(
-            RequestRepository.external_requests().filter(
+            RequestRepository.external_requests()
+            .filter(
                 send_time__gte=start,
                 send_time__lte=end,
                 task_status="success",
                 latency__isnull=False,
                 model_id__in=model_ids,
-            ).values("model_id", "send_time", "latency")
+            )
+            .filter(internal_only_q())
+            .values("model_id", "send_time", "latency")
         )
 
     @staticmethod
