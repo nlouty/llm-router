@@ -58,13 +58,13 @@ class ExternalProxyService:
         cb_config = APP_CONFIG.get("load_balancer", {}).get("circuit_breaker", {})
         self.stream_timeout = (
             float(proxy_config.get("stream_connect_timeout_seconds", 30)),
-            float(proxy_config.get("stream_read_timeout_seconds", 900)),
+            float(proxy_config.get("stream_read_timeout_seconds", 3660)),
         )
         self.normal_timeout = (
             float(proxy_config.get("normal_connect_timeout_seconds", 5)),
-            float(proxy_config.get("normal_read_timeout_seconds", 900)),
+            float(proxy_config.get("normal_read_timeout_seconds", 3660)),
         )
-        self.stream_total_timeout = float(proxy_config.get("stream_total_timeout_seconds", 900))
+        self.stream_total_timeout = float(proxy_config.get("stream_total_timeout_seconds", 3660))
         self.client_disconnect_check_interval = float(
             proxy_config.get("client_disconnect_check_interval_seconds", 0.5)
         )

@@ -230,7 +230,7 @@ class RequestRepository:
     @staticmethod
     def cleanup_stale(
         model_id: int | None = None,
-        threshold_minutes: int = 20,
+        threshold_minutes: int = 66,
         user_ip_ids: list[int] | None = None,
         ip_ids: list[int] | None = None,
     ) -> int:

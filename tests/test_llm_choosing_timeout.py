@@ -5,7 +5,7 @@ The choosing request re-enters the router's own pipeline in-process
 seconds: every upstream attempt's (connect, read) socket timeouts are clamped
 to the remaining budget, so a hung routing server is disconnected at the
 deadline and the choosing call ends as a 504 instead of blocking for up to
-normal_read_timeout_seconds (900s) per attempt.
+normal_read_timeout_seconds (3660s) per attempt.
 """
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def test_llm_choosing_clamps_single_node_socket_timeout_to_budget(monkeypatch):
     assert router_result == "complexity:5"
     connect_timeout, read_timeout = captured["timeout"]
     # Socket timeouts are clamped to the remaining choosing budget (2s), not
-    # the normal (5, 900) client-request timeouts.
+    # the normal (5, 3660) client-request timeouts.
     assert 0 < read_timeout <= 2
     assert 0 < connect_timeout <= 2
 
@@ -155,7 +155,7 @@ def test_llm_choosing_clamps_pd_prefill_and_decode_timeouts_to_budget(monkeypatc
     assert model == target_model
     assert router_result == "complexity:5"
     # Both PD phases (prefill then decode) are clamped to the remaining
-    # choosing budget instead of prefill (5, 300) / normal (5, 900).
+    # choosing budget instead of prefill (5, 300) / normal (5, 3660).
     assert len(timeouts) == 2
     for connect_timeout, read_timeout in timeouts:
         assert 0 < read_timeout <= 2

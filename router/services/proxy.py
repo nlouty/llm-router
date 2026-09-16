@@ -136,14 +136,14 @@ class ProxyService:
         self.auto_router = AutoRouteAlgorithm(self.chooser, proxy=self)
         self.stream_timeout = (
             float(proxy_config.get("stream_connect_timeout_seconds", 30)),
-            float(proxy_config.get("stream_read_timeout_seconds", 900)),
+            float(proxy_config.get("stream_read_timeout_seconds", 3660)),
         )
         self.normal_timeout = (
             float(proxy_config.get("normal_connect_timeout_seconds", 5)),
-            float(proxy_config.get("normal_read_timeout_seconds", 900)),
+            float(proxy_config.get("normal_read_timeout_seconds", 3660)),
         )
         self.llm_choosing_timeout = float(proxy_config.get("llm_choosing_timeout_seconds", 10))
-        self.stream_total_timeout = float(proxy_config.get("stream_total_timeout_seconds", 900))
+        self.stream_total_timeout = float(proxy_config.get("stream_total_timeout_seconds", 3660))
         self.context_overflow_output_fallbacks = [
             int(v) for v in proxy_config.get("context_overflow_output_fallbacks", [38528, 18528])
         ]

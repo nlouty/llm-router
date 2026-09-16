@@ -23,8 +23,8 @@ exec gunicorn router_project.wsgi:application \
   --workers "${GUNICORN_WORKERS:-8}" \
   --threads "${GUNICORN_THREADS:-64}" \
   --worker-class gthread \
-  --timeout "${GUNICORN_TIMEOUT:-960}" \
-  --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT:-1200}" \
+  --timeout "${GUNICORN_TIMEOUT:-3720}" \
+  --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT:-3960}" \
   --max-requests "${GUNICORN_MAX_REQUESTS:-3000}" \
   --max-requests-jitter "${GUNICORN_MAX_REQUESTS_JITTER:-3000}" \
   --access-logfile - \

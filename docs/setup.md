@@ -158,8 +158,8 @@ gunicorn router_project.wsgi:application \
   --workers 8 \
   --threads 64 \
   --worker-class gthread \
-  --timeout 960 \
-  --graceful-timeout 1200 \
+  --timeout 3720 \
+  --graceful-timeout 3960 \
   --max-requests 3000 \
   --max-requests-jitter 3000 \
   --access-logfile - \
