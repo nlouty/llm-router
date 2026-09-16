@@ -35,7 +35,7 @@ class AdmissionService:
         self.missing_user_info_message = admission_config.get(
             "user_info_missing_message", "Access denied, you do not have permission"
         )
-        self.stale_minutes = int(APP_CONFIG.get("proxy", {}).get("stale_processing_minutes", 20))
+        self.stale_minutes = int(APP_CONFIG.get("proxy", {}).get("stale_processing_minutes", 66))
         self.unknown_model_max_tokens = int(APP_CONFIG.get("proxy", {}).get("unknown_model_max_tokens", 20480))
         self.auto_max_tokens = int(APP_CONFIG.get("proxy", {}).get("auto_max_tokens", 65536))
 

@@ -32,11 +32,11 @@ python manage.py prod check_server_health --server-id 12
 
 ## `cleanup_stale_processing`
 
-Flips `processing` rows older than the threshold (default 20 minutes) to `incomplete` with `fail_reason="stale processing"` and decrements upstream workload counters.
+Flips `processing` rows older than the threshold to `incomplete` with `fail_reason="stale processing"` and decrements upstream workload counters. The default threshold comes from `proxy.stale_processing_minutes` (66 minutes — request timeout plus 5 minutes, issue #305), so a cron run with no arguments never reaps requests that are still within the timeout budget.
 
 ```bash
-python manage.py prod cleanup_stale_processing --threshold 20
-python manage.py prod cleanup_stale_processing --threshold 20 --dry-run
+python manage.py prod cleanup_stale_processing
+python manage.py prod cleanup_stale_processing --threshold 66 --dry-run
 ```
 
 ## `release_vip_cooldowns`

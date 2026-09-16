@@ -23,7 +23,7 @@ exec gunicorn router_project.wsgi:application \
   --workers "${GUNICORN_WORKERS:-1}" \
   --threads "${GUNICORN_THREADS:-8}" \
   --worker-class gthread \
-  --timeout "${GUNICORN_TIMEOUT:-960}" \
-  --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT:-1200}" \
+  --timeout "${GUNICORN_TIMEOUT:-3720}" \
+  --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT:-3960}" \
   --access-logfile - \
   --error-logfile -

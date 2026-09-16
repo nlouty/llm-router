@@ -22,13 +22,13 @@ proxy:
   auto_max_tokens: 65536
   context_overflow_output_fallbacks: [38528, 18528]
   stream_connect_timeout_seconds: 30
-  stream_read_timeout_seconds: 900
-  stream_total_timeout_seconds: 900
+  stream_read_timeout_seconds: 3660
+  stream_total_timeout_seconds: 3660
   normal_connect_timeout_seconds: 5
-  normal_read_timeout_seconds: 900
+  normal_read_timeout_seconds: 3660
   llm_choosing_timeout_seconds: 10
   client_disconnect_check_interval_seconds: 0.5
-  stale_processing_minutes: 20
+  stale_processing_minutes: 66
   opencode_failure_delay_seconds: 180
 
 load_balancer:
@@ -136,7 +136,7 @@ Prefix cache blocks are measured in Python Unicode characters, not LLM tokenizer
 
 `vip.cooldown_seconds` controls how long a VIP server stays in cooldown before it can be demoted to the normal pool. `vip.min_normal_servers` keeps at least that many normal servers available when VIP scale-up promotes servers.
 
-`proxy.default_max_tokens` is injected into JSON bodies that omit `max_tokens`. `proxy.unknown_model_max_tokens` is used only when admission checks a request without a model name. `proxy.auto_max_tokens` is the `max_tokens` limit for auto-routed requests — exact `model: auto` or any model with `auto = TRUE` — because the serving target is not known until routing resolves it. `proxy.context_overflow_output_fallbacks` is the descending ladder of output-token budgets the router steps through when a context overflow cannot be fixed by a larger-window server (issue #306); a rung is only used when it is lower than the request's current budget, and once the last rung still overflows the real upstream error is returned. Stream and normal requests have separate connect/read timeout settings; streaming also has `stream_total_timeout_seconds`. `proxy.llm_choosing_timeout_seconds` is the absolute budget for the internal llm-choosing request: every attempt's socket timeouts are clamped to the remaining budget, so a hung routing server is disconnected at the deadline and the choosing call fails fast with a 504 (the client request then falls back to the default model). Choosing-request failures are not recorded by the circuit breaker — only real client traffic and the `check_server_health` command count toward `consecutive_failures` — while choosing-request successes still reset the counter and close an open circuit.
+`proxy.default_max_tokens` is injected into JSON bodies that omit `max_tokens`. `proxy.unknown_model_max_tokens` is used only when admission checks a request without a model name. `proxy.auto_max_tokens` is the `max_tokens` limit for auto-routed requests — exact `model: auto` or any model with `auto = TRUE` — because the serving target is not known until routing resolves it. `proxy.context_overflow_output_fallbacks` is the descending ladder of output-token budgets the router steps through when a context overflow cannot be fixed by a larger-window server (issue #306); a rung is only used when it is lower than the request's current budget, and once the last rung still overflows the real upstream error is returned. Stream and normal requests have separate connect/read timeout settings; streaming also has `stream_total_timeout_seconds`. `proxy.stale_processing_minutes` must exceed `stream_total_timeout_seconds` by at least 5 minutes (issue #305): the router enforces this invariant at startup, so in-flight requests are never reaped as stale while still inside the timeout budget. `proxy.llm_choosing_timeout_seconds` is the absolute budget for the internal llm-choosing request: every attempt's socket timeouts are clamped to the remaining budget, so a hung routing server is disconnected at the deadline and the choosing call fails fast with a 504 (the client request then falls back to the default model). Choosing-request failures are not recorded by the circuit breaker — only real client traffic and the `check_server_health` command count toward `consecutive_failures` — while choosing-request successes still reset the counter and close an open circuit.
 
 `load_balancer.chooser_class` must point to a class implementing `choose(candidates, context, attempted_server_ids)`. The default prefix-cache chooser stores successful request prefixes in Redis and falls back to least-connection selection when no useful cache match exists. Retries are attempted **only** on connection failures (the request body never reached the upstream, so retrying another server is safe for non-idempotent POST). Read timeouts and any HTTP response status — including the values listed in `retry_status_codes` — are **not** retried; the only deliberate exception is context-overflow, which first retries on a larger-context server/model and then, when no larger-window server exists, steps the output-token budget down `proxy.context_overflow_output_fallbacks` (issue #306) — each step-down resets the attempt budget so the same servers can be retried with the smaller body. `mark_unhealthy_status_codes` controls passive circuit-breaker failures.
 
