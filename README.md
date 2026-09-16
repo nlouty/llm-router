@@ -73,6 +73,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - `request_time_stats`, `model_request_time_stats` (bucketed average latency)
   - `model_request_count_by_period`, `model_ip_count_by_period` (bucketed counts)
   - `model_latency_boxplot`: min/Q1/median/Q3/max + over-limit ratio, drops > 890s, trims top 1%
+  - Latency stats and `model_request_count_by_period` exclude external-provider requests (rows with `router_result` `external:…`, issue #308); every other stats query keeps them
   - `models`, `model_online_list`, `model_info` model catalog endpoints; automatic hour/day/month granularity selection in Asia/Shanghai
   - MR live review and CodeHub review ingestion/list/statistics endpoints
 

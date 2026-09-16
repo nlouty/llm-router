@@ -14,7 +14,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 |------|----------|
 | `test_admission_view.py` | Deprecated model, max-token, unknown-model, and unknown-small-request admission failures |
 | `test_api_download.py` | `/api/download/ai_assistant` success and 404 paths |
-| `test_api_stats.py` | Stats endpoints, hour/day/month bucketing, boxplot edge cases |
+| `test_api_stats.py` | Stats endpoints, hour/day/month bucketing, boxplot edge cases, external-provider row exclusion (latency + period counts) vs retention elsewhere |
 | `test_cancellable_upstream.py` | `CancellableUpstreamRequest.cancel()` shuts down in-flight HTTP via socket close |
 | `test_check_db_schema.py` | `check_db_schema` drift detection and `--fix` on PostgreSQL |
 | `test_circuit_breaker.py` | Failure counting, threshold, open/half_open transitions, cooldown escalation per probe cycle (not per failure, issue #300) |
