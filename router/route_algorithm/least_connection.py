@@ -4,6 +4,7 @@ import random
 from typing import Any, Callable, Sequence
 
 from router.route_algorithm.base import ServerSelectionContext
+from router.utils.target import server_target
 
 
 def effective_weight(server: Any) -> int:
@@ -75,10 +76,10 @@ class LeastConnectionServerChooser:
     def _load_counts(self, available: Sequence[Any]) -> dict[int, int]:
         if self.server_count_provider:
             return self.server_count_provider(available)
-        targets = [server.base_url for server in available]
-        processing_counts = self._count_processing(targets)
+        targets = {server.id: server_target(server) for server in available}
+        processing_counts = self._count_processing(list(targets.values()))
         return {
-            server.id: processing_counts.get(server.base_url, 0)
+            server.id: processing_counts.get(targets[server.id], 0)
             for server in available
         }
 

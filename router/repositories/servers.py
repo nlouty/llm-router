@@ -11,6 +11,7 @@ from router.config import APP_CONFIG
 from router.models import Server, is_prefiller_role
 from router.services.request_context import get_request_id
 from router.services.request_logger import append_request_log
+from router.utils.target import parse_server_target, server_target
 
 # Arbitrary key for the workload-recalculation advisory lock. Only one
 # corrector run may hold it at a time so concurrent runs serialize.
@@ -188,12 +189,56 @@ class ServerRepository:
 
     @staticmethod
     def decrement_workload_by_targets(target_counts: dict[str, int]) -> None:
-        for base_url, count in target_counts.items():
-            if not base_url or count <= 0:
+        """Decrement workload for stale requests grouped by target string.
+
+        Qualified targets (``base_url#s<id>``, issue #310 — rows sharing a
+        base_url) decrement exactly the row that served those requests;
+        plain/legacy targets attribute to every row on that base_url.
+        """
+        for target, count in target_counts.items():
+            if not target or count <= 0:
                 continue
-            Server.objects.filter(base_url=base_url).update(
-                workload=Greatest(F("workload") - count, Value(0))
-            )
+            base_url, server_id = parse_server_target(target)
+            if server_id is not None:
+                Server.objects.filter(id=server_id).update(
+                    workload=Greatest(F("workload") - count, Value(0))
+                )
+            else:
+                Server.objects.filter(base_url=base_url).update(
+                    workload=Greatest(F("workload") - count, Value(0))
+                )
+
+    @staticmethod
+    def release_active_tokens_by_targets(target_token_sums: dict[str, float]) -> None:
+        """Release stale decode tokens against the exact decoder rows.
+
+        Qualified targets release on the row identified by their ``#s<id>``
+        suffix; plain/legacy targets fall back to the row found on that
+        base_url (pre-#310 behavior).
+        """
+        id_targets: dict[int, float] = {}
+        url_targets: dict[str, float] = {}
+        for target, tokens in target_token_sums.items():
+            if not target or tokens <= 0:
+                continue
+            base_url, server_id = parse_server_target(target)
+            if server_id is not None:
+                id_targets[server_id] = id_targets.get(server_id, 0.0) + tokens
+            elif base_url:
+                url_targets[base_url] = url_targets.get(base_url, 0.0) + tokens
+        for server_id, tokens in id_targets.items():
+            server = Server.objects.filter(id=server_id).first()
+            if server is not None:
+                ServerRepository.release_active_tokens(server, tokens)
+        if url_targets:
+            url_servers = {
+                s.base_url: s
+                for s in Server.objects.filter(base_url__in=list(url_targets.keys()))
+            }
+            for base_url, tokens in url_targets.items():
+                server = url_servers.get(base_url)
+                if server is not None:
+                    ServerRepository.release_active_tokens(server, tokens)
 
     # ------------------------------------------------------------------
     # PD disaggregation: decoder load accounting and cluster helpers.
@@ -376,8 +421,10 @@ class ServerRepository:
 
         The authoritative workload for a server is the number of
         ``RequestRecord`` rows with in-flight statuses whose
-        ``target_pod_ip`` equals ``server.base_url`` (requests are linked to
-        servers by string, not a foreign key).
+        ``target_pod_ip`` equals the server's target string — its
+        ``base_url``, plus the ``#s<id>`` suffix when several active rows
+        share that base_url (issue #310; requests are linked to servers by
+        string, not a foreign key).
 
         Returns ``(changes, orphans)`` where ``changes`` lists every server
         whose stored workload differs from the expected count (with
@@ -419,7 +466,7 @@ class ServerRepository:
             servers = ServerRepository._active_servers(include_offline)
             changes: list[dict] = []
             for server in servers:
-                target = expected.get(server.base_url, 0)
+                target = expected.get(server_target(server), 0)
                 if server.workload == target:
                     continue
                 changes.append(
@@ -434,7 +481,7 @@ class ServerRepository:
                     Server.objects.filter(id=server.id).update(workload=target)
                     server.workload = target
 
-            known = {s.base_url for s in servers}
+            known = {server_target(s) for s in servers}
             orphans = [
                 {"target_pod_ip": pod_ip, "count": count}
                 for pod_ip, count in expected.items()

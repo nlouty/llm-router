@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import requests as http_requests
+from django.db import IntegrityError
 from django.http import FileResponse, HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_http_methods
@@ -687,8 +688,8 @@ def add_server(request):
         return parsed_payload
     payload, servers_data = parsed_payload
 
-    if _has_duplicate_base_urls(servers_data):
-        return _bad_request("duplicate base_url in request")
+    if _has_duplicate_server_tuples(servers_data):
+        return _bad_request("duplicate (model_name, base_url, api_key) in request")
 
     now = timezone.now()
     results = [_process_add_server_item(data, now) for data in servers_data]
@@ -708,9 +709,19 @@ def _add_server_payload_or_error(request):
     return _bad_request("payload must be a dictionary or a list")
 
 
-def _has_duplicate_base_urls(servers_data) -> bool:
-    base_urls = [server.get("base_url", "").strip() for server in servers_data if isinstance(server, dict)]
-    return len(base_urls) != len(set(base_urls))
+def _has_duplicate_server_tuples(servers_data) -> bool:
+    # A server's identity is the (model_name, base_url, api_key) tuple
+    # (issue #310): rows may share a base_url when differentiated by api_key.
+    tuples = [
+        (
+            (server.get("model_name") or "").strip(),
+            (server.get("base_url") or "").strip(),
+            (server.get("api_key") or "").strip() or None,
+        )
+        for server in servers_data
+        if isinstance(server, dict)
+    ]
+    return len(tuples) != len(set(tuples))
 
 
 def _process_add_server_item(data, now):
@@ -725,7 +736,7 @@ def _process_add_server_item(data, now):
     api_key = (data.get("api_key") or "").strip() or None
     operation = _create_add_server_operation(data, now)
 
-    validation_failure = _add_server_validation_failure(base_url, model_name, role, group_id)
+    validation_failure = _add_server_validation_failure(base_url, model_name, role, group_id, api_key)
     if validation_failure:
         message, result_base_url = validation_failure
         return _fail_add_server_operation(operation, message, result_base_url)
@@ -747,7 +758,7 @@ def _create_add_server_operation(data, now):
     )
 
 
-def _add_server_validation_failure(base_url: str, model_name: str, role: str, group_id: str | None) -> tuple[str, str | None] | None:
+def _add_server_validation_failure(base_url: str, model_name: str, role: str, group_id: str | None, api_key: str | None = None) -> tuple[str, str | None] | None:
     if not base_url:
         return "base_url is required", None
     if not base_url.rstrip("/").endswith("/v1"):
@@ -758,8 +769,11 @@ def _add_server_validation_failure(base_url: str, model_name: str, role: str, gr
         return f"role must be one of mixed, prefiller, prefix-prefiller, decoder (got {role!r})", base_url
     if role in ("prefiller", "prefix-prefiller", "decoder") and not group_id:
         return "group_id is required for prefiller/prefix-prefiller/decoder servers", base_url
-    if Server.objects.filter(base_url=base_url).exists():
-        return "base_url already exists", base_url
+    # Tuple uniqueness (issue #310). A duplicate tuple requires an existing
+    # Model row of that name; a not-yet-existing model cannot have servers.
+    model = Model.objects.filter(model_name=model_name).first()
+    if model is not None and Server.objects.filter(model_id=model.id, base_url=base_url, api_key=api_key).exists():
+        return "server with this model/base_url/api_key already exists", base_url
     return None
 
 
@@ -798,15 +812,22 @@ def _create_add_server_success(operation, base_url: str, model_name: str, role: 
     if model_path and model_obj.model_path != model_path:
         model_obj.model_path = model_path
         model_obj.save(update_fields=["model_path"])
-    server = Server.objects.create(
-        model_id=model_obj.id,
-        base_url=base_url,
-        role=role,
-        group_id=group_id,
-        api_key=api_key,
-        created_at=timezone.now(),
-        updated_at=timezone.now(),
-    )
+    try:
+        server = Server.objects.create(
+            model_id=model_obj.id,
+            base_url=base_url,
+            role=role,
+            group_id=group_id,
+            api_key=api_key,
+            created_at=timezone.now(),
+            updated_at=timezone.now(),
+        )
+    except IntegrityError:
+        # uniq_servers_model_base_url_api_key backstop for direct DB writes
+        # or a race between the exists-check and this insert.
+        return _fail_add_server_operation(
+            operation, "server with this model/base_url/api_key already exists", base_url
+        )
 
     operation.server_id = server.id
     operation.status = "success"

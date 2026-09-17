@@ -48,6 +48,7 @@ from router.route_algorithm.least_connection import LeastConnectionServerChooser
 from router.utils.errors import error_payload, error_response, timeout_sse_event
 from router.utils.headers import build_upstream_headers, filter_request_headers
 from router.utils.session import extract_session_id
+from router.utils.target import server_target
 
 
 logger = logging.getLogger(__name__)
@@ -1371,7 +1372,9 @@ class ProxyService:
     def _target_identifier(server) -> str | None:
         if not server:
             return None
-        return server.base_url[:500]
+        # Qualified with #s<id> when several active rows share the base_url
+        # (issue #310), so stale cleanup attributes to the exact row.
+        return server_target(server)
 
     def _perform_request(self, django_request, server, upstream_url, headers, body, is_stream, upstream_client):
         if is_stream:

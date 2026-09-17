@@ -47,6 +47,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_requests_repository.py` | Request attempt metadata, model choosing latency, cleanup, and repository counts |
 | `test_server_chooser.py` | Least-connection and prefix-cache-Preble chooser selection logic |
 | `test_server_operations.py` | `/api/add_server` success, duplicate, partial failure, and operation logging |
+| `test_server_target.py` | Target-string qualification for shared base_urls (issue #310): format/parse, duplication detection, per-row workload decrement, stale-decode token release, per-row workload reconciliation |
 | `test_sse.py` | `parse_sse_usage` extracts the last `usage` block from SSE |
 | `test_token_filtering.py` | Estimated-token storage and `servers.context_window` filtering |
 | `test_vip.py` | VIP port eligibility, pool promotion/demotion, cooldowns, and workload accounting |

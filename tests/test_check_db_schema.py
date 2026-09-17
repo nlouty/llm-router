@@ -20,6 +20,18 @@ def all_router_tables():
         for model in models:
             if model._meta.db_table not in existing_tables:
                 schema_editor.create_model(model)
+        # A persisted test database created before issue #310 lacks the
+        # servers tuple-unique constraint; add it like --fix would, so the
+        # "schema matches" assertions below compare against a complete schema.
+        if Server._meta.db_table in existing_tables and connection.vendor == "postgresql":
+            with connection.cursor() as cursor:
+                constraints = connection.introspection.get_constraints(cursor, "servers")
+            constraint = next(
+                c for c in Server._meta.constraints
+                if c.name == "uniq_servers_model_base_url_api_key"
+            )
+            if constraint.name not in constraints:
+                schema_editor.add_constraint(Server, constraint)
     yield
 
 
@@ -217,29 +229,31 @@ def test_check_db_schema_fix_drops_extra_column(capsys):
 
 @postgres_only
 def test_check_db_schema_reports_missing_unique_constraint(capsys):
+    # servers.base_url is no longer unique (issue #310); models.model_name
+    # still is, so it stands in for the single-column unique check.
     with connection.schema_editor() as schema_editor:
-        schema_editor.execute('ALTER TABLE "servers" DROP CONSTRAINT IF EXISTS "servers_base_url_key";')
+        schema_editor.execute('ALTER TABLE "models" DROP CONSTRAINT IF EXISTS "models_model_name_key";')
 
     with pytest.raises(SystemExit):
         call_command("check_db_schema")
 
     output = capsys.readouterr()
-    assert "Missing unique constraint in servers.base_url" in output.err
+    assert "Missing unique constraint in models.model_name" in output.err
 
     # Restore
     with connection.schema_editor() as schema_editor:
-        schema_editor.execute('ALTER TABLE "servers" ADD CONSTRAINT "servers_base_url_key" UNIQUE ("base_url");')
+        schema_editor.execute('ALTER TABLE "models" ADD CONSTRAINT "models_model_name_key" UNIQUE ("model_name");')
 
 
 @postgres_only
 def test_check_db_schema_fix_adds_missing_unique_constraint(capsys):
     with connection.schema_editor() as schema_editor:
-        schema_editor.execute('ALTER TABLE "servers" DROP CONSTRAINT IF EXISTS "servers_base_url_key";')
+        schema_editor.execute('ALTER TABLE "models" DROP CONSTRAINT IF EXISTS "models_model_name_key";')
 
     call_command("check_db_schema", "--fix")
 
     output = capsys.readouterr()
-    assert 'ADD CONSTRAINT "servers_base_url_key" UNIQUE ("base_url")' in output.out
+    assert 'ADD CONSTRAINT "models_model_name_key" UNIQUE ("model_name")' in output.out
 
     # Verify constraint was added
     with connection.cursor() as cursor:
@@ -248,11 +262,79 @@ def test_check_db_schema_fix_adds_missing_unique_constraint(capsys):
             SELECT 1 FROM pg_index i
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
             JOIN pg_class c ON c.oid = i.indrelid
-            WHERE c.relname = 'servers' AND a.attname = 'base_url'
+            WHERE c.relname = 'models' AND a.attname = 'model_name'
               AND i.indisunique = true AND i.indisprimary = false
             """
         )
         assert cursor.fetchone() is not None
+
+
+@postgres_only
+def test_check_db_schema_reports_extra_unique_constraint(capsys):
+    # issue #310: the live servers.base_url unique outlived the model
+    # definition that declared it.
+    with connection.schema_editor() as schema_editor:
+        schema_editor.execute('ALTER TABLE "servers" DROP CONSTRAINT IF EXISTS "servers_base_url_key";')
+        schema_editor.execute('ALTER TABLE "servers" ADD CONSTRAINT "servers_base_url_key" UNIQUE ("base_url");')
+
+    try:
+        with pytest.raises(SystemExit):
+            call_command("check_db_schema")
+
+        output = capsys.readouterr()
+        assert "Extra unique constraint in servers.base_url" in output.err
+    finally:
+        with connection.schema_editor() as schema_editor:
+            schema_editor.execute('ALTER TABLE "servers" DROP CONSTRAINT IF EXISTS "servers_base_url_key";')
+
+
+@postgres_only
+def test_check_db_schema_fix_drops_extra_unique_constraint(capsys):
+    with connection.schema_editor() as schema_editor:
+        schema_editor.execute('ALTER TABLE "servers" DROP CONSTRAINT IF EXISTS "servers_base_url_key";')
+        schema_editor.execute('ALTER TABLE "servers" ADD CONSTRAINT "servers_base_url_key" UNIQUE ("base_url");')
+
+    call_command("check_db_schema", "--fix")
+
+    output = capsys.readouterr()
+    assert 'DROP CONSTRAINT IF EXISTS "servers_base_url_key"' in output.out
+    assert not _has_single_column_unique("servers", "base_url")
+
+
+@postgres_only
+def test_check_db_schema_fix_drops_extra_unique_bare_index(capsys):
+    # The unique may exist as a bare CREATE UNIQUE INDEX under another name:
+    # dropping only the derived constraint name would silently no-op.
+    index_name = "uq_servers_base_url_drift"
+    with connection.schema_editor() as schema_editor:
+        schema_editor.execute(f'DROP INDEX IF EXISTS "{index_name}";')
+        schema_editor.execute(f'CREATE UNIQUE INDEX "{index_name}" ON "servers" ("base_url");')
+
+    try:
+        call_command("check_db_schema", "--fix")
+
+        output = capsys.readouterr()
+        assert f'DROP INDEX CONCURRENTLY IF EXISTS "{index_name}"' in output.out
+        assert not _has_single_column_unique("servers", "base_url")
+    finally:
+        with connection.schema_editor() as schema_editor:
+            schema_editor.execute(f'DROP INDEX IF EXISTS "{index_name}";')
+
+
+def _has_single_column_unique(table: str, column: str) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT 1 FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            JOIN pg_class c ON c.oid = i.indrelid
+            WHERE c.relname = %s AND a.attname = %s
+              AND i.indisunique = true AND i.indisprimary = false
+              AND array_length(i.indkey, 1) = 1
+            """,
+            [table, column],
+        )
+        return cursor.fetchone() is not None
 
 
 @postgres_only
