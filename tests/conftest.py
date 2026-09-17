@@ -91,6 +91,18 @@ def api_test_tables(django_db_setup, django_db_blocker):
             # Department manager column
             if Department._meta.db_table in connection.introspection.table_names() and not has_column("departments", "manager"):
                 schema_editor.add_field(Department, Department._meta.get_field("manager"))
+            # Issue #310: base_url uniqueness moved to the (model_id,
+            # base_url, api_key) tuple. A persisted test database may still
+            # carry the old single-column unique; drop it on PostgreSQL, or
+            # rebuild the table on SQLite (its auto-indexes cannot be
+            # dropped in place).
+            if Server._meta.db_table in existing_tables:
+                if connection.vendor == "postgresql":
+                    with connection.cursor() as cursor:
+                        cursor.execute('ALTER TABLE "servers" DROP CONSTRAINT IF EXISTS "servers_base_url_key";')
+                elif connection.vendor == "sqlite" and _sqlite_servers_base_url_is_unique():
+                    schema_editor.delete_model(Server)
+                    schema_editor.create_model(Server)
         yield
 
 
@@ -98,6 +110,26 @@ def has_column(table, column):
     with connection.cursor() as cursor:
         description = connection.introspection.get_table_description(cursor, table)
     return column in {item.name for item in description}
+
+
+def _sqlite_servers_base_url_is_unique():
+    if connection.vendor != "sqlite":
+        return False
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = %s", ["servers"])
+        row = cursor.fetchone()
+    return bool(row and row[0]) and '"base_url" varchar(500) NOT NULL UNIQUE' in row[0]
+
+
+@pytest.fixture(autouse=True)
+def _clear_target_duplication_cache():
+    # server_target() caches the duplicated-base_url set; never let one
+    # test's rows leak into another test's target strings.
+    from router.utils import target as server_target_utils
+
+    server_target_utils.clear_duplication_cache()
+    yield
+    server_target_utils.clear_duplication_cache()
 
 
 @pytest.fixture(autouse=True)

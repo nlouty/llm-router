@@ -17,6 +17,7 @@ from router.route_algorithm.least_connection import (
     LeastConnectionServerChooser,
     effective_weight,
 )
+from router.utils.target import plain_target, qualified_target
 from router.services.request_log_handler import install_pd_handler
 from router.services.request_logger import append_request_log
 
@@ -506,9 +507,13 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         """True when the n-prefiller has >= 1 new (non-cached) prefill in
         flight: processing rows still in their prefill phase on this server
         with a dispatch-time classification <= the primary threshold."""
-        target = f"P: {server.base_url}"
-        counts = self._new_prefill_counts([target])
-        return counts.get(target, 0) > 0
+        # Both target formats (issue #310): plain while the base_url is
+        # unique, #s<id>-qualified once several active rows share it. Asking
+        # for both keeps this DB-free for the provider path and tolerant of
+        # the duplication-set TTL window.
+        targets = [f"P: {plain_target(server)}", f"P: {qualified_target(server)}"]
+        counts = self._new_prefill_counts(targets)
+        return any(counts.get(target, 0) > 0 for target in targets)
 
     def _new_prefill_counts(self, targets: list[str]) -> dict[str, int]:
         if self.new_prefill_provider is not None:

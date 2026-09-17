@@ -4,8 +4,6 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 
 from django.db import models
-from django.db.models import F, Value
-from django.db.models.functions import Greatest
 from django.utils import timezone
 
 from router.models import RequestRecord
@@ -236,7 +234,6 @@ class RequestRepository:
     ) -> int:
         from django.db import transaction
 
-        from router.models import Server
         from router.repositories.servers import ServerRepository
 
         cutoff = timezone.now() - timedelta(minutes=threshold_minutes)
@@ -292,21 +289,12 @@ class RequestRepository:
             if prefilling_targets:
                 ServerRepository.decrement_workload_by_targets(prefilling_targets)
 
-            # Decoder: decrement workload + release active_tokens
+            # Decoder: decrement workload + release active_tokens on the exact
+            # rows — qualified targets carry the owning row's id (issue #310).
             if decoding_workload:
-                decoder_urls = list(decoding_workload.keys())
-                decoder_servers: dict[str, Server] = {
-                    s.base_url: s for s in Server.objects.filter(base_url__in=decoder_urls)
-                }
-                for base_url, count in decoding_workload.items():
-                    if count > 0:
-                        Server.objects.filter(base_url=base_url, workload__gt=0).update(
-                            workload=Greatest(F("workload") - count, Value(0))
-                        )
-                for base_url, tokens in decoder_tokens.items():
-                    server = decoder_servers.get(base_url)
-                    if server is not None and tokens > 0:
-                        ServerRepository.release_active_tokens(server, tokens)
+                ServerRepository.decrement_workload_by_targets(decoding_workload)
+            if decoder_tokens:
+                ServerRepository.release_active_tokens_by_targets(decoder_tokens)
 
             return len(record_ids)
 

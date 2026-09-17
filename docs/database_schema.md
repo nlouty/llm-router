@@ -182,7 +182,7 @@ Current server columns:
 CREATE TABLE servers (
     id BIGSERIAL PRIMARY KEY,
     model_id INTEGER NULL,
-    base_url VARCHAR(500) NOT NULL UNIQUE,
+    base_url VARCHAR(500) NOT NULL,
     is_online BOOLEAN NOT NULL DEFAULT TRUE,
     weight INTEGER NOT NULL DEFAULT 1,
     health_path VARCHAR(200) NOT NULL DEFAULT '/healthy',
@@ -210,15 +210,19 @@ CREATE TABLE servers (
 CREATE INDEX servers_online_model_idx
     ON servers (is_online, model_id)
     WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX CONCURRENTLY uniq_servers_model_base_url_api_key
+    ON servers (model_id, base_url, api_key)
+    WHERE deleted_at IS NULL;
 ```
 
-`base_url` should include the upstream API prefix expected by the router, normally `/v1`. The proxy appends the incoming path such as `chat/completions`.
+`base_url` should include the upstream API prefix expected by the router, normally `/v1`. The proxy appends the incoming path such as `chat/completions`. Several rows may share one `base_url` when the endpoint behind it dispatches each `api_key` to a different backend (issue #310): a row's identity is the `(model_id, base_url, api_key)` tuple, and each such row is an independent routing target with its own workload, circuit state, health probe, and prefix-cache affinity. Postgres treats NULLs as distinct, so the unique index does not block duplicate key-less rows — that case is enforced by `/api/add_server`.
 
 `cache_time` controls how long successful prefix-cache entries for this server stay valid in Redis.
 
 `csb_token`, when present, is injected into upstream requests as the `csb-token` header.
 
-`api_key` (issue #279) holds the credential for servers managed by an external system that only accept one specific key. When present, every upstream send to that server — normal, stream, retries, PD prefill and decode, health probes, and add-server verification — strips the client's `Authorization`/`x-api-key`/`api-key` headers and sends `Authorization: Bearer <api_key>` instead (see `build_upstream_headers` in `router/utils/headers.py`). `NULL` keeps today's behavior: the client's own `Authorization` is forwarded. It is set via the optional `api_key` field of `/api/add_server` (masked in the response); like other admin-maintained columns it can also be set directly on existing rows. The column is added by `check_db_schema --fix` (it surfaces `ALTER TABLE servers ADD COLUMN api_key VARCHAR(500) NULL`).
+`api_key` (issue #279) holds the credential for servers managed by an external system that only accept one specific key. When present, every upstream send to that server — normal, stream, retries, PD prefill and decode, health probes, and add-server verification — strips the client's `Authorization`/`x-api-key`/`api-key` headers and sends `Authorization: Bearer <api_key>` instead (see `build_upstream_headers` in `router/utils/headers.py`). `NULL` keeps today's behavior: the client's own `Authorization` is forwarded. It is set via the optional `api_key` field of `/api/add_server` (masked in the response); like other admin-maintained columns it can also be set directly on existing rows. It also differentiates rows that share a `base_url` (issue #310 — one endpoint dispatching each key to a different backend). The column is added by `check_db_schema --fix` (it surfaces `ALTER TABLE servers ADD COLUMN api_key VARCHAR(500) NULL`).
 
 `circuit_state`, `consecutive_failures`, `last_state_change_at`, and `cooldown_seconds` are router-managed circuit-breaker fields. Closed servers are routable. Open servers become half-open after cooldown. Half-open servers are routable for probe traffic.
 
@@ -323,7 +327,7 @@ ALTER TABLE requests ADD COLUMN session VARCHAR(255) NULL;
 
 `task_status` is one of the request lifecycle states used by the router, including `processing`, `success`, `failed`, `agent_disconnected`, and `incomplete`.
 
-`attempt_count`, `target_pod_ip`, `prefix_cache`, and `last_match` are updated before each upstream attempt.
+`attempt_count`, `target_pod_ip`, `prefix_cache`, and `last_match` are updated before each upstream attempt. For single-node (non-PD) requests `target_pod_ip` equals the server's `base_url`; when several active rows share that `base_url` (issue #310) it carries a `#s<server.id>` suffix so stale cleanup and workload reconciliation attribute the row to the exact server — readers without a suffix fall back to base_url attribution for legacy rows.
 
 `final_prefix_cache` stores cached-token usage parsed from successful upstream responses when available.
 

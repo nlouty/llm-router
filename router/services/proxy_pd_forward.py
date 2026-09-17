@@ -20,6 +20,7 @@ from router.services.request_logger import append_request_log, flush_request_log
 from router.utils.errors import error_payload, timeout_sse_event
 from router.utils.headers import build_upstream_headers
 from router.utils.sse import parse_sse_usage
+from router.utils.target import server_target
 
 logger = logging.getLogger(__name__)
 install_pd_handler(logger)
@@ -254,7 +255,7 @@ class PDForwardService:
         prefiller_url = self.proxy._build_url(
             prefiller.base_url, path, django_request.META.get("QUERY_STRING", "")
         )
-        target_pod_ip = f"P: {prefiller.base_url}"
+        target_pod_ip = f"P: {server_target(prefiller)}"
         state.last_target_pod_ip = target_pod_ip
         RequestRepository.record_attempt(
             record, target_pod_ip, state.attempts,
@@ -491,7 +492,7 @@ class PDForwardService:
             ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
             record.task_status = "decoding"
             record.save(update_fields=["task_status"])
-            current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
+            current_target = f"{target_pod_ip} -- D: {server_target(decoder)}"
             if recompute_count > 0:
                 current_target += _KV_TRANSFER_FAIL_TAG
             state.last_target_pod_ip = current_target
@@ -698,7 +699,7 @@ class PDForwardService:
                     ServerRepository.reserve_active_tokens(decoder, float(prompt_tokens or 0))
                     record.task_status = "decoding"
                     record.save(update_fields=["task_status"])
-                    current_target = f"{target_pod_ip} -- D: {decoder.base_url}"
+                    current_target = f"{target_pod_ip} -- D: {server_target(decoder)}"
                     if recompute_count > 0:
                         current_target += _KV_TRANSFER_FAIL_TAG
                     state.last_target_pod_ip = current_target

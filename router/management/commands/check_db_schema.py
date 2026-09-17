@@ -122,15 +122,16 @@ class Command(BaseCommand):
                         schema_editor.execute(sql)
 
         for table, mismatches in drift["unique_mismatches"].items():
-            for column, status in mismatches.items():
-                if status == "missing":
+            for column, info in mismatches.items():
+                if info["status"] == "missing":
                     sql = self._add_unique_sql(table, column)
                 else:
-                    sql = self._drop_unique_sql(table, column)
+                    sql = self._drop_unique_sql(
+                        table, column, info.get("index_name"), info.get("is_constraint", False)
+                    )
                 self.stdout.write(sql)
                 if not dry_run:
-                    with connection.schema_editor() as schema_editor:
-                        schema_editor.execute(sql)
+                    self._execute_schema_sql(sql)
 
         for table, constraints in drift["missing_constraints"].items():
             model = {m._meta.db_table: m for m in models}[table]
@@ -359,14 +360,18 @@ class Command(BaseCommand):
     def _unique_mismatches(self, cursor, table, model, actual_columns):
         if connection.vendor != "postgresql":
             return {}
-        # Get columns that have single-column unique constraints in the DB
+        # Single-column unique constraints/indexes in the DB, with the
+        # backing index's real name and whether it is constraint-backed
+        # (droppable via DROP CONSTRAINT) or a bare unique index (DROP INDEX).
         cursor.execute(
             """
-            SELECT a.attname
+            SELECT a.attname, ic.relname, (con.oid IS NOT NULL)
             FROM pg_index i
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
             JOIN pg_class c ON c.oid = i.indrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_class ic ON ic.oid = i.indexrelid
+            LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
             WHERE c.relname = %s
               AND n.nspname = current_schema()
               AND i.indisunique = true
@@ -376,16 +381,21 @@ class Command(BaseCommand):
             """,
             [table],
         )
-        db_unique_columns = {row[0] for row in cursor.fetchall()}
+        db_unique_columns = {row[0]: (row[1], bool(row[2])) for row in cursor.fetchall()}
 
         mismatches = {}
         for field in model._meta.local_concrete_fields:
             if field.column not in actual_columns or field.primary_key:
                 continue
             if field.unique and field.column not in db_unique_columns:
-                mismatches[field.column] = "missing"
+                mismatches[field.column] = {"status": "missing"}
             elif not field.unique and field.column in db_unique_columns:
-                mismatches[field.column] = "extra"
+                index_name, is_constraint = db_unique_columns[field.column]
+                mismatches[field.column] = {
+                    "status": "extra",
+                    "index_name": index_name,
+                    "is_constraint": is_constraint,
+                }
         return mismatches
 
     def _add_unique_sql(self, table, column):
@@ -393,8 +403,20 @@ class Command(BaseCommand):
         constraint_name = f"{table}_{column}_key"
         return f"ALTER TABLE {quote_name(table)} ADD CONSTRAINT {quote_name(constraint_name)} UNIQUE ({quote_name(column)});"
 
-    def _drop_unique_sql(self, table, column):
+    def _drop_unique_sql(self, table, column, index_name=None, is_constraint=False):
+        """Drop an extra single-column unique by its real catalog name.
+
+        Detection matches any single-column unique index, but live databases
+        may carry it as a differently-named constraint or as a bare
+        ``CREATE UNIQUE INDEX``; dropping only the derived
+        ``{table}_{column}_key`` name would silently no-op and the drift
+        would survive every fix pass.
+        """
         quote_name = connection.ops.quote_name
+        if index_name:
+            if is_constraint:
+                return f"ALTER TABLE {quote_name(table)} DROP CONSTRAINT IF EXISTS {quote_name(index_name)};"
+            return f"DROP INDEX CONCURRENTLY IF EXISTS {quote_name(index_name)};"
         constraint_name = f"{table}_{column}_key"
         return f"ALTER TABLE {quote_name(table)} DROP CONSTRAINT IF EXISTS {quote_name(constraint_name)};"
 
@@ -535,8 +557,8 @@ class Command(BaseCommand):
                 self.stderr.write(f"Type mismatch in {table}.{column}: db is {info['actual']}, model expects {info['expected']}")
 
         for table, mismatches in drift["unique_mismatches"].items():
-            for column, status in mismatches.items():
-                if status == "missing":
+            for column, info in mismatches.items():
+                if info["status"] == "missing":
                     self.stderr.write(f"Missing unique constraint in {table}.{column}")
                 else:
                     self.stderr.write(f"Extra unique constraint in {table}.{column}")

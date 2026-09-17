@@ -65,12 +65,104 @@ def test_add_server_duplicate_in_request():
         {"base_url": "http://s1/v1", "model_name": "m1"},
         {"base_url": "http://s1/v1", "model_name": "m1"}
     ]
-    
+
     response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
-    
+
     assert response.status_code == 400
-    assert response.json()["error"] == "duplicate base_url in request"
+    assert response.json()["error"] == "duplicate (model_name, base_url, api_key) in request"
     assert ServerOperation.objects.count() == 0
+
+
+def test_add_server_batch_same_base_url_different_api_keys():
+    client = Client()
+    payload = [
+        {"base_url": "http://a/v1", "model_name": "m1", "api_key": "sk-1"},
+        {"base_url": "http://a/v1", "model_name": "m1", "api_key": "sk-2"},
+    ]
+
+    captured_headers = []
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m1"}]}
+
+        def capture(url, **kwargs):
+            captured_headers.append(kwargs.get("headers"))
+            return mock_resp
+
+        mock_get.side_effect = capture
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) == 2
+    assert Server.objects.filter(base_url="http://a/v1").count() == 2
+    assert set(Server.objects.filter(base_url="http://a/v1").values_list("api_key", flat=True)) == {"sk-1", "sk-2"}
+
+    # Each row is verified with its own credential.
+    assert captured_headers == [
+        {"Authorization": "Bearer sk-1"},
+        {"Authorization": "Bearer sk-2"},
+    ]
+
+
+def test_add_server_batch_same_base_url_same_key_rejected():
+    client = Client()
+    payload = [
+        {"base_url": "http://a/v1", "model_name": "m1", "api_key": "sk-1"},
+        {"base_url": "http://a/v1", "model_name": "m1", "api_key": "sk-1"},
+    ]
+
+    response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 400
+    assert "duplicate" in response.json()["error"]
+    assert ServerOperation.objects.count() == 0
+
+
+def test_add_server_rejects_existing_tuple():
+    model = Model.objects.create(model_name="m1")
+    Server.objects.create(model_id=model.id, base_url="http://a/v1", api_key="sk-1")
+    client = Client()
+    payload = {"base_url": "http://a/v1", "model_name": "m1", "api_key": "sk-1"}
+
+    response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "server with this model/base_url/api_key already exists"
+    assert Server.objects.filter(base_url="http://a/v1").count() == 1
+
+
+def test_add_server_rejects_keyless_duplicate_of_keyless_row():
+    model = Model.objects.create(model_name="m1")
+    Server.objects.create(model_id=model.id, base_url="http://a/v1", api_key=None)
+    client = Client()
+    payload = {"base_url": "http://a/v1", "model_name": "m1"}
+
+    response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "server with this model/base_url/api_key already exists"
+
+
+def test_add_server_allows_same_tuple_under_different_model():
+    model = Model.objects.create(model_name="m1")
+    Server.objects.create(model_id=model.id, base_url="http://a/v1", api_key="sk-1")
+    client = Client()
+    payload = {"base_url": "http://a/v1", "model_name": "m2", "api_key": "sk-1"}
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "m2"}]}
+        mock_get.return_value = mock_resp
+
+        response = client.post("/api/add_server", json.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    assert Server.objects.filter(base_url="http://a/v1").count() == 2
 
 def test_add_server_partial_failure():
     client = Client()

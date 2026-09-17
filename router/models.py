@@ -98,7 +98,7 @@ class Model(models.Model):
 
 class Server(TimestampedSoftDeleteModel):
     model_id = models.IntegerField(blank=True, null=True)
-    base_url = models.CharField(max_length=500, unique=True)
+    base_url = models.CharField(max_length=500)
     is_online = models.BooleanField(default=True)
     weight = models.IntegerField(default=1)
     health_path = models.CharField(max_length=200, blank=True, default="/healthy")
@@ -122,6 +122,18 @@ class Server(TimestampedSoftDeleteModel):
     class Meta:
         managed = False
         db_table = "servers"
+        constraints = [
+            # A server row's identity (issue #310): rows may share a base_url
+            # when the endpoint behind it dispatches each api_key to a
+            # different backend. Postgres treats NULLs as distinct, so
+            # key-less duplicates (api_key NULL) are enforced by the
+            # /api/add_server validation instead of this index.
+            models.UniqueConstraint(
+                fields=["model_id", "base_url", "api_key"],
+                condition=Q(deleted_at__isnull=True),
+                name="uniq_servers_model_base_url_api_key",
+            ),
+        ]
 
 
 class ExternalRoute(TimestampedSoftDeleteModel):
