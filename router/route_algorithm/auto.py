@@ -4,10 +4,7 @@ import json
 import random
 import re
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any
-
-from django.utils import timezone
 
 from router.config import APP_CONFIG
 from router.repositories.models import ModelRepository
@@ -33,7 +30,6 @@ class AutoRouteAlgorithm:
     ROUTING_USER_PROMPT_CHAR_LIMIT = 500
     ROUTING_USER_PROMPT_COLLAPSE_MULTIPLIER = 3
     ROUTING_USER_PROMPT_MESSAGE_LIMIT = 20
-    STICKY_SESSION_WINDOW_SECONDS = 3600
 
     def __init__(self, chooser=None, proxy=None):
         self.chooser = chooser
@@ -283,8 +279,7 @@ class AutoRouteAlgorithm:
         if not isinstance(session, str) or not session:
             return None
 
-        since = timezone.now() - timedelta(seconds=self.STICKY_SESSION_WINDOW_SECONDS)
-        choices = RequestRepository.list_recent_session_choices(session, since)
+        choices = RequestRepository.list_recent_session_choices(session)
         # Choices often repeat the same model id; resolve each id once per
         # request instead of hitting the models table per choice.
         models: dict[int, Any] = {}
