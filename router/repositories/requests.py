@@ -321,10 +321,12 @@ class RequestRepository:
         )
 
     @staticmethod
-    def list_recent_session_choices(session: str, since, limit: int = 10) -> list[dict]:
+    def list_recent_session_choices(session: str, limit: int = 10) -> list[dict]:
         """Recent committed model choices for one session, newest first.
 
-        Only rows that already carry a concrete model and a router_result are
+        No time bound: the newest anchor wins however old it is (issue #313),
+        so a session keeps its model until that model stops serving. Only
+        rows that already carry a concrete model and a router_result are
         returned; callers decide which of those results count as sticky anchors.
         """
         if not session:
@@ -332,7 +334,6 @@ class RequestRepository:
         return list(
             RequestRecord.objects.filter(
                 session=session,
-                send_time__gte=since,
                 model_id__gt=0,
                 router_result__isnull=False,
             )

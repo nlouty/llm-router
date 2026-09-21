@@ -92,7 +92,9 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    If there are no text targets, `router_result` records `routing_failed:missing_target_model:no auto-routing target model for auto request`. No fallback model is applied at this step.
 
-5. Check prefix-cache model hits.
+5. Check session-sticky selection, then prefix-cache model hits.
+
+   A request that carries a session id first resolves session-sticky selection: the newest committed choice for that session wins — up to 10 rows are scanned, and `small_request_routing` / `multimodal_bypass` rows are not anchors. There is no time bound (issue #313): the session keeps its model, deprecated or not, as long as that model still has serving servers; a hit records `session-sticky`. When the anchor model no longer serves, older anchors are tried and the request falls through to the steps below.
 
    When the active chooser supports `get_all_model_prefix_ratios`, the router checks Redis prefix-cache ratios for every text target model. This pre-check is skipped for requests with exactly one user message, and for requests that carry a session id whose session-sticky lookup missed (issue #299): the Redis cache is keyed by prompt prefix, not session, so a different task sharing the same agent prefix must be routed by complexity estimation instead of inheriting the previous task's model.
 

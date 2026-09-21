@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 
 import pytest
 from django.test import Client
@@ -27,11 +28,11 @@ def _context(session=None, auto_model_selection=True):
     )
 
 
-def _anchor_record(session, model, router_result):
+def _anchor_record(session, model, router_result, send_time=None):
     return RequestRecord.objects.create(
         user_ip_id=0,
         ip_id=1,
-        send_time=timezone.now(),
+        send_time=send_time or timezone.now(),
         model_id=model.id,
         task_status="success",
         session=session,
@@ -78,6 +79,23 @@ def test_resolve_sticky_model_reuses_recent_anchor():
     model = Model.objects.create(model_name="target", complexity_min=1, complexity_max=10)
     Server.objects.create(model_id=model.id, base_url="http://target.example", is_online=True)
     _anchor_record("sess-1", model, "auto:complexity:5")
+
+    chosen = AutoRouteAlgorithm()._resolve_sticky_model(_context("sess-1"))
+    assert chosen == model
+
+
+@pytest.mark.django_db
+def test_resolve_sticky_model_uses_anchor_regardless_of_age():
+    # Issue #313: sticky affinity has no time window. However long ago the
+    # session last asked, it keeps its model while that model still serves.
+    model = Model.objects.create(model_name="target", complexity_min=1, complexity_max=10)
+    Server.objects.create(model_id=model.id, base_url="http://target.example", is_online=True)
+    _anchor_record(
+        "sess-1",
+        model,
+        "auto:complexity:5",
+        send_time=timezone.now() - timedelta(days=400),
+    )
 
     chosen = AutoRouteAlgorithm()._resolve_sticky_model(_context("sess-1"))
     assert chosen == model
