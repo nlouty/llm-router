@@ -226,7 +226,7 @@ def test_get_apikey_missing_returns_404(client):
 
 
 @pytest.mark.django_db
-def test_invalidate_apikey_deletes_row(client):
+def test_invalidate_apikey_keeps_tombstone_row(client):
     UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001")
 
     response = _invalidate(client, "E001")
@@ -234,7 +234,12 @@ def test_invalidate_apikey_deletes_row(client):
     assert response.status_code == 200
     assert response.json()["data"]["employee_no"] == "E001"
     assert UserIPRepository.get_active_apikey_by_employee_no("E001") is None
-    assert not UserIP.objects.filter(apikey="key-1").exists()
+    # The row survives as a tombstone: historical user_ip_id attribution must
+    # keep resolving, and the old key stays known-but-invalid (403, not the
+    # unknown-key IP fallback).
+    row = UserIP.objects.get(apikey="key-1")
+    assert row.is_valid is False
+    assert UserIPRepository.get_by_apikey("key-1") == row
 
 
 @pytest.mark.django_db
@@ -261,6 +266,104 @@ def test_invalidate_then_rotate(client, monkeypatch):
 
     assert response.status_code == 200
     assert UserIP.objects.filter(apikey="key-2", employee_no="E001").exists()
+    # The old key stays behind as a tombstone; the new key gets its own row.
+    assert UserIP.objects.get(apikey="key-1").is_valid is False
+
+
+# --- key-string collision check at registration ---
+
+
+@pytest.mark.django_db
+def test_register_apikey_rejects_key_owned_by_another_employee(client):
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E002", is_valid=False)
+
+    response = _post(client, apikey="key-1", employee_no="E001")
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "apikey is already registered to another employee"
+    # No row mutation: the string keeps its original owner and state.
+    row = UserIP.objects.get(apikey="key-1")
+    assert row.employee_no == "E002"
+    assert row.is_valid is False
+
+
+@pytest.mark.django_db
+def test_register_apikey_revives_same_employee_tombstone(client, monkeypatch):
+    def fail(self, apikey, employee_no):
+        pytest.fail("CMDB must not be called when the key row already exists")
+
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", fail)
+    dept = _allowed_department()
+    row = UserIP.objects.create(
+        ip_id=0,
+        apikey="abcdEFGHwxyz",
+        employee_no="E001",
+        department_id=dept.id,
+        user_name="Alice",
+        user_charge="Bob",
+    )
+    _invalidate(client, "E001")
+
+    response = _post(client, apikey="abcdEFGHwxyz")
+
+    assert response.status_code == 200
+    revived = UserIP.objects.get(apikey="abcdEFGHwxyz")
+    # Same row revived: historical user_ip_id values keep resolving.
+    assert revived.id == row.id
+    assert revived.is_valid is True
+    assert revived.deleted_at is None
+    # Fields are preserved, not blanked by the registration defaults.
+    assert revived.user_name == "Alice"
+    assert revived.user_charge == "Bob"
+    assert UserIPRepository.get_active_apikey_by_employee_no("E001").id == row.id
+
+
+@pytest.mark.django_db
+def test_register_apikey_revives_soft_deleted_row_of_same_employee(client):
+    dept = _allowed_department()
+    row = UserIP.objects.create(
+        ip_id=0, apikey="key-1", employee_no="E001", department_id=dept.id
+    )
+    row.deleted_at = timezone.now()
+    row.save(update_fields=["deleted_at"])
+
+    response = _post(client, apikey="key-1")
+
+    assert response.status_code == 200
+    revived = UserIP.objects.get(apikey="key-1")
+    assert revived.id == row.id
+    assert revived.is_valid is True
+    assert revived.deleted_at is None
+
+
+@pytest.mark.django_db
+def test_revive_of_denied_key_returns_403_and_stays_invalid(client):
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001", department_id=dept.id)
+
+    _invalidate(client, "E001")
+    response = _post(client)
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "department is not allowed and employee is not whitelisted"
+    assert UserIP.objects.get(apikey="key-1").is_valid is False
+
+
+@pytest.mark.django_db
+def test_get_apikey_404_after_invalidate_then_returns_revived_row(client):
+    UserIP.objects.create(
+        ip_id=0, apikey="abcdEFGHwxyz", employee_no="E001", department_id=_allowed_department().id
+    )
+
+    assert _get(client, "E001").status_code == 200
+    _invalidate(client, "E001")
+    assert _get(client, "E001").status_code == 404
+
+    _post(client, apikey="abcdEFGHwxyz")
+    response = _get(client, "E001")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["apikey_preview"] == "abcd…wxyz"
 
 
 # --- registration-time department/whitelist verification ---

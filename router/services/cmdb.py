@@ -85,6 +85,11 @@ class CMDBService:
         The internal adapter owns employee lookup, department data, VIP
         inheritance, idempotency, conflict handling, and key rotation; it is
         expected to persist a ``user_ips`` API-key-backed row directly.
+        Invalidated rows are never hard-deleted — they stay as
+        ``is_valid = false`` tombstones (their id backs historical
+        ``requests.user_ip_id`` values), so re-registering the same key
+        string must revive that row in place while a fresh key string gets a
+        new row.
 
         @param apikey Non-empty API key string (max 255 chars).
         @param employee_no Employee number that owns the key (max 50 chars).
