@@ -218,7 +218,7 @@ curl -i -X POST http://localhost:8001/api/apikey \
   -d '{"apikey":"employee-key","employee_no":"E001"}'
 ```
 
-After validating the JSON fields, the endpoint rejects an `employee_no` that already has an active apikey with HTTP 409 before performing any write. If the `employee_no` has an active (unexpired) whitelist entry, the endpoint bypasses CMDB entirely and inserts the `user_ips` apikey row directly with `department_id = 0` and the whitelist `user_name` — the CMDB sync (`refresh_user_info`) overwrites the department once CMDB can resolve one. Otherwise it delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 for non-whitelisted employees until an internal adapter provides this method.
+After validating the JSON fields, the endpoint rejects an `employee_no` that already has an active apikey with HTTP 409 before performing any write. It then checks the apikey string against every `user_ips` key row ever stored (valid, invalidated, or soft-deleted — the uniqueness index spans them all): a row owned by a different `employee_no` is a coincidental collision, rejected with HTTP 409 (`apikey is already registered to another employee`) without touching the row, while a row owned by the same `employee_no` means a known key is being re-registered — it is revived in place (`is_valid = true`, `deleted_at` cleared, same row id, other fields untouched, no CMDB call) and re-verified like a fresh registration: a denied department without a whitelist rescue deactivates it again with HTTP 403. Reviving keeps the row id stable so historical `requests.user_ip_id` values keep resolving. For a key string with no stored row, the endpoint proceeds: if the `employee_no` has an active (unexpired) whitelist entry, it bypasses CMDB entirely and inserts the `user_ips` apikey row directly with `department_id = 0` and the whitelist `user_name` — the CMDB sync (`refresh_user_info`) overwrites the department once CMDB can resolve one. Otherwise it delegates lookup and all database writes to `CMDBService.fetch_and_save_apikey(apikey, employee_no)`. The internal CMDB adapter owns employee lookup, department data, VIP inheritance, idempotency, conflict handling, and key rotation. The public CMDB adapter is unimplemented, so the endpoint returns HTTP 404 for non-whitelisted employees until an internal adapter provides this method.
 
 CMDB only reports the employee's `user_name`/`user_charge`/department — it does not know whether the department may use the router — so after the CMDB write the saved `user_ips` row is verified (`AdmissionService.verify_apikey_registration`): an allowed department passes; a denied or unresolvable department is rescued only by the whitelist, matched by `user_ips.employee_no` against `whitelist.employee_no` or `user_ips.user_charge` against `whitelist.user_name` (allowed and unexpired entries only). When both fail the row is kept but stored with `is_valid = false` and the endpoint responds with HTTP 403 — such a key is refused by the proxy (see below) while the employee slot stays re-registrable once their department or whitelist status changes.
 
@@ -238,6 +238,15 @@ When the employee already has an active apikey:
 {
   "code": 409,
   "error": "employee already has an active apikey"
+}
+```
+
+When the apikey string is already stored for another employee:
+
+```json
+{
+  "code": 409,
+  "error": "apikey is already registered to another employee"
 }
 ```
 
@@ -286,7 +295,7 @@ Returns HTTP 404 when the employee has no active apikey.
 POST /api/apikey/invalidate
 ```
 
-Deletes an employee's active apikey row. The key immediately stops authenticating proxy requests, and the per-employee slot is released so a new key can be registered (key rotation).
+Invalidates an employee's active apikey. The row is kept as a tombstone (`is_valid = false`, same row id) instead of being deleted: historical `requests.user_ip_id` values keep resolving the employee in stats, and a client still presenting the key is refused with HTTP 403 (`invalid_apikey`) rather than falling back to IP-based admission. The per-employee slot is released so a new key can be registered (key rotation); re-registering the exact same key string revives the tombstone row in place (see API-Key Registration).
 
 ```bash
 curl -i -X POST http://localhost:8001/api/apikey/invalidate \

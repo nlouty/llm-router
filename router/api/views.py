@@ -66,6 +66,36 @@ def register_apikey(request):
             {"code": 409, "error": "employee already has an active apikey"}, status=409
         )
 
+    # Key-string check before any write: the apikey namespace is global
+    # (uniq_user_ips_nonempty_apikey spans every row, invalidated or not). A
+    # row owned by the same employee means a known key is being re-registered
+    # — revive it in place so its id (and the historical requests.user_ip_id
+    # values pointing at it) stay intact. A row owned by anyone else is a
+    # coincidental collision — reject it instead of silently reassigning the
+    # key's ownership.
+    existing = UserIPRepository.get_any_by_apikey(apikey)
+    if existing is not None:
+        if existing.employee_no != employee_no:
+            return JsonResponse(
+                {"code": 409, "error": "apikey is already registered to another employee"}, status=409
+            )
+        UserIPRepository.reactivate(existing)
+        if not AdmissionService.verify_apikey_registration(existing):
+            UserIPRepository.deactivate_apikey_by_employee_no(employee_no)
+            return JsonResponse(
+                {"code": 403, "error": "department is not allowed and employee is not whitelisted"},
+                status=403,
+            )
+        return JsonResponse(
+            {
+                "code": 200,
+                "message": "success",
+                "data": {
+                    "employee_no": employee_no,
+                },
+            }
+        )
+
     # Whitelisted employees bypass CMDB: CMDB sometimes fails to resolve a
     # department, and a whitelist entry (while unexpired) is enough to trust
     # the employee. Insert the row directly with department_id = 0 before the

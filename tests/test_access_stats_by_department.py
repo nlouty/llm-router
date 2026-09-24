@@ -221,3 +221,28 @@ class TestExportAccessStatsCsv:
         assert emp002[header.index("IP工号")] == "EMP001"
         assert emp002[header.index("前缀缓存Token")] == "200"
         assert emp002[header.index("三级部门")] == "前端组"
+
+
+class TestTombstoneAttribution:
+    """失效apikey行（is_valid=false墓碑）仍需解析历史请求的工号"""
+
+    def test_invalidated_key_row_still_attributes_requests(self, db):
+        now = timezone.now()
+        dept = Department.objects.create(dept1="技术部", created_at=now, updated_at=now)
+        ip = Ips.objects.create(ip="10.0.0.9", created_at=now, updated_at=now)
+        key = UserIP.objects.create(
+            ip_id=0, apikey="sk-emp999",
+            employee_no="EMP999", user_name="田七",
+            department_id=dept.id, is_valid=False,  # invalidated tombstone
+            created_at=now, updated_at=now,
+        )
+
+        _make_request(ip.id, key.id, when=now - timedelta(minutes=5))
+
+        results = RequestRepository.summarize_success_by_employee_and_ip(
+            start=now - timedelta(hours=1), end=now + timedelta(minutes=5)
+        )
+
+        assert [(r["employee_no"], r["ip"]) for r in results] == [("EMP999", "10.0.0.9")]
+        assert results[0]["user_name"] == "田七"
+        assert results[0]["dept1"] == "技术部"

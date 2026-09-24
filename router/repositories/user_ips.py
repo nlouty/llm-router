@@ -40,10 +40,6 @@ class UserIPRepository:
         )
 
     @staticmethod
-    def exists_by_ip_id(ip_id: int) -> bool:
-        return UserIP.objects.filter(ip_id=ip_id, deleted_at__isnull=True).exists()
-
-    @staticmethod
     def all_active_apikeys() -> list[UserIP]:
         return list(
             UserIP.objects.filter(
@@ -75,6 +71,24 @@ class UserIPRepository:
         return UserIP.objects.filter(apikey=apikey, deleted_at__isnull=True).first()
 
     @staticmethod
+    def get_any_by_apikey(apikey: str) -> UserIP | None:
+        """Any row ever stored for the key, regardless of validity or deletion.
+
+        ``uniq_user_ips_nonempty_apikey`` spans every row (invalidated or
+        soft-deleted included), so registration collision checks must use this
+        full-history lookup.
+        """
+        return UserIP.objects.filter(apikey=apikey).first()
+
+    @staticmethod
+    def reactivate(obj: UserIP) -> None:
+        """Revive a key row in place: same id, other fields untouched."""
+        obj.is_valid = True
+        obj.deleted_at = None
+        obj.updated_at = timezone.now()
+        obj.save(update_fields=["is_valid", "deleted_at", "updated_at"])
+
+    @staticmethod
     def deactivate_apikey_by_employee_no(employee_no: str) -> bool:
         """Set ``is_valid = false`` on the employee's active key (soft)."""
         obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
@@ -87,11 +101,14 @@ class UserIPRepository:
 
     @staticmethod
     def invalidate_apikey_by_employee_no(employee_no: str) -> bool:
-        obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
-        if obj is None:
-            return False
-        obj.delete()
-        return True
+        """Deactivate the employee's active key, keeping the row as a tombstone.
+
+        The row (and its id) must survive invalidation so historical
+        ``requests.user_ip_id`` values keep resolving the employee in stats.
+        The stored key stays known-but-invalid: the proxy refuses it with 403
+        instead of falling back to IP-based admission.
+        """
+        return UserIPRepository.deactivate_apikey_by_employee_no(employee_no)
 
     @staticmethod
     def create_or_update_apikey(
@@ -124,8 +141,9 @@ class UserIPRepository:
             obj.department_id = department_id
             obj.vip = vip
             obj.is_valid = True
+            obj.deleted_at = None
             obj.updated_at = now
-            obj.save(update_fields=["employee_no", "user_name", "user_charge", "department_id", "vip", "is_valid", "updated_at"])
+            obj.save(update_fields=["employee_no", "user_name", "user_charge", "department_id", "vip", "is_valid", "deleted_at", "updated_at"])
         return obj
 
     @staticmethod
