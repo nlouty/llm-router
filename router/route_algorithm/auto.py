@@ -205,7 +205,15 @@ class AutoRouteAlgorithm:
                 "no auto-routing target model for auto request",
             )
 
-        model_names = [model.model_name for model in auto_models]
+        healthy_models = [
+            model for model in auto_models if self._model_is_healthy(model.id)
+        ]
+        # When nothing is healthy anywhere, keep the full target set so
+        # behavior degrades to the pre-filter one: the complexity-matched
+        # model still receives the request (half-open probe or upstream
+        # failure) instead of being rejected at model selection.
+        selection_models = healthy_models or auto_models
+        model_names = [model.model_name for model in selection_models]
 
         sticky_model = self._resolve_sticky_model(context)
         if sticky_model is not None:
@@ -215,7 +223,7 @@ class AutoRouteAlgorithm:
         # miss with a session id must go to complexity estimation instead of
         # pinning a different task that shares the same agent prefix (#299).
         if not getattr(context, "session", None):
-            cached_model = self._check_cache_hit(body, auto_models, model_names, body_data)
+            cached_model = self._check_cache_hit(body, selection_models, model_names, body_data)
             if cached_model:
                 return cached_model, "cache_hit"
 
@@ -223,8 +231,9 @@ class AutoRouteAlgorithm:
             body,
             record,
             context,
-            auto_models,
+            selection_models,
             model_names,
+            target_models=auto_models,
         )
 
     def _is_multimodal(self, body: bytes, parsed_data: dict | None = None) -> bool:
@@ -290,16 +299,27 @@ class AutoRouteAlgorithm:
             if model_id not in models:
                 models[model_id] = ModelRepository.get_by_id(model_id)
             model = models[model_id]
-            if model is not None and self._model_has_pd_holders(model.id):
+            if model is not None and self._model_is_healthy(model.id):
                 return model
         return None
 
-    def _model_has_pd_holders(self, model_id: int) -> bool:
+    def _model_pool(self, model_id: int) -> list:
         # Reuse the proxy's per-request candidate memo so the later
         # _select_candidates for the same model does not re-query the DB.
         if self.proxy is not None and hasattr(self.proxy, "_pd_holders_cached"):
-            return bool(self.proxy._pd_holders_cached(model_id))
-        return bool(ServerRepository.list_pd_holders(model_id, vip=False))
+            return self.proxy._pd_holders_cached(model_id)
+        return ServerRepository.list_pd_holders(model_id, vip=False)
+
+    def _model_is_healthy(self, model_id: int) -> bool:
+        # Healthy means at least one routable server with a closed circuit.
+        # list_pd_holders already drops offline, soft-deleted, VIP and
+        # cooldown-unexpired circuit-open servers, so a non-empty pool
+        # without a closed server is exactly the probe tier: half-open
+        # servers with spare probe capacity, which may still be down and
+        # must not be trusted for model selection.
+        return any(
+            server.circuit_state == "closed" for server in self._model_pool(model_id)
+        )
 
     @staticmethod
     def is_sticky_anchor_result(router_result: str | None) -> bool:
@@ -341,6 +361,7 @@ class AutoRouteAlgorithm:
         context: ServerSelectionContext,
         active_models: list[Any],
         model_names: list[str],
+        target_models: list[Any] | None = None,
     ) -> tuple[Any, str | None]:
         complexity, router_result = self._query_routing_complexity(
             body,
@@ -360,8 +381,55 @@ class AutoRouteAlgorithm:
                 self._multiple_models_for_complexity_result(complexity, matched),
             )
 
-        return self._get_default_model(), self._no_model_for_complexity_result(
-            complexity
+        if target_models is None:
+            return self._get_default_model(), self._no_model_for_complexity_result(
+                complexity
+            )
+        return self._resolve_unavailable_complexity(
+            complexity, active_models, target_models
+        )
+
+    def _resolve_unavailable_complexity(
+        self,
+        complexity: int,
+        healthy_models: list[Any],
+        target_models: list[Any],
+    ) -> tuple[Any, str | None]:
+        """Pick a target when no healthy model covers this complexity.
+
+        Reached only when ``healthy_models`` is a strict, non-empty subset of
+        ``target_models``: the caller substitutes the full target set when
+        nothing is healthy anywhere, and a single match on that set returns
+        before reaching this method.
+        """
+        matched_targets = self._models_for_complexity(target_models, complexity)
+        if not matched_targets:
+            # No target range covers this complexity at all: a configuration
+            # gap, not an outage — keep the classic fallback-model result.
+            return self._get_default_model(), self._no_model_for_complexity_result(
+                complexity
+            )
+
+        # Every model covering this complexity is unavailable. Its half-open
+        # servers still accept limited probe traffic (half_open_probe_limit),
+        # which is the in-band recovery path: one successful request closes
+        # the circuit and returns the model to the healthy set, while cooldown
+        # expiry paces the retries.
+        if self._availability_probe_enabled():
+            probe_model = next(
+                (model for model in matched_targets if self._model_pool(model.id)),
+                None,
+            )
+            if probe_model is not None:
+                return probe_model, self._availability_probe_result(complexity)
+
+        survivor = (
+            healthy_models[0]
+            if len(healthy_models) == 1
+            else self._pick_least_loaded(healthy_models)
+        )
+        return survivor, self._availability_fallback_result(
+            complexity, matched_targets
         )
 
     def _query_routing_complexity(
@@ -446,10 +514,18 @@ class AutoRouteAlgorithm:
         picked inside forward_internal (cluster-aware). Decoders and
         decoder-less prefillers are excluded by list_pd_holders.
         """
+        return self._pick_least_loaded(routing_models)
+
+    def _pick_least_loaded(self, models: list[Any]) -> Any | None:
+        """Model whose PD-aware candidate pool is least loaded.
+
+        A pool's load is its minimum workload/weight; models without routable
+        servers are skipped; ties break randomly.
+        """
         best_models: list[Any] = []
         best_load: float | None = None
-        for routing_model in routing_models:
-            servers = ServerRepository.list_pd_holders(routing_model.id, vip=False)
+        for model in models:
+            servers = self._model_pool(model.id)
             if not servers:
                 continue
             load = min(
@@ -457,9 +533,9 @@ class AutoRouteAlgorithm:
                 for server in servers
             )
             if best_load is None or load < best_load:
-                best_models, best_load = [routing_model], load
+                best_models, best_load = [model], load
             elif load == best_load:
-                best_models.append(routing_model)
+                best_models.append(model)
         return random.choice(best_models) if best_models else None
 
     def _routing_response_error_result(self, response) -> str:
@@ -499,6 +575,27 @@ class AutoRouteAlgorithm:
             "routing_failed",
             "no_model_for_complexity",
             f"complexity {complexity} has no matching auto-routing target model",
+        )
+
+    @staticmethod
+    def _availability_probe_result(complexity: int) -> str:
+        return f"complexity:{complexity}:availability_probe"
+
+    @staticmethod
+    def _availability_fallback_result(
+        complexity: int,
+        skipped_models: list[Any],
+    ) -> str:
+        skipped = ",".join(str(model.model_name) for model in skipped_models)
+        detail = AutoRouteAlgorithm._compact_router_message(
+            f"targets unavailable ({skipped})"
+        )
+        return f"complexity:{complexity}:availability_fallback:{detail}"
+
+    @staticmethod
+    def _availability_probe_enabled() -> bool:
+        return bool(
+            APP_CONFIG.get("router", {}).get("availability_probe_enabled", True)
         )
 
     def _multiple_models_for_complexity_result(

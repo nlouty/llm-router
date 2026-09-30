@@ -24,7 +24,7 @@ def test_context_overflow_does_not_switch_to_fallback_when_auto(monkeypatch):
     )
     Server.objects.create(model_id=flash_model.id, base_url="http://flash.example", is_online=True)
 
-    def fake_query_routing_llm(self, body, record, context, active_models, model_names):
+    def fake_query_routing_llm(self, body, record, context, active_models, model_names, target_models=None):
         return other_model, "router_decision"
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._query_routing_llm", fake_query_routing_llm)
 
@@ -128,7 +128,7 @@ def test_context_overflow_retries_same_model_larger_window(monkeypatch):
     # Flash exists but must NOT be contacted: a larger-window same-model server exists.
     Server.objects.create(model_id=flash_model.id, base_url="http://flash.example", is_online=True)
 
-    def fake_query_routing_llm(self, body, record, context, active_models, model_names):
+    def fake_query_routing_llm(self, body, record, context, active_models, model_names, target_models=None):
         return other_model, "router_decision"
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._query_routing_llm", fake_query_routing_llm)
 
@@ -193,7 +193,7 @@ def test_context_overflow_returns_real_body_when_retries_exhausted(monkeypatch):
         context_window=2000,
     )
 
-    def fake_query_routing_llm(self, body, record, context, active_models, model_names):
+    def fake_query_routing_llm(self, body, record, context, active_models, model_names, target_models=None):
         return other_model, "router_decision"
     monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm._query_routing_llm", fake_query_routing_llm)
 

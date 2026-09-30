@@ -35,11 +35,13 @@ router:
   fallback_model: DeepSeek-V4-Flash
   system_prompt_path: router/assets/router_system_prompt.md
   auto_concurrent_limit: 6
+  availability_probe_enabled: true
 ```
 
 - `fallback_model` is used when the routing LLM cannot produce a unique complexity target.
 - `system_prompt_path` points to the classifier prompt. If it cannot be read, a built-in compact JSON classifier prompt is used.
 - `auto_concurrent_limit` is the admission-control limit base for requests whose input model is exactly `auto`.
+- `availability_probe_enabled` (default `true`) controls the in-band recovery probe for unavailable complexity targets (see step 8).
 
 ## Entry Conditions
 
@@ -94,9 +96,9 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
 5. Check session-sticky selection, then prefix-cache model hits.
 
-   A request that carries a session id first resolves session-sticky selection: the newest committed choice for that session wins — up to 10 rows are scanned, and `small_request_routing` / `multimodal_bypass` rows are not anchors. There is no time bound (issue #313): the session keeps its model, deprecated or not, as long as that model still has serving servers; a hit records `session-sticky`. When the anchor model no longer serves, older anchors are tried and the request falls through to the steps below.
+   A request that carries a session id first resolves session-sticky selection: the newest committed choice for that session wins — up to 10 rows are scanned, and `small_request_routing` / `multimodal_bypass` rows are not anchors. There is no time bound (issue #313): the session keeps its model, deprecated or not, as long as that model still has a **healthy** serving pool (at least one closed-circuit routable server); a hit records `session-sticky`. Half-open-only anchors no longer pin the session: when the anchor model has no closed-circuit server, older anchors are tried and the request falls through to the steps below, where the probe/divert logic of step 8 decides what happens to that model.
 
-   When the active chooser supports `get_all_model_prefix_ratios`, the router checks Redis prefix-cache ratios for every text target model. This pre-check is skipped for requests with exactly one user message, and for requests that carry a session id whose session-sticky lookup missed (issue #299): the Redis cache is keyed by prompt prefix, not session, so a different task sharing the same agent prefix must be routed by complexity estimation instead of inheriting the previous task's model.
+   When the active chooser supports `get_all_model_prefix_ratios`, the router checks Redis prefix-cache ratios for every **healthy** text target model (offline or circuit-broken targets are excluded from the query, so a cached prefix cannot pin a request to a dead model). This pre-check is skipped for requests with exactly one user message, and for requests that carry a session id whose session-sticky lookup missed (issue #299): the Redis cache is keyed by prompt prefix, not session, so a different task sharing the same agent prefix must be routed by complexity estimation instead of inheriting the previous task's model.
 
    A model is selected immediately only when exactly one text target has a prefix ratio greater than `0.7`. The result is `cache_hit`.
 
@@ -124,14 +126,19 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    The router accepts compact JSON, fenced JSON, a bare integer, or the first standalone integer from `1` to `10`. Invalid, missing, out-of-range, or boolean values are treated as routing failures.
 
-8. Match complexity to a target model.
+8. Match complexity to a target model, filtered by availability.
 
-   The selected complexity must match exactly one text target range.
+   Before matching, targets are split by availability. A target is **healthy** when it has at least one routable server with a closed circuit (online, not soft-deleted, non-VIP, PD-routable). A pool that is non-empty but has no closed circuit is the **probe tier** — half-open servers with spare probe capacity, which may still be down and are never trusted for selection. When no target is healthy anywhere, the full target set is kept, so behavior degrades to the pre-filter one.
 
-   - One match: select that model and record `complexity:<score>`.
-   - No matches: use `router.fallback_model` and record `routing_failed:no_model_for_complexity:...`.
-   - Multiple matches: use `router.fallback_model` and record `routing_failed:multiple_models_for_complexity:...`.
-   - Routing LLM unavailable, non-200, exception, or invalid output: use `router.fallback_model` and record a `routing_failed` or `routing_error` result.
+   The classified complexity is matched against ranges (inclusive) in this order:
+
+   - Exactly one healthy match: select that model and record `complexity:<score>` (this also resolves overlapping ranges: a dead overlap participant no longer forces the multiple-match fallback).
+   - Multiple healthy matches: use `router.fallback_model` and record `routing_failed:multiple_models_for_complexity:...`.
+   - No healthy match, but some unfiltered target covers the complexity (its pool is dead or probe-only):
+     1. **Probe** (`router.availability_probe_enabled`, default on): the first (lowest-id) unavailable matched model whose pool still has probe capacity receives the request, recorded as `complexity:<score>:availability_probe`. This is the in-band recovery path: the existing circuit-breaker machinery paces it (cooldown expiry reopens the probe window, `half_open_probe_limit` caps concurrent probes, failure re-opens the circuit with doubled cooldown), so one request per window risks a client-visible error while a model is down.
+     2. **Divert**: otherwise the healthy survivor serves the request — the single healthy target, or the least-loaded pool when several remain — recorded as `complexity:<score>:availability_fallback:targets unavailable (<names>)`.
+   - No target covers the complexity at all (a range gap, not an outage): use `router.fallback_model` and record `routing_failed:no_model_for_complexity:...`.
+   - Routing LLM unavailable, non-200, exception, or invalid output: use `router.fallback_model` and record a `routing_failed` or `routing_error` result — classifier failures keep the classic blind fallback and never trigger the availability ladder.
 
 9. Rewrite the original request.
 
@@ -161,7 +168,7 @@ The router never switches to a different model on a context overflow (issue #224
 The original client request row records:
 
 - `model_id`: updated to the selected concrete model when one is chosen.
-- `router_result`: original model prefix plus the route decision, capped at 300 characters. This is persisted during processing (together with `model_id`) as soon as a model is resolved, not only at request finish. `AdmissionService.check_concurrency` reads the prefix (everything before the first `:`) to bucket in-flight requests by their entrance model, so the origin prefix must not be removed or reordered.
+- `router_result`: original model prefix plus the route decision, capped at 300 characters. This is persisted during processing (together with `model_id`) as soon as a model is resolved, not only at request finish. `AdmissionService.check_concurrency` reads the prefix (everything before the first `:`) to bucket in-flight requests by their entrance model, so the origin prefix must not be removed or reordered. Availability decisions keep this shape (`auto:complexity:7:availability_fallback:...`, `auto:complexity:7:availability_probe`); both count as session-sticky anchors, so a session diverted to a survivor model keeps it until that model stops serving — diverted traffic therefore does not revisit the recovered model on its own, and circuit recovery relies on the step-8 probes, non-auto traffic, and the health probing command.
 - `estimate_tokens`: fast heuristic estimate (`fast_estimate_tokens`) before model selection, replaced by a real tokenizer count after model selection when `tokenizer.enabled` is on.
 - `model_choosing_latency`: elapsed milliseconds from request receipt to the first upstream send, recorded for every dispatched request (not only auto ones); auto-selection and small-request-routing time is included in that window.
 - `prefix_cache` and `last_match`: server-selection prefix-cache data for the final upstream attempt.
