@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -347,16 +348,19 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         """group_id of the winning cluster, or None when standalone/cold wins.
 
         Ties prefer the cluster: its KV is pullable by any member via RDMA.
+        Clusters tied on the best ratio win randomly (issue #318): a fixed
+        winner would keep the lowest-id cluster permanently busier.
         """
         if not match.cluster_ratios:
             return None
-        best_group = max(match.cluster_ratios, key=match.cluster_ratios.get)
-        best_cluster_ratio = match.cluster_ratios[best_group]
-        if best_cluster_ratio <= self.secondary_match_threshold:
+        best_ratio = max(match.cluster_ratios.values())
+        if best_ratio <= self.secondary_match_threshold:
             return None
-        if self._best_standalone_ratio(available, match) > best_cluster_ratio:
+        if self._best_standalone_ratio(available, match) > best_ratio:
             return None
-        return best_group
+        return random.choice(
+            [group for group, ratio in match.cluster_ratios.items() if ratio == best_ratio]
+        )
 
     def _best_standalone_ratio(self, available: Sequence[Any], match: _PrefixMatch) -> float:
         return max(

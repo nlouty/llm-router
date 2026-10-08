@@ -107,6 +107,44 @@ class TestPickDecoder:
         assert d.base_url == "http://d1"
 
 
+class TestRandomTieBreaking:
+    """Issue #318: tied picks must not permanently favor the lowest-id server."""
+
+    def test_tied_decoders_are_chosen_randomly(self, monkeypatch):
+        _server("http://d1", role="decoder", group_id="g1", active_tokens=5.0)
+        d2 = _server("http://d2", role="decoder", group_id="g1", active_tokens=5.0)
+        choices = []
+
+        def choose(options):
+            choices.append(list(options))
+            return options[1]
+
+        monkeypatch.setattr("router.repositories.servers.random.choice", choose)
+
+        d = ServerRepository.pick_least_tokens_decoder("g1")
+
+        assert d is not None
+        assert d.base_url == d2.base_url
+        assert [[s.base_url for s in options] for options in choices] == [["http://d1", "http://d2"]]
+
+    def test_tied_prefillers_are_chosen_randomly(self, monkeypatch):
+        _server("http://p1", role="prefiller", group_id="g1", workload=2)
+        p2 = _server("http://p2", role="prefiller", group_id="g1", workload=2)
+        choices = []
+
+        def choose(options):
+            choices.append(list(options))
+            return options[1]
+
+        monkeypatch.setattr("router.repositories.servers.random.choice", choose)
+
+        p = ServerRepository.pick_least_workload_prefiller("g1")
+
+        assert p is not None
+        assert p.base_url == p2.base_url
+        assert [[s.base_url for s in options] for options in choices] == [["http://p1", "http://p2"]]
+
+
 class TestDecoderCircuitRecovery:
     def test_decode_success_closes_half_open_decoder(self):
         # Regression for #192: a decoder must recover from half_open on a
