@@ -215,6 +215,31 @@ class TestScopes:
         )
         assert chooser._winning_scope(servers, match) == "g1"  # cluster 0.7 wins
 
+    def test_tied_clusters_win_randomly(self, monkeypatch):
+        # Issue #318: two same-scale clusters with the same best ratio must
+        # share the win instead of the first-inserted cluster always winning.
+        chooser = _chooser_with_workload({}, decoder_mins={})
+        servers = [
+            make_server(1, "http://n1", role="prefiller", group_id="g1"),
+            make_server(2, "http://n2", role="prefiller", group_id="g2"),
+        ]
+        match = _PrefixMatch(
+            server_match_ratios={1: 0.7, 2: 0.7},
+            cluster_ratios={"g1": 0.7, "g2": 0.7},
+        )
+        choices = []
+
+        def choose(options):
+            choices.append(list(options))
+            return options[1]
+
+        monkeypatch.setattr(
+            "router.route_algorithm.prefix_cache_preble.random.choice", choose
+        )
+
+        assert chooser._winning_scope(servers, match) == "g2"
+        assert choices == [["g1", "g2"]]
+
     def test_mixed_group_id_is_not_a_cluster_member(self):
         # A mixed server with an accidentally set group_id is standalone.
         chooser = _chooser_with_workload({}, decoder_mins={})

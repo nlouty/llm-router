@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from datetime import timedelta
 
 from django.db.models import Count, F, Q, Value
@@ -335,6 +336,15 @@ class ServerRepository:
         }
 
     @staticmethod
+    def _pick_random_min(servers: list[Server], key) -> Server | None:
+        """Least-key server with random tie breaking (issue #318): a plain
+        min() would always favor the lowest-id server."""
+        if not servers:
+            return None
+        min_key = min(key(s) for s in servers)
+        return random.choice([s for s in servers if key(s) == min_key])
+
+    @staticmethod
     def pick_least_tokens_decoder(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
         """Pick the least-active_tokens routable decoder in a cluster."""
         attempted_ids = attempted_ids or set()
@@ -345,6 +355,9 @@ class ServerRepository:
             and s.group_id == group_id
             and s.id not in attempted_ids
         ]
+        chosen = ServerRepository._pick_random_min(
+            decoders, lambda s: float(getattr(s, "active_tokens", 0.0) or 0.0)
+        )
         request_id = get_request_id()
         if request_id:
             all_decoder_ids = sorted(s.id for s in servers if (getattr(s, "role", "mixed") or "mixed") == "decoder" and s.group_id == group_id)
@@ -354,11 +367,9 @@ class ServerRepository:
                 "attempted_ids": sorted(attempted_ids),
                 "all_decoder_ids": all_decoder_ids,
                 "available_count": len(decoders),
-                "chosen_id": min(decoders, key=lambda s: (float(getattr(s, "active_tokens", 0.0) or 0.0))).id if decoders else None,
+                "chosen_id": chosen.id if chosen else None,
             }, ensure_ascii=False))
-        if not decoders:
-            return None
-        return min(decoders, key=lambda s: (float(getattr(s, "active_tokens", 0.0) or 0.0)))
+        return chosen
 
     @staticmethod
     def pick_least_workload_prefiller(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
@@ -371,9 +382,9 @@ class ServerRepository:
             and s.group_id == group_id
             and s.id not in attempted_ids
         ]
-        if not prefillers:
-            return None
-        return min(prefillers, key=lambda s: (int(getattr(s, "workload", 0) or 0)))
+        return ServerRepository._pick_random_min(
+            prefillers, lambda s: int(getattr(s, "workload", 0) or 0)
+        )
 
     @staticmethod
     def count_new_prefills_by_targets(
