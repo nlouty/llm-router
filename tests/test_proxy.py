@@ -731,6 +731,46 @@ def test_separate_image_message_uses_multimodal_bypass():
     assert decision.router_result == "auto:multimodal_bypass"
 
 
+def test_deprecated_multimodal_model_still_serves_auto_image_requests():
+    # Deprecation blocks the model name on the normal port but, like text
+    # targets, does not remove auto-routing eligibility: the vision model
+    # chosen by multimodal_bypass never passes the view-level name gate.
+    vision_model = Model.objects.create(
+        model_name="vision-model",
+        auto=False,
+        multimodal=True,
+        deprecation="vision-model is deprecated, please use vision-model-v2.",
+    )
+    Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
+
+    body = json.dumps({
+        "model": "auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,abc123"},
+                    },
+                ],
+            },
+        ],
+    }).encode("utf-8")
+
+    decision = AutoRouteAlgorithm().resolve(
+        _parsed_auto_request(body),
+        MagicMock(id=123),
+        _auto_selection_context(body),
+        None,
+        False,
+    )
+
+    assert decision.model == vision_model
+    assert decision.router_result == "auto:multimodal_bypass"
+
+
 def test_auto_route_prefix_cache_uses_only_auto_selectable_models():
     routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
     target_model = Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)

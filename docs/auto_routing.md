@@ -64,9 +64,9 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
 2. Detect multimodal auto requests.
 
-   This step runs before small-request routing (issue #324): an image-bearing request must reach the vision model, never the text-only routing classifier. For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port, the router checks the JSON `messages` list. If any message content is a list containing a part with `type: "image_url"` and a truthy `image_url`, the router selects the first active model with `multimodal = TRUE`, ordered by `id`.
+   This step runs before small-request routing (issue #324): an image-bearing request must reach the vision model, never the text-only routing classifier. For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port, the router checks the JSON `messages` list. If any message content is a list containing a part with `type: "image_url"` and a truthy `image_url`, the router selects the first model with `multimodal = TRUE`, ordered by `id`. `models.deprecation` is ignored here, as with text targets: a deprecated vision model still serves auto image requests, because the model name written by `multimodal_bypass` never passes the view-level name block.
 
-   This bypasses small-request routing and the text complexity classifier. If no active multimodal model exists, the request continues through small-request routing and text auto selection.
+   This bypasses small-request routing and the text complexity classifier. If no multimodal model exists, the request continues through small-request routing and text auto selection.
 
 3. Try small-request routing.
 
