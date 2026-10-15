@@ -53,7 +53,7 @@ class AutoRouteAlgorithm:
         is_vip_channel: bool,
     ) -> AutoRouteDecision:
         origin_model_name = context.origin_model_name or parsed.model_name
-        model, router_result = self._resolve_small_request_routing_model(
+        model, router_result = self._resolve_multimodal_model(
             parsed,
             record,
             context,
@@ -61,6 +61,15 @@ class AutoRouteAlgorithm:
             is_vip_channel,
             origin_model_name,
         )
+        if router_result is None:
+            model, router_result = self._resolve_small_request_routing_model(
+                parsed,
+                record,
+                context,
+                model,
+                is_vip_channel,
+                origin_model_name,
+            )
         if router_result is None:
             model, router_result = self._resolve_auto_model(
                 parsed,
@@ -72,6 +81,36 @@ class AutoRouteAlgorithm:
             )
         context.router_result = router_result
         return AutoRouteDecision(model=model, router_result=router_result)
+
+    def _resolve_multimodal_model(
+        self,
+        parsed,
+        record,
+        context: ServerSelectionContext,
+        model,
+        is_vip_channel: bool,
+        origin_model_name: str | None,
+    ):
+        # Multimodal detection outranks small-request routing (issue #324):
+        # an image-bearing auto request must reach the vision model instead of
+        # the text-only routing classifier, whose image failures surface as
+        # gateway_timeout_error request timeouts. With no multimodal target
+        # configured, the request falls through to small-request routing and
+        # text auto selection unchanged.
+        if (
+            is_vip_channel
+            or not context.auto_model_selection
+            or not self._is_multimodal(parsed.body, getattr(context, "body_data", None))
+        ):
+            return model, None
+
+        multimodal_model = ModelRepository.get_multimodal_model()
+        if multimodal_model is None:
+            return model, None
+
+        prefixed = self._router_result_with_origin(origin_model_name, "multimodal_bypass")
+        self._apply_resolved_model(parsed, record, context, multimodal_model, prefixed)
+        return multimodal_model, prefixed
 
     @staticmethod
     def _router_result_with_origin(
@@ -193,10 +232,6 @@ class AutoRouteAlgorithm:
         # Parsed JSON of the request, threaded from RequestParser so the whole
         # routing path parses the body exactly once (Action 5).
         body_data = getattr(context, "body_data", None)
-        if self._is_multimodal(body, body_data):
-            model = ModelRepository.get_multimodal_model()
-            if model:
-                return model, "multimodal_bypass"
 
         auto_models = ModelRepository.list_auto_selectable_models()
         if not auto_models:
