@@ -73,10 +73,11 @@ class ModelRepository:
 
     @staticmethod
     def get_multimodal_model() -> Model | None:
-        return Model.objects.filter(
-            multimodal=True,
-            deprecation__isnull=True,
-        ).order_by("id").first()
+        # Deprecation is a normal-port name-access block, not an eligibility
+        # filter: like text targets, a deprecated multimodal model still
+        # serves auto image requests — the model name written by
+        # multimodal_bypass never passes the view-level deprecation gate.
+        return Model.objects.filter(multimodal=True).order_by("id").first()
 
     @staticmethod
     def get_by_names(model_names: list[str]) -> dict[str, Model]:
