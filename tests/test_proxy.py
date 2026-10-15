@@ -634,6 +634,33 @@ def test_text_only_content_parts_do_not_use_multimodal_bypass():
     assert router_result == "complexity:5"
 
 
+def _parsed_auto_request(body: bytes):
+    return type(
+        "Parsed",
+        (),
+        {
+            "estimated_full_body_tokens": 0,
+            "body": body,
+            "model_name": "auto",
+        },
+    )()
+
+
+def _auto_selection_context(body: bytes) -> ServerSelectionContext:
+    return ServerSelectionContext(
+        request_id=1,
+        ip_id=None,
+        model_id=None,
+        model_name="auto",
+        path="chat/completions",
+        method="POST",
+        is_stream=False,
+        body=body,
+        body_data=json.loads(body.decode("utf-8")),
+        auto_model_selection=True,
+    )
+
+
 def test_chat_image_content_parts_use_multimodal_bypass():
     vision_model = Model.objects.create(model_name="vision-model", auto=False, multimodal=True)
     Model.objects.create(model_name="target-model", auto=True, complexity_min=1, complexity_max=10)
@@ -657,14 +684,16 @@ def test_chat_image_content_parts_use_multimodal_bypass():
         ],
     }).encode("utf-8")
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fail_if_called))._get_auto_route_model(
-        body,
+    decision = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fail_if_called)).resolve(
+        _parsed_auto_request(body),
         MagicMock(id=123),
-        MagicMock(),
+        _auto_selection_context(body),
+        None,
+        False,
     )
 
-    assert model == vision_model
-    assert router_result == "multimodal_bypass"
+    assert decision.model == vision_model
+    assert decision.router_result == "auto:multimodal_bypass"
 
 
 def test_separate_image_message_uses_multimodal_bypass():
@@ -690,14 +719,16 @@ def test_separate_image_message_uses_multimodal_bypass():
         ],
     }).encode("utf-8")
 
-    model, router_result = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fail_if_called))._get_auto_route_model(
-        body,
+    decision = AutoRouteAlgorithm(_RoutingChooser(), proxy=_StubProxy(fail_if_called)).resolve(
+        _parsed_auto_request(body),
         MagicMock(id=123),
-        MagicMock(),
+        _auto_selection_context(body),
+        None,
+        False,
     )
 
-    assert model == vision_model
-    assert router_result == "multimodal_bypass"
+    assert decision.model == vision_model
+    assert decision.router_result == "auto:multimodal_bypass"
 
 
 def test_auto_route_prefix_cache_uses_only_auto_selectable_models():
@@ -1084,7 +1115,12 @@ def test_auto_entrance_multimodal_request_selects_auto_false_multimodal_model(mo
     vision_model = Model.objects.create(model_name="vision-model", auto=False, multimodal=True)
     Server.objects.create(model_id=source_model.id, base_url="http://source.example", is_online=True)
     Server.objects.create(model_id=vision_model.id, base_url="http://vision.example", is_online=True)
-    monkeypatch.setattr("router.route_algorithm.auto.AutoRouteAlgorithm.SMALL_REQUEST_ROUTING_TOKEN_LIMIT", 0)
+    # Issue #324: a routing model with a routable server is configured and the
+    # image request body is well under SMALL_REQUEST_ROUTING_TOKEN_LIMIT, so
+    # multimodal detection must win over small-request routing — the image
+    # never reaches the text-only routing classifier.
+    routing_model = Model.objects.create(model_name="router-model", is_routing_model=True)
+    Server.objects.create(model_id=routing_model.id, base_url="http://router.example", is_online=True)
 
     # The multimodal bypass must skip the choosing pipeline entirely (no
     # llm-choosing record is created by the internal forward).

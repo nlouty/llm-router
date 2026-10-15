@@ -5,7 +5,7 @@
 There are two related behaviors:
 
 - True auto model selection: requests whose input model is `auto`, or normal-port requests for a concrete model whose `models.auto = TRUE`, can be rewritten to another model.
-- Small-request routing: normal-port auto requests whose fast token estimate is below `3000` can be sent to a configured routing model before true auto selection runs. The estimate is a cheap char/byte heuristic (`fast_estimate_tokens`) that needs no model, so it is available before one is selected.
+- Small-request routing: normal-port auto requests whose fast token estimate is below `3000` — and that contain no image parts, since multimodal detection runs first (issue #324) — can be sent to a configured routing model before true auto selection runs. The estimate is a cheap char/byte heuristic (`fast_estimate_tokens`) that needs no model, so it is available before one is selected.
 
 ## Database Setup
 
@@ -62,21 +62,21 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    This value prefixes the final `requests.router_result`, for example `auto:complexity:5` or `source-model:small_request_routing`.
 
-2. Try small-request routing.
+2. Detect multimodal auto requests.
 
-   This step runs first for auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port whose fast token estimate is between `1` and `3000`. The estimate is `fast_estimate_tokens` (a char/byte heuristic that needs no model), so it works before any model is selected. Explicit (non-auto) model requests are never rewritten to the routing model.
+   This step runs before small-request routing (issue #324): an image-bearing request must reach the vision model, never the text-only routing classifier. For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port, the router checks the JSON `messages` list. If any message content is a list containing a part with `type: "image_url"` and a truthy `image_url`, the router selects the first active model with `multimodal = TRUE`, ordered by `id`.
+
+   This bypasses small-request routing and the text complexity classifier. If no active multimodal model exists, the request continues through small-request routing and text auto selection.
+
+3. Try small-request routing.
+
+   For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port that were not claimed by multimodal detection, whose fast token estimate is between `1` and `3000`. The estimate is `fast_estimate_tokens` (a char/byte heuristic that needs no model), so it works before any model is selected. Explicit (non-auto) model requests are never rewritten to the routing model.
 
    The router scans `models.is_routing_model = TRUE` rows by ascending `id` and asks for non-VIP servers for each routing model. Candidate servers must be online, routable by circuit-breaker state, not soft-deleted, and have `context_window IS NULL OR context_window >= estimate_tokens`.
 
    If a routing-model server exists, the request is rewritten to that routing model, `chat_template_kwargs.enable_thinking` is set to `false`, the processing row's `model_id` is updated, and `router_result` becomes `small_request_routing`. True auto selection is skipped.
 
    If no routing-model server exists, the router continues. A non-auto request keeps its requested model; an auto request proceeds to true auto selection.
-
-3. Detect multimodal auto requests.
-
-   For true auto requests, the router checks the JSON `messages` list. If any message content is a list containing a part with `type: "image_url"` and a truthy `image_url`, the router selects the first active model with `multimodal = TRUE`, ordered by `id`.
-
-   This bypasses the text complexity classifier. If no active multimodal model exists, the request continues through text auto selection.
 
 4. Build the text target set.
 
