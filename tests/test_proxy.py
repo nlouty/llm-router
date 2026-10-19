@@ -91,7 +91,7 @@ def test_v1_models_endpoint_answered_locally_without_upstream(monkeypatch):
             "owned_by": "gateway",
             "max_context": None,
             "max_output_tokens": 65536,
-            "concurrent_limit": 6,
+            "concurrent_limit": 8,
         }
     ]
     # Gateway internals are not exposed to users.

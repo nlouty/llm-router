@@ -136,7 +136,7 @@ class AdmissionService:
         if model is None:
             # Literal "auto" entrance. In-flight records keep model_id = 0
             # before resolution and "auto:..." prefix after, so both map here.
-            limit_base = int(APP_CONFIG.get("router", {}).get("auto_concurrent_limit", 6))
+            limit_base = int(APP_CONFIG.get("router", {}).get("auto_concurrent_limit", 8))
             matches_entrance = self._entrance_is_auto
         else:
             # Concrete model by name (whether or not it is also auto=true):

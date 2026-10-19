@@ -74,7 +74,7 @@ Optional config:
 router:
   fallback_model: DeepSeek-V4-Flash
   system_prompt_path: router/assets/router_system_prompt.md
-  auto_concurrent_limit: 6
+  auto_concurrent_limit: 8
 ```
 
 See [Auto Routing](auto_routing.md) for the full model-selection sequence, cache shortcut, and fallback behavior.
