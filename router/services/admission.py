@@ -188,17 +188,18 @@ class AdmissionService:
     def off_peak_boost_active(beijing_time=None) -> bool:
         """True during the 4x concurrency boost window.
 
-        23:00–08:00 Beijing time every day, Saturdays from 18:00, or all day
-        Sunday. ``beijing_time`` defaults to the current local time (the
-        project timezone) so callers can pin the clock in tests.
+        22:00–09:00 Beijing time every day, from 19:00 on Wednesdays,
+        Fridays and Saturdays, or all day Sunday. ``beijing_time`` defaults
+        to the current local time (the project timezone) so callers can pin
+        the clock in tests.
         """
         if beijing_time is None:
             beijing_time = timezone.localtime()
         wd = beijing_time.weekday()  # Monday=0 ... Sunday=6
         return (
-            beijing_time.hour < 8
-            or beijing_time.hour >= 23
-            or (wd == 5 and beijing_time.hour >= 18)
+            beijing_time.hour < 9
+            or beijing_time.hour >= 22
+            or (wd in (2, 4, 5) and beijing_time.hour >= 19)  # Wednesday, Friday, Saturday
             or wd == 6
         )
 

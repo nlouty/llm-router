@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from django.utils import timezone
@@ -218,6 +218,29 @@ def test_whitelist_cannot_rescue_an_ip_without_user_ips_row():
     identity = _identity()
 
     assert not _service(strict=True).check_permission(identity).allowed
+
+
+# --- off-peak boost window ---
+
+
+def test_off_peak_boost_window_boundaries():
+    # Every day boosts 22:00-09:00; Wednesday, Friday and Saturday start at
+    # 19:00 instead; Sunday is boosted all day. 2026-06-01 is a Monday.
+    cases = [
+        (datetime(2026, 6, 1, 21, 59), False),  # Monday 21:59
+        (datetime(2026, 6, 1, 22, 0), True),    # Monday 22:00
+        (datetime(2026, 6, 2, 8, 59), True),    # Tuesday 08:59
+        (datetime(2026, 6, 2, 9, 0), False),    # Tuesday 09:00
+        (datetime(2026, 6, 3, 18, 59), False),  # Wednesday 18:59
+        (datetime(2026, 6, 3, 19, 0), True),    # Wednesday 19:00
+        (datetime(2026, 6, 4, 21, 0), False),   # Thursday 21:00
+        (datetime(2026, 6, 5, 19, 0), True),    # Friday 19:00
+        (datetime(2026, 6, 6, 18, 59), False),  # Saturday 18:59
+        (datetime(2026, 6, 6, 19, 0), True),    # Saturday 19:00
+        (datetime(2026, 6, 7, 12, 0), True),    # Sunday noon
+    ]
+    for when, boosted in cases:
+        assert AdmissionService.off_peak_boost_active(when) is boosted, when
 
 
 # --- apikey registration verification (department, then whitelist) ---
