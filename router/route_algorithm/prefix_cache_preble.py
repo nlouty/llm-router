@@ -321,9 +321,12 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         request class decides placement:
 
         - cached  (ratio > primary):   holders first, busy-holder switch to a
-          same-cluster p-prefiller, cluster-first #247 escape.
+          same-cluster p-prefiller, cluster-first #247 escape. A busy holder
+          with no same-cluster p-prefiller keeps the request only while below
+          its #247 overload threshold.
         - partial (ratio > secondary): n-prefillers inside the cluster so the
-          partial KV is pulled via RDMA instead of recomputed.
+          partial KV is pulled via RDMA instead of recomputed; #247 escape
+          when the cluster is overloaded.
         - cold:                        strict n-prefiller isolation, globally.
         """
         scope_group = self._winning_scope(available, match)
@@ -403,7 +406,9 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         switch steers the request to a same-cluster p-prefiller (RDMA pull)
         when the holder is an n-prefiller already running a new prefill —
         issue #276's head-of-line blocking. Overload escape stays inside the
-        cluster first: p-prefillers, then n-prefillers, then global.
+        cluster first: p-prefillers, then n-prefillers, then global. A busy
+        holder with no same-cluster p-prefiller keeps the request only while
+        below its #247 overload threshold.
         """
         load_counts = self._load_counts(available)
         min_load = min(load_counts.get(server.id, 0) for server in available)
@@ -425,8 +430,17 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             if busy_with_new:
                 has_p = any(self._server_role(s) == "prefix-prefiller" for s in group_servers)
                 if not has_p:
-                    # Split disabled for this cluster: stay on the holder.
-                    return chosen
+                    if not self._is_overloaded(
+                        chosen, load_counts.get(chosen.id, 0), min_load
+                    ):
+                        # Split disabled for this cluster: stay on the holder.
+                        return chosen
+                    logger.info(
+                        "[PrefixCachePreble] holder server_id=%s overloaded with "
+                        "no same-cluster p-prefiller; escaping globally",
+                        chosen.id,
+                    )
+                    return self._cached_escape(available, group_servers, load_counts)
                 match.switched_from = chosen.id
                 logger.info(
                     "[PrefixCachePreble] holder server_id=%s has a new prefill "
@@ -462,11 +476,20 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     def _choose_partial(self, available: Sequence[Any], group_servers: list[Any]):
         """Partial class (secondary < ratio <= primary): new-style placement,
         but inside the argmax cluster so the partial KV is pulled via RDMA
-        instead of recomputed on a server outside the pool."""
+        instead of recomputed on a server outside the pool. The #247 escape
+        applies here too: an overloaded cluster sheds partials to the global
+        least-loaded pool instead of queueing them behind its prefillers."""
         load_counts = self._load_counts(available)
+        min_load = min(load_counts.get(server.id, 0) for server in available)
         n_in_cluster = [s for s in group_servers if self._server_role(s) == "prefiller"]
         if n_in_cluster:
-            return self._pick_least_loaded(n_in_cluster, load_counts)
+            candidate = self._pick_least_loaded(n_in_cluster, load_counts)
+            if not self._is_overloaded(candidate, load_counts.get(candidate.id, 0), min_load):
+                return candidate
+            logger.info(
+                "[PrefixCachePreble] partial cluster overloaded; falling back "
+                "to least loaded server"
+            )
         return self._choose_new(available, load_counts)
 
     def _choose_new(self, available: Sequence[Any], load_counts: dict[int, float] | None = None):
