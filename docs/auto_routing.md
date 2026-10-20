@@ -34,7 +34,7 @@ Optional `router` configuration keys:
 router:
   fallback_model: DeepSeek-V4-Flash
   system_prompt_path: router/assets/router_system_prompt.md
-  auto_concurrent_limit: 6
+  auto_concurrent_limit: 8
   availability_probe_enabled: true
 ```
 

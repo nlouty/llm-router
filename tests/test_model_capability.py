@@ -78,7 +78,7 @@ def test_normal_port_capabilities():
     auto = _entry_by_id(payload, "auto")
     assert auto["max_output_tokens"] == 65536
     assert auto["max_context"] == 200000  # min over auto targets (only model-a)
-    assert auto["concurrent_limit"] == 6
+    assert auto["concurrent_limit"] == 8
 
 
 def test_auto_max_context_is_min_of_redirect_targets():
@@ -210,7 +210,7 @@ def test_off_peak_boost_window_quadruples_limit(_fixed_clock):
     payload = Client().get("/v1/models", SERVER_PORT="8001", REMOTE_ADDR="10.0.0.6").json()
 
     assert _entry_by_id(payload, "model-a")["concurrent_limit"] == 12
-    assert _entry_by_id(payload, "auto")["concurrent_limit"] == 24
+    assert _entry_by_id(payload, "auto")["concurrent_limit"] == 32
 
 
 def test_apikey_identity_included_and_no_request_record():
