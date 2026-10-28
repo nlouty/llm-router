@@ -68,6 +68,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_when_user_info_missing": True,
         "user_info_missing_message": "Access denied, you do not have permission",
     },
+    "encryption": {"emp_token_secret_key": ""},
     "tokenizer": {"enabled": False},
     "cmdb": {"enabled": False, "dummy": True, "refresh_interval_between_ips_seconds": 1},
     "database": {
@@ -100,6 +101,8 @@ def load_config() -> dict[str, Any]:
     config = _deep_merge(DEFAULT_CONFIG, data)
     if "LLM_ROUTER_LOG_PATH" in os.environ:
         config["log_path"] = os.environ["LLM_ROUTER_LOG_PATH"]
+    if "EMP_TOKEN_SECRET_KEY" in os.environ:
+        config.setdefault("encryption", {})["emp_token_secret_key"] = os.environ["EMP_TOKEN_SECRET_KEY"]
     prefix_cache = config.setdefault("prefix_cache", {})
 
     database = config.setdefault("database", {})
