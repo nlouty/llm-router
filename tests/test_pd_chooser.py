@@ -85,9 +85,9 @@ def mock_redis():
         PrefixCachePrebleServerChooser._redis_client = None
 
 
-def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[str, float] | None = None, new_prefill_targets: set[str] | None = None):
+def _chooser_with_workload(server_workloads: dict[int, int], decoder_avgs: dict[str, float] | None = None, new_prefill_targets: set[str] | None = None):
     """Build a chooser where each server reports a fixed workload, and PD
-    decoder-min loads are stubbed (no DB needed). ``new_prefill_targets`` are
+    decoder-average loads are stubbed (no DB needed). ``new_prefill_targets`` are
     base_urls whose "P: {base_url}" target reports one new prefill in flight."""
     c = PrefixCachePrebleServerChooser.__new__(PrefixCachePrebleServerChooser)
     # minimal init skipping redis/APP_CONFIG
@@ -104,8 +104,8 @@ def _chooser_with_workload(server_workloads: dict[int, int], decoder_mins: dict[
         t: 1 for t in targets if t[len("P: "):] in busy
     }
     c._ensure_redis = lambda: None
-    if decoder_mins is not None:
-        c._cluster_decoder_mins = staticmethod(lambda: decoder_mins)
+    if decoder_avgs is not None:
+        c._cluster_decoder_avgs = staticmethod(lambda: decoder_avgs)
     return c
 
 
@@ -117,16 +117,31 @@ class TestPrefillerLoadUsesDecoderFloor:
             make_server(1, "http://m1", role="mixed", workload=0),
             make_server(2, "http://p1", role="prefiller", group_id="g1", workload=5),
         ]
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 1.0})
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 1.0})
         ctx = make_context(make_body("a fresh prompt with no cached match"))
         selected = chooser.choose(candidates, ctx, set())
         assert selected.id == 1  # mixed wins; prefiller's load is 5 not 0
+
+    def test_decoder_floor_not_discounted_by_prefiller_weight(self, mock_redis):
+        # #331: the decode-side floor must not be divided by the prefiller's
+        # weight. Prefiller (weight 4, workload 0) behind decoders averaging
+        # 2.0 per-unit load: effective = max(0/4, 2.0) = 2.0, so the mixed
+        # server at 1.0 wins. (The double-division bug scored the prefiller
+        # 2.0/4 = 0.5 and wrongly preferred the decode-saturated cluster.)
+        candidates = [
+            make_server(1, "http://m1", role="mixed", workload=1),
+            make_server(2, "http://p1", role="prefiller", group_id="g1", workload=0, weight=4),
+        ]
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 2.0})
+        ctx = make_context(make_body("a fresh prompt with no cached match"))
+        selected = chooser.choose(candidates, ctx, set())
+        assert selected.id == 1
 
     def test_prefix_hit_on_prefiller_overloaded_falls_back(self, mock_redis):
         # Seed Redis: prefix maps to prefiller (id=2), ratio 1.0
         _, storage = mock_redis
         body = make_body("shared prefix content")
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 100.0})
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 100.0})
         prefiller = make_server(2, "http://p1", role="prefiller", group_id="g1")
         chooser.on_response(prefiller, make_context(body, request_id=42), 200)
         assert storage, "on_response should have written prefix entries"
@@ -138,7 +153,7 @@ class TestPrefillerLoadUsesDecoderFloor:
             make_server(1, "http://m1", role="mixed", workload=0),
             prefiller,
         ]
-        chooser2 = _chooser_with_workload({}, decoder_mins={"g1": 100.0})
+        chooser2 = _chooser_with_workload({}, decoder_avgs={"g1": 100.0})
         selected = chooser2.choose(candidates, make_context(body), set())
         assert selected.id == 1
 
@@ -150,7 +165,7 @@ class TestPrefillerBalancingWithinCluster:
             make_server(2, "http://p2", role="prefiller", group_id="g1", workload=0),
             make_server(3, "http://p3", role="prefiller", group_id="g1", workload=0),
         ]
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 0.0})
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 0.0})
         ctx = make_context(make_body("a fresh prompt with no cached match"))
         selected = chooser.choose(candidates, ctx, set())
         assert selected.id in (2, 3)
@@ -160,7 +175,7 @@ class TestPrefillerBalancingWithinCluster:
         body = make_body("shared prefix content")
         busy = make_server(1, "http://p1", role="prefiller", group_id="g1", workload=7)
         idle = make_server(2, "http://p2", role="prefiller", group_id="g1", workload=0)
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 3.0})
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 3.0})
         chooser.on_response(busy, make_context(body, request_id=42), 200)
         assert storage, "on_response should have written prefix entries"
 

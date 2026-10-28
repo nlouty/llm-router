@@ -58,8 +58,8 @@ class TestListPdHolders:
         assert holders == []
 
 
-class TestClusterDecoderMinLoad:
-    def test_decoder_min_is_min_workload_per_cluster(self):
+class TestClusterDecoderAvgLoad:
+    def test_decoder_avg_is_mean_workload_per_cluster(self):
         servers = [
             _server("http://p1", role="prefiller", group_id="g1", workload=2),
             _server("http://p2", role="prefiller", group_id="g1", workload=5),
@@ -67,17 +67,26 @@ class TestClusterDecoderMinLoad:
             _server("http://d2", role="decoder", group_id="g1", workload=8),
             _server("http://m1", role="mixed"),
         ]
-        decoder_mins = ServerRepository.cluster_decoder_min_load(servers)
-        assert decoder_mins == {"g1": 3.0}
+        decoder_avgs = ServerRepository.cluster_decoder_avg_load(servers)
+        assert decoder_avgs == {"g1": 5.5}
 
     def test_cluster_without_decoder_is_omitted(self):
         servers = [
             _server("http://p1", role="prefiller", group_id="g1", workload=2),
             _server("http://d1", role="decoder", group_id="g2", workload=1),
         ]
-        decoder_mins = ServerRepository.cluster_decoder_min_load(servers)
+        decoder_avgs = ServerRepository.cluster_decoder_avg_load(servers)
         # g1 has no decoder -> omitted
-        assert decoder_mins == {"g2": 1.0}
+        assert decoder_avgs == {"g2": 1.0}
+
+    def test_decoder_load_is_weight_normalized(self):
+        # A weight-2 decoder at workload 4 counts like a weight-1 at 2 (#331).
+        servers = [
+            _server("http://d1", role="decoder", group_id="g1", workload=4, weight=2),
+            _server("http://d2", role="decoder", group_id="g1", workload=2),
+        ]
+        decoder_avgs = ServerRepository.cluster_decoder_avg_load(servers)
+        assert decoder_avgs == {"g1": 2.0}
 
 
 class TestPickDecoder:
@@ -87,6 +96,15 @@ class TestPickDecoder:
         d = ServerRepository.pick_least_tokens_decoder("g1")
         assert d is not None
         assert d.base_url == "http://d2"
+
+    def test_picks_weight_normalized_active_tokens(self):
+        # A weight-2 decoder absorbs twice the tokens per unit capacity (#331):
+        # 60 tokens / weight 2 (= 30) beats 50 tokens / weight 1 (= 50).
+        _server("http://d1", role="decoder", group_id="g1", active_tokens=60.0, weight=2)
+        _server("http://d2", role="decoder", group_id="g1", active_tokens=50.0)
+        d = ServerRepository.pick_least_tokens_decoder("g1")
+        assert d is not None
+        assert d.base_url == "http://d1"
 
     def test_excludes_attempted(self):
         d1 = _server("http://d1", role="decoder", group_id="g1", active_tokens=1.0)
@@ -143,6 +161,16 @@ class TestRandomTieBreaking:
         assert p is not None
         assert p.base_url == p2.base_url
         assert [[s.base_url for s in options] for options in choices] == [["http://p1", "http://p2"]]
+
+
+class TestPickPrefiller:
+    def test_picks_weight_normalized_workload(self):
+        # 4 / weight 2 (= 2) beats 3 / weight 1 (= 3) (#331).
+        _server("http://p1", role="prefiller", group_id="g1", workload=4, weight=2)
+        _server("http://p2", role="prefiller", group_id="g1", workload=3)
+        p = ServerRepository.pick_least_workload_prefiller("g1")
+        assert p is not None
+        assert p.base_url == "http://p1"
 
 
 class TestDecoderCircuitRecovery:

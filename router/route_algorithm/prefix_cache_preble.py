@@ -617,28 +617,33 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     def _load_counts(self, available: Sequence[Any]) -> dict[int, float]:
         """Workload per server, with PD prefillers reporting node + cluster load.
 
-        Mixed servers report their own workload. A prefiller reports
-        ``max(own workload, min decoder workload)`` so least-loaded selection
-        still prefers an idle prefiller within the cluster while a decoder-bound
-        cluster is never mistaken for an idle node. Decoders are never in the
-        candidate set (they hold no prefix cache and are chosen later).
+        Mixed servers report their own workload. A prefiller reports the
+        bottleneck of its two sides, prefill and decode — ``max(own workload,
+        decoder_avg * own weight)`` — so the later ``/ weight`` normalization
+        (LeastConnectionServerChooser._normalized_load) yields
+        ``max(own/weight, avg(D.workload/D.weight))``: each side normalized by
+        its own capacity exactly once (#331). Decoders are chosen by
+        active_tokens, not workload, so the cluster's average (not its least
+        busy decoder) reflects the decode pressure the next request adds.
+        Decoders are never in the candidate set (they hold no prefix cache and
+        are chosen later).
         """
         load_counts = super()._load_counts(available)
         prefillers = [s for s in available if is_prefiller_role(getattr(s, "role", None))]
         if not prefillers:
             return load_counts
-        decoder_mins = self._cluster_decoder_mins()
+        decoder_avgs = self._cluster_decoder_avgs()
         for server in prefillers:
             own = int(getattr(server, "workload", 0) or 0)
-            floor = decoder_mins.get(getattr(server, "group_id", None), 0)
-            load_counts[server.id] = max(own, floor)
+            floor = decoder_avgs.get(getattr(server, "group_id", None), 0)
+            load_counts[server.id] = max(own, floor * effective_weight(server))
         return load_counts
 
     @staticmethod
-    def _cluster_decoder_mins() -> dict[str, float]:
+    def _cluster_decoder_avgs() -> dict[str, float]:
         from router.repositories.servers import ServerRepository
 
-        return ServerRepository.cluster_decoder_min_load(ServerRepository.list_all_online())
+        return ServerRepository.cluster_decoder_avg_load(ServerRepository.list_all_online())
 
     def _prefix_chars_from_body(self, body: bytes) -> str:
         text = self._text_from_body(body)
