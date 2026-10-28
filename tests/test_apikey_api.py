@@ -2,9 +2,11 @@ import json
 from datetime import timedelta
 
 import pytest
+from cryptography.fernet import Fernet
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from router.config import APP_CONFIG
 from router.models import Department, UserIP, Whitelist
 from router.repositories.user_ips import UserIPRepository
 from router.repositories.whitelist import WhitelistRepository
@@ -523,3 +525,120 @@ def test_invalidate_apikey_matches_employee_no_case_insensitively(client):
 
     assert response.status_code == 200
     assert UserIPRepository.get_active_apikey_by_employee_no("E001") is None
+
+
+# --- encrypted lookup (issue #335) ---
+
+FERNET_KEY = Fernet.generate_key().decode("utf-8")
+
+
+def _fernet():
+    return Fernet(FERNET_KEY.encode("utf-8"))
+
+
+def _get_encrypted(client, employee_no="E001", cipher=None):
+    token = (cipher or _fernet()).encrypt(employee_no.encode("utf-8")).decode("utf-8")
+    return client.get(f"/api/apikey?encrypted_employee_no={token}")
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_returns_roundtrip_encrypted_apikey(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+    UserIP.objects.create(ip_id=0, apikey="abcdEFGHwxyz", employee_no="E001")
+
+    response = _get_encrypted(client, "E001")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["employee_no"] == "E001"
+    assert data["is_valid"] is True
+    # Nullable columns: set by DB defaults in production, None under the SQLite
+    # test schema — so assert the fields are carried, not their values.
+    assert "created_at" in data
+    assert "updated_at" in data
+    decrypted = _fernet().decrypt(data["encrypted_apikey"].encode("utf-8")).decode("utf-8")
+    assert decrypted == "abcdEFGHwxyz"
+    # The plaintext key never travels over the wire.
+    assert "abcdEFGHwxyz" not in response.content.decode()
+    assert "apikey_preview" not in data
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_missing_employee_returns_404(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+
+    response = _get_encrypted(client, "E999")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_tampered_token_returns_403(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+    token = _fernet().encrypt(b"E001").decode("utf-8")
+    tampered = ("A" if token[0] != "A" else "B") + token[1:]
+
+    response = client.get(f"/api/apikey?encrypted_employee_no={tampered}")
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_token_signed_with_other_key_returns_403(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+
+    response = _get_encrypted(client, "E001", cipher=Fernet(Fernet.generate_key()))
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_get_apikey_rejects_employee_no_and_encrypted_employee_no_together(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+    token = _fernet().encrypt(b"E001").decode("utf-8")
+
+    response = client.get(f"/api/apikey?employee_no=E001&encrypted_employee_no={token}")
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_without_configured_key_returns_500(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": ""})
+
+    response = _get_encrypted(client, "E001")
+
+    assert response.status_code == 500
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_with_malformed_key_returns_500(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": "not-a-fernet-key"})
+
+    response = _get_encrypted(client, "E001")
+
+    assert response.status_code == 500
+
+
+@pytest.mark.django_db
+def test_get_apikey_encrypted_matches_employee_no_case_insensitively(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+    UserIP.objects.create(ip_id=0, apikey="abcdEFGHwxyz", employee_no="e001")
+
+    response = _get_encrypted(client, "E001")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["employee_no"] == "e001"
+
+
+@pytest.mark.django_db
+def test_get_apikey_plain_mode_unchanged_when_encryption_configured(client, monkeypatch):
+    monkeypatch.setitem(APP_CONFIG, "encryption", {"emp_token_secret_key": FERNET_KEY})
+    UserIP.objects.create(ip_id=0, apikey="abcdEFGHwxyz", employee_no="E001")
+
+    response = _get(client, "E001")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["apikey_preview"] == "abcd…wxyz"
+    assert "encrypted_apikey" not in data

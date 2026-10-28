@@ -210,7 +210,7 @@ curl -i -X POST http://localhost:8001/api/whitelist/update \
 POST /api/apikey
 ```
 
-Requests registration of an employee API key. This endpoint is unauthenticated and must not be exposed to untrusted callers. Keys are never returned in the response.
+Requests registration of an employee API key. This endpoint is unauthenticated and must not be exposed to untrusted callers. Keys are never returned in plaintext; the only response field carrying key material is the Fernet-encrypted `encrypted_apikey` of the encrypted lookup mode below.
 
 ```bash
 curl -i -X POST http://localhost:8001/api/apikey \
@@ -267,7 +267,7 @@ Proxy requests resolve the `Authorization: Bearer <apikey>` header against activ
 GET /api/apikey?employee_no=E001
 ```
 
-Looks up a single employee's active apikey. `employee_no` is required; omitting it returns HTTP 400. The full key value is never returned — only a masked preview of its first and last four characters.
+Looks up a single employee's active apikey. Exactly one of `employee_no` or `encrypted_employee_no` is required; providing neither or both returns HTTP 400. In this plain `employee_no` mode the full key value is never returned — only a masked preview of its first and last four characters.
 
 ```bash
 curl -i 'http://localhost:8001/api/apikey?employee_no=E001'
@@ -288,6 +288,34 @@ curl -i 'http://localhost:8001/api/apikey?employee_no=E001'
 ```
 
 Returns HTTP 404 when the employee has no active apikey.
+
+### Encrypted Lookup (issue #335)
+
+```http
+GET /api/apikey?encrypted_employee_no=<fernet-token>
+```
+
+Untrusted-caller variant of the lookup: `encrypted_employee_no` is a Fernet token of the employee number, produced by the caller with the shared key `encryption.emp_token_secret_key` (see [Configuration](configuration.md)). The router decrypts it locally — Fernet packs AES encryption plus HMAC verification into one primitive, so any tampered ciphertext or token signed with a different key fails the signature check and is rejected with HTTP 403 — and answers with the employee's active apikey **Fernet-encrypted under the same key** as `encrypted_apikey`, readable only by holders of the shared key. The token's embedded timestamp is deliberately not validated (`decrypt` runs without `ttl`), so clock drift between the two sides never rejects a legitimate request. An unset or malformed shared key returns HTTP 500; an unknown employee returns HTTP 404, exactly like the plain mode.
+
+```bash
+curl -i 'http://localhost:8001/api/apikey?encrypted_employee_no=gAAAAA...'
+```
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "employee_no": "E001",
+    "encrypted_apikey": "gAAAAABk…",
+    "is_valid": true,
+    "created_at": "2026-08-05T06:42:47+00:00",
+    "updated_at": "2026-08-05T06:42:47+00:00"
+  }
+}
+```
+
+Fernet encryption is randomized, so `encrypted_apikey` differs on every call even for a stored key.
 
 ## API-Key Invalidation
 

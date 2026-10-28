@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import requests as http_requests
+from cryptography.fernet import Fernet, InvalidToken
 from django.db import IntegrityError
 from django.http import FileResponse, HttpResponse, JsonResponse
 from django.utils import timezone
@@ -32,6 +33,7 @@ from router.repositories.user_ips import UserIPRepository
 from router.repositories.whitelist import WhitelistRepository
 from router.services.admission import AdmissionService
 from router.services.cmdb import CMDBService
+from router.utils.encryption import get_cipher
 
 DOWNLOAD_FILE_PATH = Path("/home/AI_Assistant/AI_Assistant.exe")
 logger = logging.getLogger(__name__)
@@ -168,19 +170,42 @@ def _mask_apikey(apikey: str) -> str:
     return f"{apikey[:4]}…{apikey[-4:]}"
 
 
-def _apikey_info(user_ip) -> dict:
+def _apikey_common_info(user_ip) -> dict:
     return {
         "employee_no": user_ip.employee_no,
-        "apikey_preview": _mask_apikey(user_ip.apikey),
         "is_valid": user_ip.is_valid,
         "created_at": user_ip.created_at.isoformat() if user_ip.created_at else None,
         "updated_at": user_ip.updated_at.isoformat() if user_ip.updated_at else None,
     }
 
 
+def _apikey_info(user_ip) -> dict:
+    return {
+        "employee_no": user_ip.employee_no,
+        "apikey_preview": _mask_apikey(user_ip.apikey),
+        **_apikey_common_info(user_ip),
+    }
+
+
+def _encrypted_apikey_info(user_ip, cipher: Fernet) -> dict:
+    encrypted_apikey = cipher.encrypt(user_ip.apikey.encode("utf-8")).decode("utf-8")
+    return {
+        "employee_no": user_ip.employee_no,
+        "encrypted_apikey": encrypted_apikey,
+        **_apikey_common_info(user_ip),
+    }
+
+
 @require_http_methods(["GET"])
 def get_apikey(request):
     employee_no = request.GET.get("employee_no")
+    encrypted_employee_no = request.GET.get("encrypted_employee_no")
+
+    if encrypted_employee_no and encrypted_employee_no.strip():
+        if employee_no and employee_no.strip():
+            return _bad_request("provide either employee_no or encrypted_employee_no, not both")
+        return _get_encrypted_apikey(encrypted_employee_no.strip())
+
     if not employee_no or not employee_no.strip():
         return _bad_request("employee_no is required")
     employee_no = employee_no.strip()
@@ -190,6 +215,38 @@ def get_apikey(request):
         return JsonResponse({"code": 404, "error": "apikey not found for employee"}, status=404)
 
     return JsonResponse({"code": 200, "message": "success", "data": _apikey_info(user_ip)})
+
+
+def _get_encrypted_apikey(encrypted_employee_no: str):
+    cipher = get_cipher()
+    if cipher is None:
+        logger.error(
+            "encrypted_employee_no lookup requested but encryption.emp_token_secret_key "
+            "is unset or invalid"
+        )
+        return JsonResponse({"code": 500, "error": "encryption key not configured"}, status=500)
+
+    # decrypt() without ttl: the token's embedded timestamp is not validated,
+    # so clock drift between the token issuer and the router never rejects it.
+    try:
+        employee_no = cipher.decrypt(encrypted_employee_no.encode("utf-8")).decode("utf-8").strip()
+    except InvalidToken:
+        return JsonResponse(
+            {"code": 403, "error": "invalid or tampered encrypted_employee_no"}, status=403
+        )
+    except UnicodeDecodeError:
+        return _bad_request("encrypted_employee_no does not decrypt to text")
+
+    if not employee_no:
+        return _bad_request("employee_no is required")
+
+    user_ip = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
+    if user_ip is None:
+        return JsonResponse({"code": 404, "error": "apikey not found for employee"}, status=404)
+
+    return JsonResponse(
+        {"code": 200, "message": "success", "data": _encrypted_apikey_info(user_ip, cipher)}
+    )
 
 
 @require_http_methods(["POST"])

@@ -15,11 +15,12 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_admission_view.py` | Deprecated model, max-token, unknown-model, and unknown-small-request admission failures |
 | `test_api_download.py` | `/api/download/ai_assistant` success and 404 paths |
 | `test_api_stats.py` | Stats endpoints, hour/day/month bucketing, boxplot edge cases, external-provider row exclusion (latency + period counts) vs retention elsewhere |
+| `test_apikey_api.py` | API-key registration, lookup (plain + Fernet-encrypted `encrypted_employee_no`, issue #335), invalidation, whitelist/CMDB interactions, tombstone revival, credential constraints |
 | `test_cancellable_upstream.py` | `CancellableUpstreamRequest.cancel()` shuts down in-flight HTTP via socket close |
 | `test_check_db_schema.py` | `check_db_schema` drift detection and `--fix` on PostgreSQL |
 | `test_circuit_breaker.py` | Failure counting, threshold, open/half_open transitions, cooldown escalation per probe cycle (not per failure, issue #300) |
 | `test_codehub_review.py` | CodeHub review create, invalid-field, and invalid-date validation |
-| `test_config.py` | `PREFIX_CACHE_*` env overrides applied by `load_config` |
+| `test_config.py` | `PREFIX_CACHE_*` and `EMP_TOKEN_SECRET_KEY` env overrides applied by `load_config` |
 | `test_context_overflow.py` | Context-overflow retry to a same-model larger-window server; no model switch; real error surfaces when exhausted |
 | `test_disconnect.py` | `DisconnectWatcher` event/callback semantics |
 | `test_errors.py` | Error payload shape and SSE timeout event format |

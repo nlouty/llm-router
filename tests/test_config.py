@@ -32,3 +32,12 @@ def test_log_path_env_override(monkeypatch, tmp_path):
     config = load_config()
 
     assert config["log_path"] == "/data/router_log"
+
+
+def test_emp_token_secret_key_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_ROUTER_CONFIG", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("EMP_TOKEN_SECRET_KEY", "abc123")
+
+    config = load_config()
+
+    assert config["encryption"]["emp_token_secret_key"] == "abc123"

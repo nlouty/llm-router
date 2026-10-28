@@ -62,6 +62,9 @@ admission:
   allow_when_user_info_missing: true
   user_info_missing_message: "Access denied, you do not have permission"
 
+encryption:
+  emp_token_secret_key: ""
+
 tokenizer:
   enabled: false
 
@@ -109,6 +112,7 @@ export DB_SSLMODE=disable
 export HTTP_PORT=8001
 export VIP_PORT=8008
 export LLM_ROUTER_LOG_PATH=/data/router_log
+export EMP_TOKEN_SECRET_KEY=''
 ```
 
 Other useful environment variables:
@@ -146,6 +150,8 @@ Prefix cache blocks are measured in Python Unicode characters, not LLM tokenizer
 `router.fallback_model` is used by auto routing when the classifier cannot produce a unique target. `router.system_prompt_path` points to the complexity-classifier prompt. `router.auto_concurrent_limit` is the base concurrency limit for exact `model: auto` requests. `router.availability_probe_enabled` (default `true`) lets auto routing send an occasional request to a half-open server of an otherwise-unavailable complexity target, so its circuit can close again through real traffic; see [Auto Routing](auto_routing.md).
 
 `admission.allow_when_user_info_missing` governs requests whose user information is incomplete: no `user_ips` row for the requesting IP (unknown to CMDB), a row without `employee_no`, or a department CMDB could not resolve (`department_id` NULL or unresolvable, including the `0` used by the whitelist apikey bypass). When `true` (default) such requests pass; when `false` they are denied with HTTP 403 unless a whitelist entry rescues them — matched by `employee_no`, or by `user_name` against the row's `user_charge`, and only while the entry is allowed and before its `expire_time`. `admission.user_info_missing_message` customizes the error message carried by that 403 (default `Access denied, you do not have permission`); a department-permission denial keeps the default message. Identities with complete information always follow the department permission chain regardless of this toggle.
+
+`encryption.emp_token_secret_key` is the shared Fernet key for the encrypted apikey lookup (issue #335): `GET /api/apikey?encrypted_employee_no=...` decrypts the caller's Fernet token of the employee number and returns the active apikey Fernet-encrypted under the same key, so neither the employee number nor the key ever crosses the network in plaintext. Tokens are decrypted without `ttl` — the embedded timestamp is never validated, so clock drift between the token issuer and the router cannot reject a request — while the built-in HMAC still rejects any tampered ciphertext or token signed with a different key (HTTP 403). An empty value (default) leaves the encrypted mode unusable: the endpoint responds HTTP 500 until a valid key is configured. Generate one with `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key())'`; in production prefer the `EMP_TOKEN_SECRET_KEY` environment variable over storing the key in `config.yaml`.
 
 `cmdb.enabled` turns on the CMDB adapter integration. When enabled, the **first request from an unseen IP runs the CMDB user lookup synchronously** before identity resolution: the freshly inserted `user_ips` row is immediately available, so that first request is already verified against the department chain (a denied department is refused even while `allow_when_user_info_missing` is `true`). The lookup latency is paid only by that first request; if the CMDB call fails the request degrades to the incomplete-identity path governed by the admission toggle instead of erroring. `cmdb.dummy` marks the public dummy adapter, and `cmdb.refresh_interval_between_ips_seconds` paces the full `refresh_user_info` crawl (which still runs in a background thread via `POST /api/refresh_user_info`).
 
