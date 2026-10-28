@@ -22,7 +22,7 @@ class WhitelistRepository:
     def is_allowed(cls, employee_no: str | None) -> bool:
         if not employee_no:
             return False
-        return Whitelist.objects.filter(cls._active_q(), employee_no=employee_no).exists()
+        return Whitelist.objects.filter(cls._active_q(), employee_no__iexact=employee_no).exists()
 
     @classmethod
     def is_allowed_user_name(cls, user_name: str | None) -> bool:
@@ -34,7 +34,7 @@ class WhitelistRepository:
     def get_active_by_employee_no(cls, employee_no: str | None) -> Whitelist | None:
         if not employee_no:
             return None
-        return Whitelist.objects.filter(cls._active_q(), employee_no=employee_no).first()
+        return Whitelist.objects.filter(cls._active_q(), employee_no__iexact=employee_no).first()
 
     @staticmethod
     def upsert(

@@ -75,7 +75,7 @@ def register_apikey(request):
     # key's ownership.
     existing = UserIPRepository.get_any_by_apikey(apikey)
     if existing is not None:
-        if existing.employee_no != employee_no:
+        if existing.employee_no.lower() != employee_no.lower():
             return JsonResponse(
                 {"code": 409, "error": "apikey is already registered to another employee"}, status=409
             )
