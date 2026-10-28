@@ -226,6 +226,13 @@ class RequestRepository:
         record.save(update_fields=["model_choosing_latency"])
 
     @staticmethod
+    def record_ttft(record: RequestRecord, ttft_ms: int) -> None:
+        # Persisted at the first-token moment so the value survives any later
+        # failure (finish() never overwrites a non-NULL ttft).
+        record.ttft = max(0, int(ttft_ms))
+        record.save(update_fields=["ttft"])
+
+    @staticmethod
     def cleanup_stale(
         model_id: int | None = None,
         threshold_minutes: int = 66,

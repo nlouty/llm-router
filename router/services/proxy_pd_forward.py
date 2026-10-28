@@ -402,7 +402,15 @@ class PDForwardService:
         record.input_token_cnt = prompt_tokens
         record.final_prefix_cache = cached_tokens
         record.prefill_latency = prefill_ms
-        record.save(update_fields=["task_status", "input_token_cnt", "final_prefix_cache", "prefill_latency"])
+        update_fields = ["task_status", "input_token_cnt", "final_prefix_cache", "prefill_latency"]
+        if not is_stream:
+            # For non-stream requests the probe's completion is the first-token
+            # moment, so ttft is final here too and survives a later decode
+            # failure (issue #330). Streams re-anchor ttft at the first decoded
+            # chunk, so they keep NULL until a chunk is actually delivered.
+            record.ttft = prefill_ttft
+            update_fields.append("ttft")
+        record.save(update_fields=update_fields)
         self._release_prefiller(prefiller)
 
         if is_stream:
@@ -782,6 +790,9 @@ class PDForwardService:
                             if chunk:
                                 if ttft is None:
                                     ttft = int((timezone.now() - record.send_time).total_seconds() * 1000)
+                                    # Persist immediately: ttft must survive any
+                                    # later failure (timeout, disconnect, recompute).
+                                    RequestRepository.record_ttft(record, ttft)
                                 chunks.append(chunk)
                                 generated, completion_tokens, recomputed = self._scan_chunk(
                                     chunk, generated, completion_tokens
