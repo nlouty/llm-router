@@ -30,10 +30,12 @@ class UserIPRepository:
 
         Defines an employee's concurrency footprint (issue #301): requests on
         any of his rows and from any of his bound IPs share one bucket.
+        ``employee_no`` is matched case-insensitively (issue #322): rows may
+        be stored in a different case than the identity reports.
         """
         return list(
             UserIP.objects.filter(
-                employee_no=employee_no,
+                employee_no__iexact=employee_no,
                 is_valid=True,
                 deleted_at__isnull=True,
             ).order_by("id")
@@ -52,7 +54,7 @@ class UserIPRepository:
     @staticmethod
     def get_active_apikey_by_employee_no(employee_no: str) -> UserIP | None:
         return UserIP.objects.filter(
-            employee_no=employee_no,
+            employee_no__iexact=employee_no,
             is_valid=True,
             deleted_at__isnull=True,
         ).filter(~Q(apikey="")).first()

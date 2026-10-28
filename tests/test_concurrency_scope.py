@@ -103,6 +103,29 @@ def test_employee_apikey_and_bound_ip_share_one_bucket():
 
 
 @pytest.mark.django_db
+def test_employee_rows_with_mixed_case_employee_no_share_one_bucket():
+    # Stored case may drift between rows (issue #322): "e1" on the key row,
+    # "E1" on the IP-backed row. They are still one employee's footprint.
+    nat = _ip("10.2.2.2")  # unbound NAT IP the apikey request arrives from
+    bound = _ip("10.2.2.3")  # the employee's bound office IP
+    model = Model.objects.create(model_name="model-a", concurrent_limit=3)
+    key_row = UserIP.objects.create(apikey="sk-e1", employee_no="e1", ip_id=0, is_valid=True)
+    UserIP.objects.create(ip_id=bound.id, employee_no="E1", is_valid=True)
+
+    _seed(model.id, ip_id=nat.id, user_ip_id=key_row.id)
+    _seed(model.id, ip_id=nat.id, user_ip_id=key_row.id)
+    _seed(model.id, ip_id=bound.id)
+
+    result = AdmissionService().check_concurrency(
+        nat, model, identity=_identity(nat, user_ip_id=key_row.id, employee_no="e1", is_apikey=True)
+    )
+
+    assert result.allowed is False
+    assert result.current == 3
+    assert result.limit == 3
+
+
+@pytest.mark.django_db
 def test_request_with_apikey_from_bound_ip_counts_once():
     nat = _ip("10.2.2.2")
     bound = _ip("10.2.2.3")

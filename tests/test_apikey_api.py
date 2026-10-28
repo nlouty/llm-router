@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from router.models import Department, UserIP, Whitelist
 from router.repositories.user_ips import UserIPRepository
+from router.repositories.whitelist import WhitelistRepository
 from router.services.cmdb import CMDBService
 
 
@@ -447,3 +448,78 @@ def test_deactivated_employee_slot_can_be_re_registered(client, monkeypatch):
 
     assert response.status_code == 200
     assert UserIP.objects.get(apikey="key-2", employee_no="E001").is_valid is True
+
+
+# --- case-insensitive employee_no (issue #322) ---
+# employee_no may contain letters, and stored rows (whitelist, user_ips) may
+# use a different case than the API receives.
+
+
+@pytest.mark.django_db
+def test_register_apikey_matches_whitelist_case_insensitively(client, monkeypatch):
+    def fail(self, apikey, employee_no):
+        pytest.fail("CMDB must not be called for a whitelisted employee")
+
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", fail)
+    Whitelist.objects.create(
+        employee_no="e001", user_name="Alice", is_allowed=1, update_time=timezone.now()
+    )
+
+    response = _post(client, employee_no="E001")
+
+    assert response.status_code == 200
+    # The row is stored with the case the API sent, not the whitelist's.
+    row = UserIP.objects.get(apikey="key-1")
+    assert row.employee_no == "E001"
+    assert row.user_name == "Alice"
+    assert WhitelistRepository.is_allowed("E001") is True
+
+
+@pytest.mark.django_db
+def test_register_apikey_rejects_duplicate_employee_case_insensitively(client):
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="e001")
+
+    response = _post(client, apikey="key-2", employee_no="E001")
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "employee already has an active apikey"
+
+
+@pytest.mark.django_db
+def test_register_apikey_revives_own_key_with_mismatched_case(client, monkeypatch):
+    def fail(self, apikey, employee_no):
+        pytest.fail("CMDB must not be called when the key row already exists")
+
+    monkeypatch.setattr(CMDBService, "fetch_and_save_apikey", fail)
+    row = UserIP.objects.create(
+        ip_id=0, apikey="key-1", employee_no="e001", department_id=_allowed_department().id
+    )
+    _invalidate(client, "e001")
+
+    response = _post(client, apikey="key-1", employee_no="E001")
+
+    assert response.status_code == 200
+    revived = UserIP.objects.get(apikey="key-1")
+    assert revived.id == row.id
+    assert revived.employee_no == "e001"
+    assert revived.is_valid is True
+
+
+@pytest.mark.django_db
+def test_get_apikey_matches_employee_no_case_insensitively(client):
+    UserIP.objects.create(ip_id=0, apikey="abcdEFGHwxyz", employee_no="e001")
+
+    response = _get(client, "E001")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["employee_no"] == "e001"
+
+
+@pytest.mark.django_db
+def test_invalidate_apikey_matches_employee_no_case_insensitively(client):
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="e001")
+
+    response = _invalidate(client, "E001")
+
+    assert response.status_code == 200
+    assert UserIPRepository.get_active_apikey_by_employee_no("E001") is None
