@@ -58,7 +58,7 @@ def _choose(chooser, candidates, body: bytes):
 class TestCachedClass:
     def test_holders_preferred_local(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=1)
         _seed(chooser, n1, _cached_request_body())
@@ -68,7 +68,7 @@ class TestCachedClass:
 
     def test_context_records_cluster_ratio_on_switch(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={}, new_prefill_targets={"http://n1"})
+        chooser = _chooser_with_workload({}, decoder_avgs={}, new_prefill_targets={"http://n1"})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
         _seed(chooser, n1, _cached_request_body())
@@ -82,7 +82,7 @@ class TestCachedClass:
 
     def test_busy_holder_stays_when_cluster_has_no_p(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={}, new_prefill_targets={"http://n1"})
+        chooser = _chooser_with_workload({}, decoder_avgs={}, new_prefill_targets={"http://n1"})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1)
         _seed(chooser, n1, _cached_request_body())
 
@@ -91,7 +91,7 @@ class TestCachedClass:
 
     def test_attempted_p_falls_back_to_holder(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={}, new_prefill_targets={"http://n1"})
+        chooser = _chooser_with_workload({}, decoder_avgs={}, new_prefill_targets={"http://n1"})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
         _seed(chooser, n1, _cached_request_body())
@@ -106,7 +106,7 @@ class TestCachedClass:
         # Pre-#276 behavior escaped the overloaded holder to GLOBAL
         # least-loaded (the idle mixed server); the split keeps cached traffic
         # on a same-cluster p-prefiller instead.
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=10)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
         m1 = make_server(3, "http://m1", role="mixed", workload=0)
@@ -119,7 +119,7 @@ class TestCachedClass:
         _, storage = mock_redis
         # Maintainer decision #3: bigger weight on p-prefillers; if still
         # overloaded, use n-prefillers.
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=10)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=9)
         n2 = make_server(3, "http://n2", role="prefiller", group_id="g1", workload=4)
@@ -133,7 +133,7 @@ class TestCachedClass:
 class TestPartialClass:
     def test_partial_targets_n_prefiller_in_argmax_cluster(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=3)
         sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0)
         p1 = make_server(3, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
@@ -146,7 +146,7 @@ class TestPartialClass:
 
     def test_cluster_ratio_beats_lower_standalone(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
         m1 = make_server(2, "http://m1", role="mixed", workload=0)
         _seed(chooser, n1, _partial_request_body())
@@ -158,7 +158,7 @@ class TestPartialClass:
 
 class TestColdClass:
     def test_cold_never_uses_idle_p_prefiller(self, mock_redis):
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
 
@@ -166,7 +166,7 @@ class TestColdClass:
         assert selected.id == n1.id  # strict: queue on busy n, keep p reserved
 
     def test_cold_uses_least_loaded_mixed(self, mock_redis):
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
         m1 = make_server(2, "http://m1", role="mixed", workload=0)
 
@@ -174,7 +174,7 @@ class TestColdClass:
         assert selected.id == m1.id
 
     def test_all_p_pool_degrades_to_least_loaded(self, mock_redis):
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         p1 = make_server(1, "http://p1", role="prefix-prefiller", group_id="g1", workload=3)
         p2 = make_server(2, "http://p2", role="prefix-prefiller", group_id="g1", workload=0)
 
@@ -192,7 +192,7 @@ class TestOverloadEscapeCoversClusterPaths:
         # pd-1 prefiller at workload 5 (weight 2) vs mixed at 2 (weight 4):
         # 5 >= 2 and 5 > 2*2 -> escape the partial affinity.
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 0.0})
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 0.0})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5, weight=2)
         m1 = make_server(2, "http://m1", role="mixed", workload=2, weight=4)
         _seed(chooser, n1, _partial_request_body())
@@ -206,7 +206,7 @@ class TestOverloadEscapeCoversClusterPaths:
         # Control: below the weight threshold the RDMA partial-KV pull still
         # wins over the lighter mixed server.
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={"g1": 0.0})
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 0.0})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1, weight=2)
         m1 = make_server(2, "http://m1", role="mixed", workload=2, weight=4)
         _seed(chooser, n1, _partial_request_body())
@@ -219,7 +219,7 @@ class TestOverloadEscapeCoversClusterPaths:
         # p-prefiller, holder at 2.5x the pool minimum: escape globally.
         _, storage = mock_redis
         chooser = _chooser_with_workload(
-            {}, decoder_mins={"g1": 0.0}, new_prefill_targets={"http://n1"}
+            {}, decoder_avgs={"g1": 0.0}, new_prefill_targets={"http://n1"}
         )
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5, weight=2)
         m1 = make_server(2, "http://m1", role="mixed", workload=2, weight=4)
@@ -233,7 +233,7 @@ class TestOverloadEscapeCoversClusterPaths:
         # holder is still cheaper than a full recompute elsewhere.
         _, storage = mock_redis
         chooser = _chooser_with_workload(
-            {}, decoder_mins={"g1": 0.0}, new_prefill_targets={"http://n1"}
+            {}, decoder_avgs={"g1": 0.0}, new_prefill_targets={"http://n1"}
         )
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1, weight=2)
         m1 = make_server(2, "http://m1", role="mixed", workload=2, weight=4)
@@ -246,7 +246,7 @@ class TestOverloadEscapeCoversClusterPaths:
 class TestScopes:
     def test_argmax_cluster_wins(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n_g1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
         n_g2 = make_server(2, "http://n2", role="prefiller", group_id="g2", workload=0)
         _seed(chooser, n_g2, _cached_request_body())
@@ -259,7 +259,7 @@ class TestScopes:
     def test_better_standalone_beats_cluster(self):
         # Unit-level scope comparison (no Redis): a mixed server's own ratio
         # competes with cluster ratios; the strictly higher scope wins.
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         servers = [
             make_server(1, "http://n1", role="prefiller", group_id="g1"),
             make_server(2, "http://m1", role="mixed"),
@@ -279,7 +279,7 @@ class TestScopes:
     def test_tied_clusters_win_randomly(self, monkeypatch):
         # Issue #318: two same-scale clusters with the same best ratio must
         # share the win instead of the first-inserted cluster always winning.
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         servers = [
             make_server(1, "http://n1", role="prefiller", group_id="g1"),
             make_server(2, "http://n2", role="prefiller", group_id="g2"),
@@ -303,7 +303,7 @@ class TestScopes:
 
     def test_mixed_group_id_is_not_a_cluster_member(self):
         # A mixed server with an accidentally set group_id is standalone.
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         mixed = make_server(1, "http://m1", role="mixed", group_id="g1")
         assert not chooser._is_cluster_prefiller(mixed)
         match = _PrefixMatch(
@@ -313,7 +313,7 @@ class TestScopes:
         assert chooser._winning_scope([mixed], match) is None
 
     def test_blank_group_prefiller_is_standalone(self):
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         blank = make_server(1, "http://p1", role="prefiller", group_id=None)
         assert not chooser._is_cluster_prefiller(blank)
 
@@ -321,7 +321,7 @@ class TestScopes:
 class TestStandalonePoolUnchanged:
     def test_primary_hit_on_mixed_unchanged(self, mock_redis):
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         m1 = make_server(1, "http://m1", role="mixed", workload=0)
         _seed(chooser, m1, _cached_request_body())
 
@@ -332,7 +332,7 @@ class TestStandalonePoolUnchanged:
         # Pre-#276 behavior for standalone scopes: #247 escape to global
         # least-loaded.
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         m1 = make_server(1, "http://m1", role="mixed", workload=10)
         m2 = make_server(2, "http://m2", role="mixed", workload=0)
         _seed(chooser, m1, _cached_request_body())
@@ -351,7 +351,7 @@ class TestFreshPrefillNeverOnP:
         # Non-UTF-8 body -> no extractable prefix text: choose() cannot
         # classify the request and used to fall back to plain least-loaded,
         # which happily picked the idle p-prefiller.
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
 
@@ -363,7 +363,7 @@ class TestFreshPrefillNeverOnP:
         # global least-loaded, straight onto an idle p that holds none of the
         # KV. It must queue on the busy live prefiller instead.
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         m1 = make_server(1, "http://m1", role="mixed", workload=10)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
         _seed(chooser, m1, _cached_request_body())
@@ -376,7 +376,7 @@ class TestFreshPrefillNeverOnP:
         # overloaded); the idle p of g2 used to win the terminal global pick
         # and take a full new prefill.
         _, storage = mock_redis
-        chooser = _chooser_with_workload({}, decoder_mins={})
+        chooser = _chooser_with_workload({}, decoder_avgs={})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=10)
         p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=9)
         n2 = make_server(3, "http://n2", role="prefiller", group_id="g1", workload=8)

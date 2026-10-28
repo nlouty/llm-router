@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from router.config import APP_CONFIG
 from router.models import Server, is_prefiller_role
+from router.route_algorithm.least_connection import effective_weight
 from router.services.request_context import get_request_id
 from router.services.request_logger import append_request_log
 from router.utils.target import parse_server_target, server_target
@@ -313,26 +314,31 @@ class ServerRepository:
         return result
 
     @staticmethod
-    def cluster_decoder_min_load(servers: list[Server]) -> dict[str, float]:
-        """Per-cluster minimum decoder workload.
+    def cluster_decoder_avg_load(servers: list[Server]) -> dict[str, float]:
+        """Per-cluster average decoder load.
 
-        The decoder side of a PD cluster's load: the fewest in-flight decode
-        requests among its decoders. The chooser uses this to floor each
-        prefiller's effective load so a decoder-bound cluster is never mistaken
-        for an idle prefiller. Mixed servers are ignored here.
+        The decoder side of a PD cluster's load: the mean in-flight decode
+        pressure across its decoders, each measured as ``workload / weight``
+        (issue #331). Decoders are chosen by ``active_tokens``, not workload,
+        so the least-workload decoder says nothing about who serves the next
+        request — the average reflects the pressure the next request adds.
+        The chooser uses this to floor each prefiller's effective load so a
+        decoder-bound cluster is never mistaken for an idle prefiller. Mixed
+        servers are ignored here.
 
-        Returns a mapping of ``group_id`` -> min decoder workload. Clusters with
-        no decoder are omitted.
+        Returns a mapping of ``group_id`` -> average decoder load. Clusters
+        with no decoder are omitted.
         """
-        decoders: dict[str, list[int]] = {}
+        decoders: dict[str, list[float]] = {}
         for server in servers:
             role = getattr(server, "role", "mixed") or "mixed"
             if role != "decoder" or not server.group_id:
                 continue
-            decoders.setdefault(server.group_id, []).append(int(getattr(server, "workload", 0) or 0))
+            load = int(getattr(server, "workload", 0) or 0) / effective_weight(server)
+            decoders.setdefault(server.group_id, []).append(load)
         return {
-            group_id: float(min(workloads))
-            for group_id, workloads in decoders.items()
+            group_id: sum(loads) / len(loads)
+            for group_id, loads in decoders.items()
         }
 
     @staticmethod
@@ -346,7 +352,7 @@ class ServerRepository:
 
     @staticmethod
     def pick_least_tokens_decoder(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
-        """Pick the least-active_tokens routable decoder in a cluster."""
+        """Pick the routable decoder with the least weight-normalized active_tokens in a cluster."""
         attempted_ids = attempted_ids or set()
         servers = ServerRepository.list_all_online()
         decoders = [
@@ -356,7 +362,8 @@ class ServerRepository:
             and s.id not in attempted_ids
         ]
         chosen = ServerRepository._pick_random_min(
-            decoders, lambda s: float(getattr(s, "active_tokens", 0.0) or 0.0)
+            decoders,
+            lambda s: float(getattr(s, "active_tokens", 0.0) or 0.0) / effective_weight(s),
         )
         request_id = get_request_id()
         if request_id:
@@ -373,7 +380,7 @@ class ServerRepository:
 
     @staticmethod
     def pick_least_workload_prefiller(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
-        """Pick the least-workload routable prefiller (either style) in a cluster."""
+        """Pick the routable prefiller (either style) with the least weight-normalized workload in a cluster."""
         attempted_ids = attempted_ids or set()
         servers = ServerRepository.list_all_online()
         prefillers = [
@@ -383,7 +390,7 @@ class ServerRepository:
             and s.id not in attempted_ids
         ]
         return ServerRepository._pick_random_min(
-            prefillers, lambda s: int(getattr(s, "workload", 0) or 0)
+            prefillers, lambda s: int(getattr(s, "workload", 0) or 0) / effective_weight(s)
         )
 
     @staticmethod
