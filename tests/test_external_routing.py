@@ -574,6 +574,38 @@ class TestStreaming:
         # The provider's response model name must not create a models row.
         assert not Model.objects.filter(model_name="GLM-5.2").exists()
 
+    def test_stream_ttft_survives_mid_stream_failure(self, monkeypatch):
+        seed_identity()
+        seed_route()
+        seed_mapping()
+        seed_internal_model("glm-5.2")
+
+        def gen(chunk_size=8192):
+            yield b'data: {"id":"c1","choices":[{"delta":{"content":"he"}}]}\n\n'
+            raise requests.exceptions.ReadTimeout("slow")
+
+        upstream = FakeUpstream(chunks=None)
+        upstream.iter_content = gen
+
+        monkeypatch.setattr(
+            "router.services.external_proxy.requests.request",
+            lambda method, url, **kwargs: upstream,
+        )
+
+        response = Client().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "glm-5.2", "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        b"".join(response.streaming_content)
+
+        record = RequestRecord.objects.last()
+        assert record.task_status == "failed"
+        # A token was delivered before the stream died, so ttft is recorded
+        # despite the failure (issue #330).
+        assert record.ttft is not None
+
 
 @pytest.mark.django_db
 class TestAccounting:

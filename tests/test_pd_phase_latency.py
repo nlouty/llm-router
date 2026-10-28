@@ -190,8 +190,9 @@ def test_pd_decode_failure_keeps_prefill_latency(monkeypatch):
     assert record.prefill_latency is not None
     # decode_latency is persisted at decode-phase end even on failure.
     assert record.decode_latency is not None
-    # ttft stays a success-path metric.
-    assert record.ttft is None
+    # ttft is equally final at prefill completion (the probe's token is the
+    # first token), so it survives the decode failure (issue #330).
+    assert record.ttft is not None
 
 
 @pytest.mark.django_db

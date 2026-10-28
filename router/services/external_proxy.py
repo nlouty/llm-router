@@ -256,6 +256,12 @@ class ExternalProxyService:
                     if chunk:
                         if first_chunk_at is None:
                             first_chunk_at = timezone.now()
+                            # Persist immediately: ttft must survive any later
+                            # failure (timeout, disconnect, upstream error).
+                            RequestRepository.record_ttft(
+                                record,
+                                int((first_chunk_at - record.send_time).total_seconds() * 1000),
+                            )
                         chunks.append(chunk)
                         yield chunk
                 # Circuit success only on full completion, mirroring

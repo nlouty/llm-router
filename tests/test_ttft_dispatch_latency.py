@@ -7,6 +7,10 @@ request receipt to the first-token moment: the first non-empty chunk for
 streaming requests, prefill completion for non-streaming PD requests (the
 probe generates exactly one token). `ttft - model_choosing_latency` is the
 LLM-side time to first token as observed by the router.
+
+`ttft` is persisted at the first-token moment itself, so it survives any
+later failure — mid-stream timeout, client disconnect, upstream or decode
+error — and stays NULL when no token was ever delivered (issue #330).
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from django.test import Client
 
 from router.models import Model, RequestRecord, Server
@@ -84,6 +89,15 @@ def _decode_ok_response():
         b'"usage":{"prompt_tokens":100,"completion_tokens":2,'
         b'"prompt_tokens_details":{"cached_tokens":0}}}'
     )
+    return resp
+
+
+def _decode_error_response():
+    resp = MagicMock()
+    resp.status_code = 500
+    resp.reason = "Internal Server Error"
+    resp.headers = {"content-type": "application/json"}
+    resp.content = b'{"error":{"message":"boom"}}'
     return resp
 
 
@@ -228,3 +242,151 @@ def test_pd_stream_ttft_includes_prefill_phase(monkeypatch):
     assert record.ttft is not None
     assert record.ttft >= 50
     assert record.model_choosing_latency <= record.ttft
+
+
+@pytest.mark.django_db
+def test_single_node_stream_ttft_survives_mid_stream_failure(monkeypatch):
+    model = _seed_single_node(monkeypatch)
+
+    def fake_perform(self, django_request, server, upstream_url, headers, body, is_stream, upstream_client):
+        upstream = MagicMock()
+        upstream.status_code = 200
+        upstream.reason = "OK"
+        upstream.headers = {}
+
+        def gen():
+            yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+            raise requests.exceptions.ReadTimeout("slow")
+
+        upstream.iter_content = lambda chunk_size=8192: gen()
+        return upstream
+
+    monkeypatch.setattr("router.services.proxy.ProxyService._perform_request", fake_perform)
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "ttft-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+    b"".join(response.streaming_content)
+
+    record = RequestRecord.objects.get(model_id=model.id)
+    assert record.task_status == "failed"
+    # The first token was delivered before the stream died, so ttft must be
+    # recorded even though the request failed (issue #330).
+    assert record.ttft is not None
+    assert record.model_choosing_latency <= record.ttft
+
+
+@pytest.mark.django_db
+def test_single_node_stream_failure_before_first_chunk_keeps_ttft_null(monkeypatch):
+    model = _seed_single_node(monkeypatch)
+
+    def fake_perform(self, django_request, server, upstream_url, headers, body, is_stream, upstream_client):
+        upstream = MagicMock()
+        upstream.status_code = 200
+        upstream.reason = "OK"
+        upstream.headers = {}
+
+        def gen():
+            raise requests.exceptions.ReadTimeout("slow")
+            yield  # noqa: makes this a generator
+
+        upstream.iter_content = lambda chunk_size=8192: gen()
+        return upstream
+
+    monkeypatch.setattr("router.services.proxy.ProxyService._perform_request", fake_perform)
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "ttft-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+    b"".join(response.streaming_content)
+
+    record = RequestRecord.objects.get(model_id=model.id)
+    assert record.task_status == "failed"
+    # No token was ever delivered, so ttft stays NULL.
+    assert record.ttft is None
+
+
+@pytest.mark.django_db
+def test_pd_stream_ttft_survives_mid_stream_failure(monkeypatch):
+    model = _seed_pd_cluster(monkeypatch)
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"hi"}}],'
+        b'"usage":{"prompt_tokens":100,"completion_tokens":1,'
+        b'"prompt_tokens_details":{"cached_tokens":0}}}\n\n'
+    )
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        assert "ttft-p.example" in url
+        time.sleep(0.05)  # prefill runs before any decode chunk exists
+        return _prefill_ok_response()
+
+    def fake_stream_request(method, url, headers=None, data=None, stream=True, timeout=None):
+        assert "ttft-d.example" in url
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.reason = "OK"
+
+        def gen(chunk_size=8192):
+            yield sse
+            raise requests.exceptions.ReadTimeout("slow")
+
+        resp.iter_content = gen
+        resp.close = lambda: None
+        return resp
+
+    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", fake_stream_request)
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({
+            "model": "ttft-pd-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }),
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+    b"".join(response.streaming_content)
+
+    record = RequestRecord.objects.get(model_id=model.id)
+    assert record.task_status == "failed"
+    # The first decode chunk was delivered (after the 50ms prefill), then the
+    # stream died mid-generation: the measured ttft survives (issue #330).
+    assert record.ttft is not None
+    assert record.ttft >= 50
+
+
+@pytest.mark.django_db
+def test_pd_non_stream_ttft_survives_decode_failure(monkeypatch):
+    model = _seed_pd_cluster(monkeypatch)
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        if "ttft-p.example" in url:
+            time.sleep(0.05)  # prefill work before the probe response
+            return _prefill_ok_response()
+        assert "ttft-d.example" in url
+        return _decode_error_response()
+
+    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+
+    response = Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "ttft-pd-model", "messages": [{"role": "user", "content": "hi"}]}),
+        content_type="application/json",
+    )
+    assert response.status_code == 500
+
+    record = RequestRecord.objects.get(model_id=model.id)
+    assert record.task_status == "failed"
+    # ttft is persisted at prefill completion (the first-token moment for a
+    # non-stream request), so the decode failure keeps it and the anchor stays
+    # the probe's completion rather than the failure (issue #330).
+    assert record.ttft is not None
+    assert record.ttft >= 50
