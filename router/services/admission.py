@@ -86,6 +86,19 @@ class AdmissionService:
             return True
         return bool(user_ip.user_charge) and WhitelistRepository.is_allowed_user_name(user_ip.user_charge)
 
+    @classmethod
+    def verify_whitelist_apikey(cls, identity) -> bool:
+        """Request-time gate for whitelist-bypass key rows (issue #337).
+
+        A ``department_id = 0`` key row was inserted by the whitelist bypass
+        at registration (issue #281): an active whitelist entry is its only
+        authorization basis, so every request re-checks that an entry still
+        rescues — by ``employee_no``, or by ``user_charge`` against
+        ``whitelist.user_name``, and only while the entry is allowed and
+        before its ``expire_time``.
+        """
+        return cls._whitelist_allows(identity)
+
     @staticmethod
     def _user_info_incomplete(identity) -> bool:
         if identity.user_ip_id == 0:

@@ -17,6 +17,7 @@ from router.config import APP_CONFIG
 from router.repositories.ips import IPRepository
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
+from router.repositories.user_ips import UserIPRepository
 from router.repositories.whitelist import UNSET, WhitelistRepository
 from router.services.admission import AdmissionService
 from router.services.cmdb import CMDBService
@@ -99,6 +100,23 @@ def proxy(request, path: str):
             return error_response(403, message, "invalid_apikey")
 
         admission = AdmissionService()
+
+        # Issue #337: department_id = 0 marks a key row inserted by the
+        # whitelist bypass at registration (issue #281) — an active whitelist
+        # entry was its only authorization basis, and the key must not outlive
+        # the entry. Re-check on every request; a stale key is revoked (row
+        # kept as a tombstone) and refused like any other invalid key.
+        if identity.is_apikey and identity.department_id == 0:
+            if not admission.verify_whitelist_apikey(identity):
+                UserIPRepository.deactivate_by_id(identity.user_ip_id)
+                logger.warning(
+                    "revoked whitelist-bypass apikey (user_ip_id=%s, employee_no=%s): no active whitelist entry",
+                    identity.user_ip_id,
+                    identity.employee_no,
+                )
+                message = "API key is invalid or revoked"
+                RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
+                return error_response(403, message, "invalid_apikey")
 
         # A valid apikey authorizes the request on its own. The client IP is
         # recorded and enriched via CMDB above, but must not drive any admission

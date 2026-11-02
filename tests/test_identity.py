@@ -1,11 +1,13 @@
 import json
+from datetime import timedelta
 from unittest.mock import MagicMock
 
 import pytest
 from django.test import Client
+from django.utils import timezone
 
 from router.config import APP_CONFIG
-from router.models import Department, Ips, Model, RequestRecord, Server, UserIP
+from router.models import Department, Ips, Model, RequestRecord, Server, UserIP, Whitelist
 from router.services.admission import AdmissionResult
 from router.services.cmdb import CMDBService
 from router.services.identity import IdentityService, RequestIdentity
@@ -470,3 +472,113 @@ def test_first_time_ip_cmdb_failure_degrades_to_incomplete_identity(monkeypatch)
     assert response.status_code == 200
     record = RequestRecord.objects.exclude(ip_id=0).get()
     assert record.user_ip_id == 0
+
+
+# --- issue #337: a whitelist-bypass key row must not outlive its whitelist entry ---
+
+
+def _whitelist_bypass_key(employee_no="E001"):
+    # department_id = 0 is what POST /api/apikey inserts for a whitelisted
+    # employee (issue #281 bypass): the whitelist entry is the only
+    # authorization basis.
+    return UserIP.objects.create(
+        ip_id=0, apikey="key-1", employee_no=employee_no, department_id=0
+    )
+
+
+def _chat_with_key(remote_addr):
+    return Client().post(
+        "/v1/chat/completions",
+        data=json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        content_type="application/json",
+        HTTP_AUTHORIZATION="Bearer key-1",
+        REMOTE_ADDR=remote_addr,
+    )
+
+
+@pytest.mark.django_db
+def test_whitelist_bypass_apikey_allowed_while_whitelisted(monkeypatch):
+    Whitelist.objects.create(employee_no="E001", is_allowed=1, update_time=timezone.now())
+    _whitelist_bypass_key()
+    Model.objects.create(model_name="m", max_tokens=65536)
+    Server.objects.create(model_id=Model.objects.get(model_name="m").id, base_url="http://s.example", is_online=True)
+    _upstream_ok(monkeypatch)
+
+    response = _chat_with_key("10.0.0.50")
+
+    assert response.status_code == 200
+    assert UserIP.objects.get(apikey="key-1").is_valid is True
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("stale", ["removed", "disallowed", "expired"])
+def test_stale_whitelist_bypass_apikey_is_revoked_and_refused(monkeypatch, stale):
+    # Issue #337: once the whitelist entry stops rescuing (deleted, flipped
+    # to is_allowed = 0, or past expire_time), the bypass key is refused with
+    # the invalid_apikey error and its row deactivated as a tombstone.
+    def fail(self, method, url, **kwargs):
+        pytest.fail("upstream must not be reached for a stale whitelist apikey")
+
+    monkeypatch.setattr(
+        "router.services.cancellable_upstream.CancellableUpstreamRequest.request",
+        fail,
+    )
+    if stale == "disallowed":
+        Whitelist.objects.create(employee_no="E001", is_allowed=0, update_time=timezone.now())
+    elif stale == "expired":
+        Whitelist.objects.create(
+            employee_no="E001",
+            is_allowed=1,
+            expire_time=timezone.now() - timedelta(hours=1),
+            update_time=timezone.now(),
+        )
+    _whitelist_bypass_key()
+
+    first = _chat_with_key("10.0.0.51")
+    second = _chat_with_key("10.0.0.51")
+
+    assert first.status_code == 403
+    assert first.json()["error"]["type"] == "invalid_apikey"
+    assert first.json()["error"]["message"] == "API key is invalid or revoked"
+    # The first denial revoked the row; the second hits the regular
+    # invalid_apikey path for a stored is_valid = false key.
+    assert second.status_code == 403
+    assert second.json()["error"]["type"] == "invalid_apikey"
+    row = UserIP.objects.get(apikey="key-1")
+    assert row.is_valid is False
+    record = RequestRecord.objects.exclude(ip_id=0).first()
+    assert record.user_ip_id == row.id
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("strict", [True, False])
+def test_whitelist_bypass_apikey_recheck_ignores_missing_info_toggle(monkeypatch, strict):
+    # The re-check is the key's registration gate, not the IP-identity
+    # incomplete-info path: allow_when_user_info_missing (either value — the
+    # default True is exactly how the stale access went unnoticed) must not
+    # resurrect a key whose whitelist entry is gone.
+    if strict:
+        _strict_missing_user_info(monkeypatch)
+    _whitelist_bypass_key()
+
+    response = _chat_with_key("10.0.0.52")
+
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "invalid_apikey"
+
+
+@pytest.mark.django_db
+def test_apikey_with_nonzero_department_is_not_whitelist_rechecked(monkeypatch):
+    # Scope of issue #337: only department_id = 0 bypass rows are re-checked.
+    # A CMDB-registered key with a real department keeps the documented
+    # registration-time-only gate.
+    dept = Department.objects.create(dept1="denied-dept", is_allowed=0)
+    UserIP.objects.create(ip_id=0, apikey="key-1", employee_no="E001", department_id=dept.id)
+    Model.objects.create(model_name="m", max_tokens=65536)
+    Server.objects.create(model_id=Model.objects.get(model_name="m").id, base_url="http://s.example", is_online=True)
+    _upstream_ok(monkeypatch)
+
+    response = _chat_with_key("10.0.0.53")
+
+    assert response.status_code == 200
+    assert UserIP.objects.get(apikey="key-1").is_valid is True
