@@ -91,6 +91,22 @@ class UserIPRepository:
         obj.save(update_fields=["is_valid", "deleted_at", "updated_at"])
 
     @staticmethod
+    def deactivate_by_id(user_ip_id: int) -> bool:
+        """Set ``is_valid = false`` on an active key row by id (soft).
+
+        Revokes the row the request resolved to, which may carry no
+        ``employee_no`` of its own (borrowed identity); like every key
+        invalidation the row survives as a tombstone.
+        """
+        obj = UserIP.objects.filter(id=user_ip_id, is_valid=True, deleted_at__isnull=True).first()
+        if obj is None:
+            return False
+        obj.is_valid = False
+        obj.updated_at = timezone.now()
+        obj.save(update_fields=["is_valid", "updated_at"])
+        return True
+
+    @staticmethod
     def deactivate_apikey_by_employee_no(employee_no: str) -> bool:
         """Set ``is_valid = false`` on the employee's active key (soft)."""
         obj = UserIPRepository.get_active_apikey_by_employee_no(employee_no)
