@@ -7,6 +7,7 @@ from django.db import models
 from django.utils import timezone
 
 from router.models import RequestRecord
+from router.utils.target import parse_pd_decode_target, parse_pd_prefill_target
 
 
 LLM_CHOOSING_IP_ID = 0
@@ -267,15 +268,14 @@ class RequestRepository:
                 record_ids.append(record.id)
                 target = record.target_pod_ip or ""
 
-                if record.task_status == "prefilling" and target.startswith("P: "):
-                    prefiller_url = target[3:]
-                    if prefiller_url:
-                        prefilling_targets[prefiller_url] = prefilling_targets.get(prefiller_url, 0) + 1
+                if record.task_status == "prefilling":
+                    prefiller_part = parse_pd_prefill_target(target)
+                    if prefiller_part is not None:
+                        prefilling_targets[prefiller_part] = prefilling_targets.get(prefiller_part, 0) + 1
 
-                elif record.task_status == "decoding" and " -- D: " in target:
-                    decoder_part = target.split(" -- D: ", 1)[1]
-                    decoder_part = decoder_part.removesuffix(" -- KV_TRANS_FAIL")
-                    if decoder_part:
+                elif record.task_status == "decoding":
+                    decoder_part = parse_pd_decode_target(target)
+                    if decoder_part is not None:
                         decoding_workload[decoder_part] = decoding_workload.get(decoder_part, 0) + 1
                         decoder_tokens[decoder_part] = decoder_tokens.get(decoder_part, 0.0) + float(record.input_token_cnt or 0)
 

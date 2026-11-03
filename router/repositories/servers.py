@@ -10,10 +10,10 @@ from django.utils import timezone
 
 from router.config import APP_CONFIG
 from router.models import Server, is_prefiller_role
-from router.route_algorithm.least_connection import effective_weight
 from router.services.request_context import get_request_id
 from router.services.request_logger import append_request_log
 from router.utils.target import (
+    PD_PREFILL_PREFIX,
     parse_pd_decode_target,
     parse_pd_prefill_target,
     parse_server_target,
@@ -337,6 +337,11 @@ class ServerRepository:
         Returns a mapping of ``group_id`` -> average decoder load. Clusters
         with no decoder are omitted.
         """
+        # Imported here, not at module level: route_algorithm imports this
+        # module back, and a module-level import makes every cold CLI entry
+        # point (e.g. manage.py correct_workload) die on the cycle.
+        from router.route_algorithm.least_connection import effective_weight
+
         decoders: dict[str, list[float]] = {}
         for server in servers:
             role = getattr(server, "role", "mixed") or "mixed"
@@ -361,6 +366,8 @@ class ServerRepository:
     @staticmethod
     def pick_least_tokens_decoder(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
         """Pick the routable decoder with the least weight-normalized active_tokens in a cluster."""
+        from router.route_algorithm.least_connection import effective_weight
+
         attempted_ids = attempted_ids or set()
         servers = ServerRepository.list_all_online()
         decoders = [
@@ -389,6 +396,8 @@ class ServerRepository:
     @staticmethod
     def pick_least_workload_prefiller(group_id: str, attempted_ids: set[int] | None = None) -> Server | None:
         """Pick the routable prefiller (either style) with the least weight-normalized workload in a cluster."""
+        from router.route_algorithm.least_connection import effective_weight
+
         attempted_ids = attempted_ids or set()
         servers = ServerRepository.list_all_online()
         prefillers = [
@@ -465,9 +474,12 @@ class ServerRepository:
 
         PD target parts resolve like ``decrement_workload_by_targets``: a
         ``#s<id>`` suffix names the owning row, a plain part attributes to
-        every active row on that base_url. A ``processing`` row that still
-        carries a ``"P: "`` target is the transient window between prefill
-        release and decoder reservation — it belongs to no server.
+        every active row on that base_url. Any in-flight row whose target
+        carries the ``"P: "`` prefix but does not parse into a phase bucket
+        is inside a dispatch transition window — task_status is flipped
+        before the target is rewritten at decode start, or an old target
+        lingers after the prefiller/decoder was released — so it belongs to
+        no server and is skipped.
 
         Returns ``(changes, orphans)``: ``changes`` lists every server whose
         stored workload (or ``active_tokens``) differs from the expected
@@ -478,8 +490,16 @@ class ServerRepository:
         (``processing``/``prefilling``/``decoding``).
 
         Set ``apply=True`` to persist the corrected values. Uses a PostgreSQL
-        advisory lock (a no-op transaction on other backends) so concurrent
-        runs or workload mutations during the run cannot interleave.
+        advisory lock (a no-op transaction on other backends) that
+        serializes concurrent corrector runs ONLY: dispatch-side counter
+        mutations (increment/decrement, reserve/release) do not take the
+        lock, so a run under live traffic can still race them — most
+        notably the finish-then-release gap, where a finished row has left
+        the in-flight set but its server has not been decremented yet, and
+        the decode-start window, where a decoder was reserved before its
+        row became visible as decoding. A ``--fix`` landing in such a
+        window writes a transiently wrong value that the next run
+        self-heals; prefer running ``--fix`` in a low-traffic window.
         """
         from django.db import connection, transaction
 
@@ -522,9 +542,13 @@ class ServerRepository:
                             decode_tokens.get(part, 0.0) + float(row["input_token_cnt"] or 0)
                         )
                         continue
-                elif row["task_status"] == "processing" and parse_pd_prefill_target(target):
-                    # Transient PD window: prefiller released, decoder not
-                    # yet reserved — no server owns this row.
+                if target.startswith(PD_PREFILL_PREFIX):
+                    # An unbucketed "P: "-prefixed row is inside a PD phase
+                    # transition: dispatch flips task_status before the
+                    # target is rewritten (decode start) or releases the
+                    # prefiller/decoder while the old target lingers
+                    # (inter-phase, KV-transfer recompute). No server owns
+                    # the row in any of those windows.
                     continue
                 plain_counts[target] = plain_counts.get(target, 0) + 1
 

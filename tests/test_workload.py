@@ -459,6 +459,87 @@ def test_recalculate_workload_interphase_processing_pd_records_belong_to_no_serv
     assert orphans == []
 
 
+def test_recalculate_workload_decode_start_window_is_not_an_orphan():
+    # Dispatch saves task_status="decoding" before rewriting the target to
+    # "P: X -- D: Y" (proxy_pd_forward decode start), so a row can briefly
+    # read decoding + "P: <prefiller>". It must not become orphan noise.
+    Server.objects.create(
+        base_url="http://p1.example", is_online=True,
+        role="prefiller", group_id="g1", workload=0,
+    )
+    decoder = Server.objects.create(
+        base_url="http://d1.example", is_online=True,
+        role="decoder", group_id="g1", workload=1, active_tokens=100.0,
+    )
+    _make_inflight("P: http://p1.example", model_id=1, task_status="decoding")
+
+    changes, orphans = ServerRepository.recalculate_workload()
+
+    assert orphans == []
+    # Known limitation (docstring): the decoder was already reserved, but no
+    # bucket can see the row until its target is rewritten, so a transient
+    # drift entry appears and self-heals on the next run after the rewrite.
+    assert changes == [
+        {
+            "server_id": decoder.id,
+            "base_url": "http://d1.example",
+            "before": 1,
+            "after": 0,
+            "tokens_before": 100.0,
+            "tokens_after": 0.0,
+        }
+    ]
+
+
+def test_recalculate_workload_recompute_window_is_not_an_orphan():
+    # KV-transfer recompute releases the decoder and flips the row back to
+    # "processing" while the old "P: X -- D: Y" target lingers.
+    Server.objects.create(
+        base_url="http://p1.example", is_online=True,
+        role="prefiller", group_id="g1", workload=0,
+    )
+    Server.objects.create(
+        base_url="http://d1.example", is_online=True,
+        role="decoder", group_id="g1", workload=0, active_tokens=0.0,
+    )
+    _make_inflight(
+        "P: http://p1.example -- D: http://d1.example",
+        model_id=1, task_status="processing",
+    )
+
+    changes, orphans = ServerRepository.recalculate_workload()
+
+    assert changes == []
+    assert orphans == []
+
+
+def test_correct_workload_command_imports_from_a_cold_process():
+    # manage.py correct_workload is a cold CLI entry point: nothing has
+    # pre-imported route_algorithm, so a module-level import cycle between
+    # repositories.servers and route_algorithm breaks it (#342 review).
+    import os
+    import subprocess
+    import sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(
+        os.environ,
+        DJANGO_SETTINGS_MODULE="router_project.settings",
+        USE_SQLITE_FOR_TESTS="1",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import django; django.setup(); "
+         "from router.management.commands.correct_workload import Command"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_recalculate_workload_attributes_pd_targets_by_id_suffix():
     first = Server.objects.create(
         base_url="http://shared.example", is_online=True,
