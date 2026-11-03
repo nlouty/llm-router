@@ -13,11 +13,19 @@ from router.models import Server, is_prefiller_role
 from router.route_algorithm.least_connection import effective_weight
 from router.services.request_context import get_request_id
 from router.services.request_logger import append_request_log
-from router.utils.target import parse_server_target, server_target
+from router.utils.target import (
+    parse_pd_decode_target,
+    parse_pd_prefill_target,
+    parse_server_target,
+    server_target,
+)
 
 # Arbitrary key for the workload-recalculation advisory lock. Only one
 # corrector run may hold it at a time so concurrent runs serialize.
 _ADVISORY_LOCK_KEY = 8723461
+
+# active_tokens drift below this is float noise, not real drift.
+_TOKENS_EPSILON = 1e-6
 
 
 class ServerRepository:
@@ -435,29 +443,43 @@ class ServerRepository:
         include_offline: bool = False,
         apply: bool = False,
     ) -> tuple[list[dict], list[dict]]:
-        """Reconcile ``Server.workload`` against in-flight processing requests.
+        """Reconcile ``Server.workload`` (and ``active_tokens``) against
+        in-flight requests.
 
         The authoritative workload for a server is the number of
-        ``RequestRecord`` rows with in-flight statuses whose
-        ``target_pod_ip`` equals the server's target string — its
-        ``base_url``, plus the ``#s<id>`` suffix when several active rows
-        share that base_url (issue #310; requests are linked to servers by
-        string, not a foreign key).
+        ``RequestRecord`` rows with in-flight statuses whose recorded
+        target belongs to that server:
 
-        Returns ``(changes, orphans)`` where ``changes`` lists every server
-        whose stored workload differs from the expected count (with
-        ``before``/``after`` values), and ``orphans`` lists ``target_pod_ip``
-        values seen on processing records that match no non-deleted server.
+        * single-node (role=mixed): ``processing`` rows whose
+          ``target_pod_ip`` equals the server's target string — its
+          ``base_url``, plus the ``#s<id>`` suffix when several active rows
+          share that base_url (issue #310; requests are linked to servers
+          by string, not a foreign key);
+        * PD prefill: ``prefilling`` rows whose target is
+          ``"P: <prefiller>"`` (``parse_pd_prefill_target``);
+        * PD decode: ``decoding`` rows whose target is
+          ``"P: <prefiller> -- D: <decoder>"`` (``parse_pd_decode_target``,
+          which strips any ``" -- KV_TRANS_FAIL"`` suffix). These rows also
+          define the decoder's ``active_tokens``: the sum of their
+          ``input_token_cnt``, exactly what dispatch reserved.
+
+        PD target parts resolve like ``decrement_workload_by_targets``: a
+        ``#s<id>`` suffix names the owning row, a plain part attributes to
+        every active row on that base_url. A ``processing`` row that still
+        carries a ``"P: "`` target is the transient window between prefill
+        release and decoder reservation — it belongs to no server.
+
+        Returns ``(changes, orphans)``: ``changes`` lists every server whose
+        stored workload (or ``active_tokens``) differs from the expected
+        value, with ``before``/``after`` (plus ``tokens_before``/
+        ``tokens_after`` when ``active_tokens`` drifts); ``orphans`` lists
+        target strings seen on in-flight records that match no non-deleted
+        server, tagged with the phase as ``kind``
+        (``processing``/``prefilling``/``decoding``).
 
         Set ``apply=True`` to persist the corrected values. Uses a PostgreSQL
         advisory lock (a no-op transaction on other backends) so concurrent
         runs or workload mutations during the run cannot interleave.
-
-        NOTE: Does not support PD-Disaggregation (role=prefiller/decoder) servers.
-        PD requests record ``target_pod_ip`` as ``"P: <prefiller> -- D: <decoder>"``
-        rather than a single ``server.base_url``, so the exact-string match below
-        will not reconcile workload for prefillers/decoders. Single-node (role=mixed)
-        servers remain fully supported. PD workload reconciliation is deferred.
         """
         from django.db import connection, transaction
 
@@ -473,39 +495,105 @@ class ServerRepository:
 
             from router.repositories.requests import is_processing_q
 
-            qs = RequestRecord.objects.filter(
-                target_pod_ip__isnull=False
-            ).exclude(target_pod_ip="").filter(is_processing_q())
-            expected = {
-                row["target_pod_ip"]: row["count"]
-                for row in qs.values("target_pod_ip").annotate(count=Count("id"))
-            }
+            qs = (
+                RequestRecord.objects
+                .filter(target_pod_ip__isnull=False)
+                .exclude(target_pod_ip="")
+                .filter(is_processing_q())
+            )
+
+            # Phase buckets keyed by the owning server's target string.
+            plain_counts: dict[str, int] = {}    # full target string -> count
+            prefill_counts: dict[str, int] = {}  # prefiller part -> count
+            decode_counts: dict[str, int] = {}   # decoder part -> count
+            decode_tokens: dict[str, float] = {} # decoder part -> input_token_cnt sum
+            for row in qs.values("target_pod_ip", "task_status", "input_token_cnt"):
+                target = row["target_pod_ip"] or ""
+                if row["task_status"] == "prefilling":
+                    part = parse_pd_prefill_target(target)
+                    if part is not None:
+                        prefill_counts[part] = prefill_counts.get(part, 0) + 1
+                        continue
+                elif row["task_status"] == "decoding":
+                    part = parse_pd_decode_target(target)
+                    if part is not None:
+                        decode_counts[part] = decode_counts.get(part, 0) + 1
+                        decode_tokens[part] = (
+                            decode_tokens.get(part, 0.0) + float(row["input_token_cnt"] or 0)
+                        )
+                        continue
+                elif row["task_status"] == "processing" and parse_pd_prefill_target(target):
+                    # Transient PD window: prefiller released, decoder not
+                    # yet reserved — no server owns this row.
+                    continue
+                plain_counts[target] = plain_counts.get(target, 0) + 1
 
             servers = ServerRepository._active_servers(include_offline)
+            servers_by_id = {server.id: server for server in servers}
+            servers_by_url: dict[str, list[Server]] = {}
+            for server in servers:
+                servers_by_url.setdefault(server.base_url, []).append(server)
+
+            def resolve_part(part: str) -> list[Server]:
+                base_url, server_id = parse_server_target(part)
+                if server_id is not None:
+                    server = servers_by_id.get(server_id)
+                    return [server] if server is not None else []
+                return servers_by_url.get(base_url, [])
+
+            expected_workload = {server.id: 0 for server in servers}
+            expected_tokens = {server.id: 0.0 for server in servers}
+            for part, count in prefill_counts.items():
+                for server in resolve_part(part):
+                    expected_workload[server.id] += count
+            for part, count in decode_counts.items():
+                for server in resolve_part(part):
+                    expected_workload[server.id] += count
+                    expected_tokens[server.id] += decode_tokens.get(part, 0.0)
+
             changes: list[dict] = []
             for server in servers:
-                target = expected.get(server_target(server), 0)
-                if server.workload == target:
+                expected_workload[server.id] += plain_counts.get(server_target(server), 0)
+                tokens_drift = abs(
+                    float(server.active_tokens or 0.0) - expected_tokens[server.id]
+                ) > _TOKENS_EPSILON
+                if server.workload == expected_workload[server.id] and not tokens_drift:
                     continue
-                changes.append(
-                    {
-                        "server_id": server.id,
-                        "base_url": server.base_url,
-                        "before": server.workload,
-                        "after": target,
-                    }
-                )
+                change = {
+                    "server_id": server.id,
+                    "base_url": server.base_url,
+                    "before": server.workload,
+                    "after": expected_workload[server.id],
+                }
+                if tokens_drift:
+                    change["tokens_before"] = float(server.active_tokens or 0.0)
+                    change["tokens_after"] = expected_tokens[server.id]
+                changes.append(change)
                 if apply:
-                    Server.objects.filter(id=server.id).update(workload=target)
-                    server.workload = target
+                    Server.objects.filter(id=server.id).update(
+                        workload=expected_workload[server.id],
+                        active_tokens=expected_tokens[server.id],
+                    )
+                    server.workload = expected_workload[server.id]
+                    server.active_tokens = expected_tokens[server.id]
 
             known = {server_target(s) for s in servers}
             orphans = [
-                {"target_pod_ip": pod_ip, "count": count}
-                for pod_ip, count in expected.items()
+                {"target_pod_ip": pod_ip, "count": count, "kind": "processing"}
+                for pod_ip, count in plain_counts.items()
                 if pod_ip not in known
             ]
-            orphans.sort(key=lambda item: item["target_pod_ip"])
+            orphans.extend(
+                {"target_pod_ip": part, "count": count, "kind": "prefilling"}
+                for part, count in prefill_counts.items()
+                if not resolve_part(part)
+            )
+            orphans.extend(
+                {"target_pod_ip": part, "count": count, "kind": "decoding"}
+                for part, count in decode_counts.items()
+                if not resolve_part(part)
+            )
+            orphans.sort(key=lambda item: (item["kind"], item["target_pod_ip"]))
             return changes, orphans
 
     @staticmethod

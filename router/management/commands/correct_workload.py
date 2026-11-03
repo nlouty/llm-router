@@ -5,8 +5,9 @@ from router.repositories.servers import ServerRepository
 
 class Command(BaseCommand):
     help = (
-        "Reconcile servers.workload against in-flight requests "
-        "(task_status='processing' grouped by target_pod_ip)."
+        "Reconcile servers.workload (and decoder active_tokens) against "
+        "in-flight requests (task_status=processing/prefilling/decoding "
+        "grouped by target_pod_ip)."
     )
 
     def add_arguments(self, parser):
@@ -41,14 +42,20 @@ class Command(BaseCommand):
         )
 
         for change in changes:
-            self.stdout.write(
+            line = (
                 f"server {change['server_id']} ({change['base_url']}): "
                 f"workload {change['before']} -> {change['after']}"
             )
+            if "tokens_before" in change:
+                line += (
+                    f", active_tokens {change['tokens_before']}"
+                    f" -> {change['tokens_after']}"
+                )
+            self.stdout.write(line)
 
         for orphan in orphans:
             self.stdout.write(
-                f"orphan processing target '{orphan['target_pod_ip']}' "
+                f"orphan {orphan['kind']} target '{orphan['target_pod_ip']}' "
                 f"({orphan['count']} record(s)) matches no active server"
             )
 
@@ -60,7 +67,7 @@ class Command(BaseCommand):
             )
         else:
             self.stdout.write(
-                self.style.SUCCESS("All server workloads already match processing requests")
+                self.style.SUCCESS("All server workloads already match in-flight requests")
             )
 
         if not fix and changes:

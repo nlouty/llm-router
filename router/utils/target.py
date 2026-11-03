@@ -22,6 +22,15 @@ TARGET_MAX_LENGTH = 500
 _DUPLICATION_CACHE_TTL_SECONDS = 30.0
 _ID_SUFFIX_RE = re.compile(r"#s(\d+)$")
 
+# PD-disaggregation target formats (proxy_pd_forward writes them):
+#   prefill phase: "P: <prefiller target>"
+#   decode phase:  "P: <prefiller target> -- D: <decoder target>"
+#                  (optionally suffixed with " -- KV_TRANS_FAIL" after a
+#                  KV-transfer failure re-dispatch)
+PD_PREFILL_PREFIX = "P: "
+PD_DECODE_SEPARATOR = " -- D: "
+PD_KV_TRANSFER_FAIL_SUFFIX = " -- KV_TRANS_FAIL"
+
 _duplication_cache: tuple[float, frozenset[str]] | None = None
 
 
@@ -90,3 +99,30 @@ def parse_server_target(target: str | None) -> tuple[str, int | None]:
     if match:
         return target[: match.start()], int(match.group(1))
     return target, None
+
+
+def parse_pd_prefill_target(target: str | None) -> str | None:
+    """The prefiller target part of a prefill-phase PD target, else ``None``.
+
+    ``"P: <target>"`` is written only for the prefill phase; decode start
+    rewrites the record, so a bare ``"P: "``-prefixed target still marks a
+    request that is prefilling (or in the brief window before its decoder
+    is chosen).
+    """
+    if not target or not target.startswith(PD_PREFILL_PREFIX):
+        return None
+    return target[len(PD_PREFILL_PREFIX):] or None
+
+
+def parse_pd_decode_target(target: str | None) -> str | None:
+    """The decoder target part of a decode-phase PD target, else ``None``.
+
+    Strips the leading prefiller part and any ``" -- KV_TRANS_FAIL"``
+    suffix; the remainder is the decoder's own target string (plain or
+    ``#s<id>``-qualified).
+    """
+    if not target or PD_DECODE_SEPARATOR not in target:
+        return None
+    part = target.split(PD_DECODE_SEPARATOR, 1)[1]
+    part = part.removesuffix(PD_KV_TRANSFER_FAIL_SUFFIX)
+    return part or None
