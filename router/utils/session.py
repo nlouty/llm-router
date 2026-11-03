@@ -8,6 +8,8 @@ SESSION_HEADERS = (
     "X-Session-Affinity",
     "x-session-id",
     "X-Snap-Traceid",
+    "X-Run-Id",
+    "sssc-harness-ses-id",
 )
 
 
