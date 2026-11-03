@@ -408,31 +408,31 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         issue #276's head-of-line blocking. Overload escape stays inside the
         cluster first: p-prefillers, then n-prefillers, then global. A busy
         holder with no same-cluster p-prefiller keeps the request only while
-        below its #247 overload threshold.
+        below its #247 overload threshold. Within-cluster comparisons rank on
+        the prefill-side own load view (issue #339): the #331 decode floor is
+        identical for every same-cluster prefiller, so it cancels here and
+        only flattens the ranking.
         """
-        load_counts = self._load_counts(available)
-        min_load = min(load_counts.get(server.id, 0) for server in available)
+        own_loads, effective_loads = self._load_views(available)
         holders = [
             server
             for server in group_servers
             if match.server_match_ratios.get(server.id, 0.0) > self.primary_match_threshold
         ]
-        chosen = self._pick_least_loaded(holders, load_counts) if holders else None
+        chosen = self._pick_least_loaded(holders, own_loads) if holders else None
         if chosen is not None:
             busy_with_new = (
                 self._server_role(chosen) == "prefiller"
                 and self._has_new_prefill(chosen)
             )
             if not busy_with_new and not self._is_overloaded(
-                chosen, load_counts.get(chosen.id, 0), min_load
+                chosen, own_loads, effective_loads
             ):
                 return chosen
             if busy_with_new:
                 has_p = any(self._server_role(s) == "prefix-prefiller" for s in group_servers)
                 if not has_p:
-                    if not self._is_overloaded(
-                        chosen, load_counts.get(chosen.id, 0), min_load
-                    ):
+                    if not self._is_overloaded(chosen, own_loads, effective_loads):
                         # Split disabled for this cluster: stay on the holder.
                         return chosen
                     logger.info(
@@ -440,57 +440,64 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                         "no same-cluster p-prefiller; escaping globally",
                         chosen.id,
                     )
-                    return self._cached_escape(available, group_servers, load_counts)
+                    return self._cached_escape(
+                        available, group_servers, own_loads, effective_loads
+                    )
                 match.switched_from = chosen.id
                 logger.info(
                     "[PrefixCachePreble] holder server_id=%s has a new prefill "
                     "in flight; switching to a same-cluster prefix-prefiller",
                     chosen.id,
                 )
-        return self._cached_escape(available, group_servers, load_counts)
+        return self._cached_escape(available, group_servers, own_loads, effective_loads)
 
     def _cached_escape(
         self,
         available: Sequence[Any],
         group_servers: list[Any],
-        load_counts: dict[int, float],
+        own_loads: dict[int, float],
+        effective_loads: dict[int, float],
     ):
         """#247 escape for the cached class, cluster-first: same-cluster
         p-prefillers, then same-cluster n-prefillers, then non-p servers
         globally — a fresh prefill never lands on a p-prefiller while a live
-        prefiller exists (issue #276)."""
-        min_load = min(load_counts.get(server.id, 0) for server in available)
+        prefiller exists (issue #276). Tiers rank on the prefill-side own
+        load view (issue #339): the shared decode floor would flatten them
+        into a tie that can land back on the busy holder."""
         for role in ("prefix-prefiller", "prefiller"):
             tier = [s for s in group_servers if self._server_role(s) == role]
-            candidate = self._pick_least_loaded(tier, load_counts) if tier else None
+            candidate = self._pick_least_loaded(tier, own_loads) if tier else None
             if candidate is not None and not self._is_overloaded(
-                candidate, load_counts.get(candidate.id, 0), min_load
+                candidate, own_loads, effective_loads
             ):
                 return candidate
         logger.info(
             "[PrefixCachePreble] cached cluster exhausted; falling back to "
             "least loaded server"
         )
-        return self._choose_new(available, load_counts)
+        # Global fallback re-ranks on the decode-floored view (#331): a
+        # decode-saturated cluster must not look idle against other scopes.
+        return self._choose_new(available, effective_loads)
 
     def _choose_partial(self, available: Sequence[Any], group_servers: list[Any]):
         """Partial class (secondary < ratio <= primary): new-style placement,
         but inside the argmax cluster so the partial KV is pulled via RDMA
         instead of recomputed on a server outside the pool. The #247 escape
         applies here too: an overloaded cluster sheds partials to the global
-        least-loaded pool instead of queueing them behind its prefillers."""
-        load_counts = self._load_counts(available)
-        min_load = min(load_counts.get(server.id, 0) for server in available)
+        least-loaded pool instead of queueing them behind its prefillers.
+        The in-cluster n-prefiller ranks on the prefill-side own load view
+        (issue #339), like the cached class."""
+        own_loads, effective_loads = self._load_views(available)
         n_in_cluster = [s for s in group_servers if self._server_role(s) == "prefiller"]
         if n_in_cluster:
-            candidate = self._pick_least_loaded(n_in_cluster, load_counts)
-            if not self._is_overloaded(candidate, load_counts.get(candidate.id, 0), min_load):
+            candidate = self._pick_least_loaded(n_in_cluster, own_loads)
+            if not self._is_overloaded(candidate, own_loads, effective_loads):
                 return candidate
             logger.info(
                 "[PrefixCachePreble] partial cluster overloaded; falling back "
                 "to least loaded server"
             )
-        return self._choose_new(available, load_counts)
+        return self._choose_new(available, effective_loads)
 
     def _choose_new(self, available: Sequence[Any], load_counts: dict[int, float] | None = None):
         """Cold/new class: p-prefillers are reserved for prefix-cached traffic
@@ -517,8 +524,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             return self._choose_new(available)
         load_counts = self._load_counts(available)
         cached = self._pick_least_loaded(cached_matches, load_counts)
-        min_load = min(load_counts.get(server.id, 0) for server in available)
-        if self._is_overloaded(cached, load_counts.get(cached.id, 0), min_load):
+        if self._is_overloaded(cached, load_counts, load_counts):
             logger.info(
                 "[PrefixCachePreble] cached server_id=%s overloaded; "
                 "falling back to least loaded server",
@@ -551,11 +557,33 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             targets, max_prefix_cache=self.primary_match_threshold
         )
 
-    def _is_overloaded(self, server: Any, load: float, min_load: float) -> bool:
-        # weight doubles as the server's suggested workload (issue #247): escape
-        # cache affinity only when the cached server is at or above its weight
-        # AND a materially lighter server exists (load > 2x the lightest one).
-        return load >= effective_weight(server) and load > min_load * 2
+    def _is_overloaded(
+        self,
+        server: Any,
+        own_loads: dict[int, float],
+        effective_loads: dict[int, float],
+    ) -> bool:
+        """#247 escape gate (issue #339).
+
+        weight doubles as the server's suggested workload: escape cache
+        affinity only when the affinity-matched server is at or above its
+        weight AND a materially lighter server exists (load > 2x the
+        lightest one). The condition holds on either load view:
+
+        - own (prefill-side, no #331 decode floor): every same-cluster
+          prefiller shares one floor, so on the effective view alone the
+          lightest sibling is floored to ~the busy holder's load and the
+          escape can never fire (issue #339: weight-4 prefillers at workload
+          8-9 kept taking cached requests while siblings sat at 1).
+        - effective (decode-floored): a decode-saturated cluster still sheds
+          affinity when a materially lighter server exists elsewhere (#331).
+        """
+        weight = effective_weight(server)
+        own = own_loads.get(server.id, 0)
+        if own >= weight and own > min(own_loads.values(), default=0) * 2:
+            return True
+        effective = effective_loads.get(server.id, 0)
+        return effective >= weight and effective > min(effective_loads.values(), default=0) * 2
 
     def on_response(self, server: Any, context: ServerSelectionContext, status_code: int) -> None:
         if not 200 <= status_code < 300 or self._redis_client is None:
@@ -615,29 +643,63 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             )
 
     def _load_counts(self, available: Sequence[Any]) -> dict[int, float]:
-        """Workload per server, with PD prefillers reporting node + cluster load.
+        """Effective (decode-floored) load view — see ``_load_views``."""
+        return self._load_views(available)[1]
 
-        Mixed servers report their own workload. A prefiller reports the
-        bottleneck of its two sides, prefill and decode — ``max(own workload,
-        decoder_avg * own weight)`` — so the later ``/ weight`` normalization
-        (LeastConnectionServerChooser._normalized_load) yields
-        ``max(own/weight, avg(D.workload/D.weight))``: each side normalized by
-        its own capacity exactly once (#331). Decoders are chosen by
-        active_tokens, not workload, so the cluster's average (not its least
-        busy decoder) reflects the decode pressure the next request adds.
-        Decoders are never in the candidate set (they hold no prefix cache and
-        are chosen later).
+    def _load_views(
+        self, available: Sequence[Any]
+    ) -> tuple[dict[int, float], dict[int, float]]:
+        """Both selection load views in one pass (issue #339).
+
+        Returns ``(own_loads, effective_loads)``:
+
+        - own: the prefill-side view. Mixed servers report their base
+          workload; a prefiller reports its own ``workload`` with no decode
+          floor. Within a cluster the floor is a constant offset (identical
+          for every member after weight normalization), so it cancels in
+          pairwise comparisons — the #247 escape gate and the within-cluster
+          least-loaded ranking use this view, where the floor would only
+          flatten siblings into one tie (issue #339).
+        - effective: the #331 view. A prefiller reports the bottleneck of
+          its two sides, prefill and decode — ``max(own workload,
+          decoder_avg * own weight)`` — so the later ``/ weight``
+          normalization (LeastConnectionServerChooser._normalized_load)
+          yields ``max(own/weight, avg(D.workload/D.weight))``: each side
+          normalized by its own capacity exactly once (#331). Used for
+          cross-scope ranking (the global ``_choose_new`` fallback), where
+          it keeps a decode-saturated cluster from looking idle. Decoders
+          are never in the candidate set (they hold no prefix cache and are
+          chosen later).
         """
-        load_counts = super()._load_counts(available)
+        base = super()._load_counts(available)
+        own_loads = dict(base)
+        effective_loads = dict(base)
         prefillers = [s for s in available if is_prefiller_role(getattr(s, "role", None))]
         if not prefillers:
-            return load_counts
-        decoder_avgs = self._cluster_decoder_avgs()
+            return own_loads, effective_loads
         for server in prefillers:
-            own = int(getattr(server, "workload", 0) or 0)
+            own_loads[server.id] = int(getattr(server, "workload", 0) or 0)
+        decoder_avgs = self._cluster_decoder_avgs()
+        floored = []
+        for server in prefillers:
             floor = decoder_avgs.get(getattr(server, "group_id", None), 0)
-            load_counts[server.id] = max(own, floor * effective_weight(server))
-        return load_counts
+            effective_loads[server.id] = max(
+                own_loads[server.id], floor * effective_weight(server)
+            )
+            if effective_loads[server.id] != own_loads[server.id]:
+                floored.append(server)
+        if floored:
+            # The workload column and the chooser's effective view diverge
+            # here — exactly the #339 blind spot, so make it visible.
+            logger.info(
+                "[PrefixCachePreble] decode floor active: %s",
+                ", ".join(
+                    f"server_id={s.id} own={own_loads[s.id]} "
+                    f"effective={effective_loads[s.id]}"
+                    for s in floored
+                ),
+            )
+        return own_loads, effective_loads
 
     @staticmethod
     def _cluster_decoder_avgs() -> dict[str, float]:

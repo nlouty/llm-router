@@ -186,6 +186,83 @@ class TestPrefillerBalancingWithinCluster:
         assert selected.id == 2
 
 
+class TestEscapeUnderDecoderFloor:
+    """Issue #339: weight-4 prefillers at workload 8-9 kept taking requests
+    while siblings sat at workload 1. The #331 decode floor is shared by every
+    same-cluster prefiller, so once it exceeded half the busy holder's load
+    the old escape (floored load > 2x floored minimum) could never fire and
+    the floored ranking flattened all siblings into one tie. Within-cluster
+    decisions must compare prefill-side own workloads."""
+
+    def _pool(self):
+        return [
+            make_server(1, "http://p1", role="prefiller", group_id="g1", workload=9, weight=4),
+            make_server(2, "http://p2", role="prefiller", group_id="g1", workload=8, weight=4),
+            make_server(3, "http://p3", role="prefiller", group_id="g1", workload=1, weight=4),
+            make_server(4, "http://p4", role="prefiller", group_id="g1", workload=1, weight=4),
+        ]
+
+    def test_cached_holder_escapes_to_light_sibling_under_floor(self, mock_redis):
+        # decoder_avg 1.25 -> floor 5: effective loads become 9/8/5/5, so the
+        # old check 9 > 2*5 was false and the holder kept every request.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 1.25})
+        pool = self._pool()
+        chooser.on_response(pool[0], make_context(make_body("cached " + "x" * 1024), request_id=42), 200)
+        assert storage
+
+        selected = chooser.choose(
+            pool, make_context(make_body("cached " + "x" * 1024 + "y" * 64)), set()
+        )
+        assert selected.id in (3, 4)  # a workload-1 sibling, not the 9/8 holders
+
+    def test_busy_holder_escapes_when_floor_flattens_pool(self, mock_redis):
+        # decoder_avg 2.5 -> floor 10: effective loads flatten to 10/10/10/10.
+        # Pre-#339 the escape compared 10 > 2*10 (never true) and the tier
+        # ranking tied randomly, so requests kept landing on the busy holder.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={"g1": 2.5}, new_prefill_targets={"http://p1"}
+        )
+        pool = self._pool()
+        chooser.on_response(pool[0], make_context(make_body("cached " + "x" * 1024), request_id=42), 200)
+        assert storage
+
+        selected = chooser.choose(
+            pool, make_context(make_body("cached " + "x" * 1024 + "y" * 64)), set()
+        )
+        assert selected.id in (3, 4)
+
+    def test_partial_under_floor_targets_light_sibling(self, mock_redis):
+        # Partial class ranks the in-cluster n-prefillers on own workloads too.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 2.5})
+        pool = self._pool()
+        chooser.on_response(pool[0], make_context(make_body("partial " + "x" * 640), request_id=42), 200)
+        assert storage
+
+        selected = chooser.choose(
+            pool, make_context(make_body("partial " + "x" * 640 + "y" * 256)), set()
+        )
+        assert selected.id in (3, 4)
+
+    def test_escape_fallback_keeps_floor_for_global_ranking(self, mock_redis):
+        # #331 regression guard: with an idle mixed server in the pool, the
+        # escape still sheds to it — the floor keeps the decode-saturated
+        # cluster (effective 5 per light sibling) looking heavier than the
+        # idle mixed server (0) in the global fallback ranking.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 1.25})
+        pool = self._pool() + [make_server(9, "http://m1", role="mixed", workload=0)]
+        chooser.on_response(pool[0], make_context(make_body("cached " + "x" * 1024), request_id=42), 200)
+        assert storage
+
+        selected = chooser.choose(
+            pool, make_context(make_body("cached " + "x" * 1024 + "y" * 64)), set()
+        )
+        assert selected.id == 9
+
+
 class TestOnResponseRecordsPrefiller:
     def test_on_response_writes_prefix_to_prefiller(self, mock_redis):
         _, storage = mock_redis
