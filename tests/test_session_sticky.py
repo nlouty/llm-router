@@ -46,6 +46,10 @@ def test_extract_session_id_fixed_priority_and_case_insensitivity():
     assert extract_session_id({"x-session-id": "c"}) == "c"
     assert extract_session_id({"X-Session-Id": "c"}) == "c"
     assert extract_session_id({"X-Snap-Traceid": "d"}) == "d"
+    assert extract_session_id({"X-Run-Id": "e"}) == "e"
+    assert extract_session_id({"x-run-id": "e"}) == "e"
+    assert extract_session_id({"sssc-harness-ses-id": "f"}) == "f"
+    assert extract_session_id({"SSSC-Harness-Ses-Id": "f"}) == "f"
     # Fixed priority: Chrys wins even if later headers are also present.
     assert (
         extract_session_id(
@@ -55,6 +59,17 @@ def test_extract_session_id_fixed_priority_and_case_insensitivity():
             }
         )
         == "chrys"
+    )
+    # The new headers sit below the established ones in the fixed order.
+    assert (
+        extract_session_id(
+            {
+                "X-Run-Id": "lingxi",
+                "sssc-harness-ses-id": "harness",
+                "X-Snap-Traceid": "codeagent3",
+            }
+        )
+        == "codeagent3"
     )
 
 
