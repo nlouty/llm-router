@@ -331,6 +331,8 @@ ALTER TABLE requests ADD COLUMN session VARCHAR(255) NULL;
 
 `attempt_count`, `target_pod_ip`, `prefix_cache`, and `last_match` are updated before each upstream attempt. For single-node (non-PD) requests `target_pod_ip` equals the server's `base_url`; when several active rows share that `base_url` (issue #310) it carries a `#s<server.id>` suffix so stale cleanup and workload reconciliation attribute the row to the exact server — readers without a suffix fall back to base_url attribution for legacy rows.
 
+`prefix_cache` and `last_match` always describe the same Redis prefix-cache entry (issue #346): `prefix_cache` is that entry's match ratio for the request's rendered prompt text and `last_match` the request id that wrote it. On pd-disaggregation clusters the recorded entry is the winning cluster scope's best-matching entry as long as the placement stays inside that cluster (its KV is what the placement reuses, via local DRAM or an RDMA pull); when the #247 escape leaves the winning cluster, or on standalone servers, it is the selected server's own best entry. `prefix_cache` also classifies the row for `count_new_prefills_by_targets`, so an escaped placement records its own low ratio and counts as a new prefill on the escaping server.
+
 `final_prefix_cache` stores cached-token usage parsed from successful upstream responses when available.
 
 `router_result` stores auto-routing and small-request-routing decisions, prefixed by the originally requested model name. Examples: `auto:complexity:7`, `AUTO:cache_hit`, `source-model:small_request_routing`, `auto:routing_failed:missing_routing_server:no available routing server`.

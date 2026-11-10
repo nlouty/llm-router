@@ -195,12 +195,17 @@ class TestOverloadEscapeCoversClusterPaths:
         chooser = _chooser_with_workload({}, decoder_avgs={"g1": 0.0})
         n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5, weight=2)
         m1 = make_server(2, "http://m1", role="mixed", workload=2, weight=4)
-        _seed(chooser, n1, _partial_request_body())
+        _seed(chooser, n1, _partial_request_body(), request_id=7)
+        # m1 holds only a short own prefix (128 of 910 chars -> ~0.14).
+        _seed(chooser, m1, make_body("partial " + "x" * 128), request_id=9)
 
         ctx = make_context(_partial_hit_body())
         selected = chooser.choose([n1, m1], ctx, set())
-        assert 0.5 < ctx.prefix_cache <= 0.9  # really the partial class
         assert selected.id == m1.id
+        # The escape left the winning cluster, so the row records the
+        # escaping server's own entry, not the scope's partial ratio (#346).
+        assert 0 < ctx.prefix_cache < 0.5
+        assert ctx.last_match == 9
 
     def test_loaded_partial_stays_in_cluster(self, mock_redis):
         # Control: below the weight threshold the RDMA partial-KV pull still
@@ -385,3 +390,66 @@ class TestFreshPrefillNeverOnP:
 
         selected = _choose(chooser, [n1, p1, n2, p2], _cache_hit_body())
         assert selected.id == n2.id
+
+
+class TestRecordedPairCoherence:
+    """Issue #346: (prefix_cache, last_match) must describe ONE entry.
+
+    The scope ratio (cluster argmax) and the selected server's own entry rid
+    used to be recorded together — producing impossible rows like ratio 0.99
+    paired with a 26k-token request. The pair now follows the placement: the
+    scope argmax entry while the request stays in the winning cluster, the
+    selected server's own entry once the escape ladder leaves it.
+    """
+
+    def test_escape_records_selected_servers_own_entry(self, mock_redis):
+        # The incident shape: cached class on an exhausted cluster (holder
+        # overloaded, no p-prefiller) escapes globally to an out-of-scope
+        # server holding only a short prefix of its own.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 0.0})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5, weight=2)
+        m1 = make_server(2, "http://m1", role="mixed", workload=2, weight=4)
+        _seed(chooser, n1, _cached_request_body(), request_id=7)
+        # m1 holds only the first 128 of 1101 chars (~0.12).
+        _seed(chooser, m1, make_body("cached " + "x" * 128), request_id=9)
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([n1, m1], ctx, set())
+        assert selected.id == m1.id  # "cached cluster exhausted" -> global
+        assert 0 < ctx.prefix_cache < 0.5  # m1's own ratio, not the scope 0.93
+        assert ctx.last_match == 9
+
+    def test_switch_records_scope_argmax_rid(self, mock_redis):
+        # In-scope busy-holder switch: the recorded rid must be the entry
+        # that produced the scope ratio (the holder's), not the switch
+        # target's own — the p-prefiller holds none of the KV itself.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://n1"}
+        )
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+        _seed(chooser, n1, _cached_request_body(), request_id=7)
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([n1, p1], ctx, set())
+        assert selected.id == p1.id
+        assert ctx.prefix_cache > 0.9  # cluster ratio reused via RDMA
+        assert ctx.last_match == 7
+
+    def test_partial_in_cluster_records_scope_argmax_rid(self, mock_redis):
+        # Partial class: the least-loaded in-cluster sibling has no own
+        # entry at all, yet the recorded pair must still name the holder's
+        # entry whose KV the placement pulls via RDMA.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=3)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0)
+        _seed(chooser, holder, _partial_request_body(), request_id=7)
+
+        ctx = make_context(_partial_hit_body())
+        selected = chooser.choose([holder, sibling], ctx, set())
+        assert selected.id == sibling.id
+        assert 0.5 < ctx.prefix_cache <= 0.9
+        assert ctx.last_match == 7

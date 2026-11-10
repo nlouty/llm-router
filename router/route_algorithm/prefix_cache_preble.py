@@ -37,10 +37,17 @@ class _PrefixMatch:
     # prefiller-role servers with a non-empty group_id (they share one
     # kv-cache pool; any member can pull the KV via RDMA).
     cluster_ratios: dict[str, float] = field(default_factory=dict)
+    # group_id -> rid of the member entry that produced cluster_ratios' max
+    # (issue #346): the request whose cached prefix the scope ratio refers to.
+    cluster_request_ids: dict[str, Any] = field(default_factory=dict)
     # Ratio of the winning scope. Set only for cluster paths: the KV the chosen
     # placement can actually reuse, including RDMA pulls. None keeps the
-    # selected server's own ratio (standalone/cold paths, pre-#276 semantics).
+    # selected server's own ratio (standalone/cold paths, pre-#276 semantics,
+    # and #247 escapes that left the winning cluster — issue #346).
     scope_ratio: float | None = None
+    # rid of the entry that produced scope_ratio; set alongside it so the
+    # recorded (prefix_cache, last_match) pair describes one entry.
+    scope_request_id: Any = None
     # "local" (the selected server holds the KV in its own DRAM) or "rdma"
     # (the KV is pulled from the cluster pool). None = no prefix reused.
     delivery: str | None = None
@@ -174,17 +181,22 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         if selected is None:
             self._clear_prefix_context(context)
             return
-        # Cluster paths record the scope (cluster) ratio — the KV the chosen
-        # placement can actually reuse, including RDMA pulls — so the stored
-        # requests.prefix_cache doubles as the request's classification for
-        # count_new_prefills_by_targets. Other paths keep the selected
-        # server's own ratio (pre-#276 semantics).
+        # The recorded pair must describe ONE entry (issue #346): the winning
+        # scope's argmax entry when the placement stays in the cluster (its KV
+        # is what the placement actually reuses, via local DRAM or RDMA pull —
+        # the scope ratio also doubles as the request's cached/new
+        # classification for count_new_prefills_by_targets), otherwise the
+        # selected server's own entry.
         context.prefix_cache = (
             match.scope_ratio
             if match.scope_ratio is not None
             else match.server_match_ratios.get(selected.id, 0.0)
         )
-        context.last_match = match.server_match_request_ids.get(selected.id)
+        context.last_match = (
+            match.scope_request_id
+            if match.scope_ratio is not None
+            else match.server_match_request_ids.get(selected.id)
+        )
 
     @staticmethod
     def _clear_prefix_context(context: ServerSelectionContext) -> None:
@@ -266,6 +278,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 group = server.group_id
                 if match_ratio > match.cluster_ratios.get(group, 0.0):
                     match.cluster_ratios[group] = match_ratio
+                    match.cluster_request_ids[group] = entry.get("rid")
             if match_ratio > self.primary_match_threshold:
                 match.cached_matches.append(server)
         return match
@@ -384,19 +397,32 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             if self._is_cluster_prefiller(server) and server.group_id == scope_group
         ]
         match.scope_ratio = match.cluster_ratios[scope_group]
+        match.scope_request_id = match.cluster_request_ids.get(scope_group)
         if match.scope_ratio > self.primary_match_threshold:
             selected = self._choose_cached(available, match, group_servers)
         else:
             selected = self._choose_partial(available, group_servers)
-        if selected is not None:
-            # Local DRAM beats RDMA: delivery is "local" only when the selected
-            # server itself holds the prefix.
-            own_ratio = match.server_match_ratios.get(selected.id, 0.0)
-            match.delivery = "local" if own_ratio > self.primary_match_threshold else "rdma"
-            if match.switched_from == selected.id:
-                # The escape ladder landed back on the busy holder (it is still
-                # the least-loaded n-prefiller): not an actual switch.
-                match.switched_from = None
+        if selected is None:
+            return None
+        if not any(server is selected for server in group_servers):
+            # The #247 escape ladder left the winning cluster: KV pools are
+            # per-cluster, so this placement reuses none of the scope's KV.
+            # Drop the scope state so the recorded (prefix_cache, last_match)
+            # pair describes the selected server's own entry and the row
+            # counts as a new prefill on it (issue #346).
+            match.scope_ratio = None
+            match.scope_request_id = None
+            match.delivery = None
+            match.switched_from = None
+            return selected
+        # Local DRAM beats RDMA: delivery is "local" only when the selected
+        # server itself holds the prefix.
+        own_ratio = match.server_match_ratios.get(selected.id, 0.0)
+        match.delivery = "local" if own_ratio > self.primary_match_threshold else "rdma"
+        if match.switched_from == selected.id:
+            # The escape ladder landed back on the busy holder (it is still
+            # the least-loaded n-prefiller): not an actual switch.
+            match.switched_from = None
         return selected
 
     def _choose_cached(
