@@ -93,8 +93,8 @@ The default chooser is `PrefixCachePrebleServerChooser`. Before each backend att
 
 - `requests.target_pod_ip`: selected server `base_url`
 - `requests.attempt_count`: attempt number for the client request
-- `requests.prefix_cache`: best prefix-cache match ratio found for that attempt
-- `requests.last_match`: historical request id that produced the best match, or `NULL`
+- `requests.prefix_cache`: match ratio of the recorded prefix-cache entry for that attempt
+- `requests.last_match`: historical request id whose cached entry produced `prefix_cache`, or `NULL` (issue #346: both fields always describe the same entry — on pd clusters the winning scope's best-matching entry while the request stays in that cluster, otherwise the selected server's own entry)
 
 If `match_ratio > prefix_cache.primary_match_threshold` (`0.9` by default), the chooser picks the least-loaded cached server. If no primary match exists but some server has `match_ratio > prefix_cache.secondary_match_threshold` (`0.5` by default), it picks the least-loaded server from that secondary set. Otherwise it picks the least-loaded candidate overall.
 
