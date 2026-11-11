@@ -85,10 +85,14 @@ def mock_redis():
         PrefixCachePrebleServerChooser._redis_client = None
 
 
-def _chooser_with_workload(server_workloads: dict[int, int], decoder_avgs: dict[str, float] | None = None, new_prefill_targets: set[str] | None = None):
+def _chooser_with_workload(server_workloads: dict[int, int], decoder_avgs: dict[str, float] | None = None, new_prefill_targets: set[str] | None = None, shared_groups: set[str] | None = None):
     """Build a chooser where each server reports a fixed workload, and PD
     decoder-average loads are stubbed (no DB needed). ``new_prefill_targets`` are
-    base_urls whose "P: {base_url}" target reports one new prefill in flight."""
+    base_urls whose "P: {base_url}" target reports one new prefill in flight.
+    ``shared_groups`` stubs the shared-pool composition lookup: groups here
+    contain a p/n split, so by default every suite group is a shared pool
+    (pre-composition-rule cluster semantics); pass a smaller set (e.g. set())
+    to make all-`prefiller` groups standalone scopes."""
     c = PrefixCachePrebleServerChooser.__new__(PrefixCachePrebleServerChooser)
     # minimal init skipping redis/APP_CONFIG
     c.primary_match_threshold = 0.9
@@ -104,6 +108,8 @@ def _chooser_with_workload(server_workloads: dict[int, int], decoder_avgs: dict[
         t: 1 for t in targets if t[len("P: "):] in busy
     }
     c._ensure_redis = lambda: None
+    groups = {"g1", "g2"} if shared_groups is None else shared_groups
+    c._shared_pool_groups = lambda: set(groups)
     if decoder_avgs is not None:
         c._cluster_decoder_avgs = staticmethod(lambda: decoder_avgs)
     return c
