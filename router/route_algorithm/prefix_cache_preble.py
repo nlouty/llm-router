@@ -34,8 +34,10 @@ class _PrefixMatch:
     server_match_ratios: dict[int, float] = field(default_factory=dict)
     server_match_request_ids: dict[int, Any] = field(default_factory=dict)
     # Cluster-scoped view (issue #276): group_id -> max member ratio among
-    # prefiller-role servers with a non-empty group_id (they share one
-    # kv-cache pool; any member can pull the KV via RDMA).
+    # prefiller-role servers of SHARED-pool groups (the p/n split is deployed
+    # in the group, so members transfer KV among themselves via RDMA).
+    # Groups without a prefix-prefiller have no intra-cluster KV transfer
+    # and never appear here: their members are standalone scopes.
     cluster_ratios: dict[str, float] = field(default_factory=dict)
     # group_id -> rid of the member entry that produced cluster_ratios' max
     # (issue #346): the request whose cached prefix the scope ratio refers to.
@@ -132,9 +134,12 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             self._clear_prefix_context(context)
             return self._choose_new(available)
 
-        match = self._probe_prefix_matches(model_key, prefix_data, request_chars, available_by_id)
+        shared_groups = self._scope_shared_groups(available)
+        match = self._probe_prefix_matches(
+            model_key, prefix_data, request_chars, available_by_id, shared_groups
+        )
         self._log_prefix_matches(model_key, available, match)
-        selected = self._choose_from_prefix_match(available, match)
+        selected = self._choose_from_prefix_match(available, match, shared_groups)
         self._apply_selected_prefix_context(context, selected, match)
 
         if context.request_id:
@@ -212,6 +217,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         prefix_data: list[tuple[str, int]],
         request_chars: str,
         available_by_id: dict[int, Any],
+        shared_groups: set[str],
     ) -> _PrefixMatch:
         """Find each available server's longest cached prefix via binary search.
 
@@ -274,7 +280,11 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             server = available_by_id.get(server_id)
             if server is None:
                 continue
-            if is_prefiller_role(getattr(server, "role", None)) and server.group_id:
+            if (
+                is_prefiller_role(getattr(server, "role", None))
+                and server.group_id
+                and server.group_id in shared_groups
+            ):
                 group = server.group_id
                 if match_ratio > match.cluster_ratios.get(group, 0.0):
                     match.cluster_ratios[group] = match_ratio
@@ -323,15 +333,20 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 server.id, server.base_url, ratio,
             )
 
-    def _choose_from_prefix_match(self, available: Sequence[Any], match: _PrefixMatch):
+    def _choose_from_prefix_match(
+        self, available: Sequence[Any], match: _PrefixMatch, shared_groups: set[str]
+    ):
         """Cluster-scoped selection (issue #276).
 
-        Scopes are prefiller clusters (group_id -> max member ratio; the
-        cluster's servers share one kv-cache pool) and standalone servers
-        (mixed servers and blank-group prefillers, which keep server-based
-        semantics). The best cluster ratio is compared against the best
-        standalone ratio; the higher scope wins. Within a winning cluster the
-        request class decides placement:
+        Scopes are shared-pool prefiller clusters (group_id -> max member
+        ratio; the cluster's servers transfer KV among themselves, so any
+        member can serve a cached/partial request via RDMA) and standalone
+        servers (mixed servers, blank-group prefillers, and prefillers of
+        groups without the p/n split — those clusters have no intra-cluster
+        KV transfer, so each member only reuses its own DRAM). The best
+        cluster ratio is compared against the best standalone ratio; the
+        higher scope wins. Within a winning cluster the request class decides
+        placement:
 
         - cached  (ratio > primary):   holders first, busy-holder switch to a
           same-cluster p-prefiller, cluster-first #247 escape. A busy holder
@@ -342,11 +357,19 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
           when the cluster is overloaded.
         - cold:                        strict n-prefiller isolation, globally.
         """
-        scope_group = self._winning_scope(available, match)
+        scope_group = self._winning_scope(available, match, shared_groups)
         if scope_group is not None:
-            return self._choose_within_cluster(available, match, scope_group)
-        if self._best_standalone_ratio(available, match) > self.secondary_match_threshold:
-            return self._choose_standalone(available, match)
+            return self._choose_within_cluster(available, match, scope_group, shared_groups)
+        if self._best_standalone_ratio(available, match, shared_groups) > self.secondary_match_threshold:
+            selected = self._choose_standalone(available, match)
+            if selected is not None and (
+                match.server_match_ratios.get(selected.id, 0.0)
+                > self.primary_match_threshold
+            ):
+                # Standalone scopes have no RDMA: the selected server itself
+                # holds the reused prefix in its own DRAM.
+                match.delivery = "local"
+            return selected
         return self._choose_new(available)
 
     @staticmethod
@@ -354,13 +377,47 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         return getattr(server, "role", "mixed") or "mixed"
 
     @staticmethod
-    def _is_cluster_prefiller(server: Any) -> bool:
-        """Prefiller-style server in a named cluster (shares the pool's KV)."""
-        return is_prefiller_role(getattr(server, "role", None)) and bool(
-            getattr(server, "group_id", None)
+    def _is_cluster_prefiller(server: Any, shared_groups: set[str]) -> bool:
+        """Prefiller-style server in a shared-pool cluster (issue #276).
+
+        Shared pool is a deployment property of the group, not of this
+        server: the group runs the p/n split (it has at least one
+        ``prefix-prefiller``), which is the signal that its prefillers
+        transfer KV among themselves. An all-``prefiller`` group has no
+        intra-cluster KV transfer, so its members are standalone scopes."""
+        return (
+            is_prefiller_role(getattr(server, "role", None))
+            and bool(getattr(server, "group_id", None))
+            and server.group_id in shared_groups
         )
 
-    def _winning_scope(self, available: Sequence[Any], match: _PrefixMatch) -> str | None:
+    def _scope_shared_groups(self, available: Sequence[Any]) -> set[str]:
+        """Shared-pool groups relevant to this selection. Skipped entirely
+        (no DB query) when no candidate is a grouped prefiller, so
+        single-node pools never pay for the lookup."""
+        if not any(
+            is_prefiller_role(getattr(server, "role", None))
+            and getattr(server, "group_id", None)
+            for server in available
+        ):
+            return set()
+        return self._shared_pool_groups()
+
+    def _shared_pool_groups(self) -> set[str]:
+        from router.repositories.servers import ServerRepository
+
+        try:
+            return ServerRepository.shared_pool_groups()
+        except Exception as e:
+            # Unknown composition must not assume RDMA: no shared pools means
+            # every prefiller keeps its own KV (per-server affinity), the
+            # safe degradation.
+            logger.error("[PrefixCachePreble] shared-pool lookup failed: %s", e)
+            return set()
+
+    def _winning_scope(
+        self, available: Sequence[Any], match: _PrefixMatch, shared_groups: set[str]
+    ) -> str | None:
         """group_id of the winning cluster, or None when standalone/cold wins.
 
         Ties prefer the cluster: its KV is pullable by any member via RDMA.
@@ -372,29 +429,36 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         best_ratio = max(match.cluster_ratios.values())
         if best_ratio <= self.secondary_match_threshold:
             return None
-        if self._best_standalone_ratio(available, match) > best_ratio:
+        if self._best_standalone_ratio(available, match, shared_groups) > best_ratio:
             return None
         return random.choice(
             [group for group, ratio in match.cluster_ratios.items() if ratio == best_ratio]
         )
 
-    def _best_standalone_ratio(self, available: Sequence[Any], match: _PrefixMatch) -> float:
+    def _best_standalone_ratio(
+        self, available: Sequence[Any], match: _PrefixMatch, shared_groups: set[str]
+    ) -> float:
         return max(
             (
                 match.server_match_ratios.get(server.id, 0.0)
                 for server in available
-                if not self._is_cluster_prefiller(server)
+                if not self._is_cluster_prefiller(server, shared_groups)
             ),
             default=0.0,
         )
 
     def _choose_within_cluster(
-        self, available: Sequence[Any], match: _PrefixMatch, scope_group: str
+        self,
+        available: Sequence[Any],
+        match: _PrefixMatch,
+        scope_group: str,
+        shared_groups: set[str],
     ):
         group_servers = [
             server
             for server in available
-            if self._is_cluster_prefiller(server) and server.group_id == scope_group
+            if self._is_cluster_prefiller(server, shared_groups)
+            and server.group_id == scope_group
         ]
         match.scope_ratio = match.cluster_ratios[scope_group]
         match.scope_request_id = match.cluster_request_ids.get(scope_group)
@@ -541,7 +605,10 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
 
     def _choose_standalone(self, available: Sequence[Any], match: _PrefixMatch):
         """Server-based selection for scopes without the cluster split (mixed
-        servers, blank-group prefillers): unchanged pre-#276 behavior."""
+        servers, blank-group prefillers, and prefillers of groups without the
+        p/n split — no intra-cluster KV transfer, so only the holder's own
+        DRAM can serve a cached/partial request): unchanged pre-#276
+        behavior."""
         cached_matches = match.cached_matches or [
             server for server in available
             if match.server_match_ratios.get(server.id, 0.0) > self.secondary_match_threshold

@@ -248,6 +248,86 @@ class TestOverloadEscapeCoversClusterPaths:
         assert selected.id == n1.id
 
 
+class TestNonSharedPoolCluster:
+    """Composition rule: a group without a prefix-prefiller has no
+    intra-cluster KV transfer, so its prefillers are standalone scopes.
+    Cached and partial requests must stick to the server that actually
+    holds the prefix — placing them on a sibling (the shared-pool RDMA
+    assumption) silently degenerates to a full re-prefill."""
+
+    def test_cached_holder_keeps_request_with_idle_sibling(self, mock_redis):
+        # The incident shape: conversation turn N prefilled on prefiller-3,
+        # turn N+1 arrives while it is busy and a sibling sits idle.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={}, shared_groups=set())
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1, weight=8)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0, weight=8)
+        _seed(chooser, holder, _cached_request_body())
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([holder, sibling], ctx, set())
+        assert selected.id == holder.id
+        assert ctx.prefix_cache > 0.9  # the holder's own entry
+
+    def test_busy_holder_with_new_prefill_stays(self, mock_redis):
+        # No p-prefiller to switch to, and switching would be wrong anyway:
+        # the sibling cannot pull the holder's KV.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, shared_groups=set(), new_prefill_targets={"http://n1"}
+        )
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1, weight=8)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0, weight=8)
+        _seed(chooser, holder, _cached_request_body())
+
+        selected = _choose(chooser, [holder, sibling], _cache_hit_body())
+        assert selected.id == holder.id
+
+    def test_partial_prefers_holder_over_idle_sibling(self, mock_redis):
+        # A partial prefix is only reusable on the holder itself; the
+        # shared-pool behavior (least-loaded in-cluster n-prefiller + RDMA
+        # pull) must not apply without the p/n split.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={}, shared_groups=set())
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=3, weight=8)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0, weight=8)
+        _seed(chooser, holder, _partial_request_body())
+
+        ctx = make_context(_partial_hit_body())
+        selected = chooser.choose([holder, sibling], ctx, set())
+        assert selected.id == holder.id
+        assert 0.5 < ctx.prefix_cache <= 0.9
+
+    def test_overloaded_holder_still_escapes(self, mock_redis):
+        # Standalone scopes keep the #247 gate: at/above weight and >2x the
+        # pool minimum, affinity sheds to global least-loaded.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={}, shared_groups=set())
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=10, weight=2)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0)
+        mixed = make_server(3, "http://m1", role="mixed", workload=0)
+        _seed(chooser, holder, _cached_request_body())
+
+        selected = _choose(chooser, [holder, sibling, mixed], _cache_hit_body())
+        assert selected.id in (sibling.id, mixed.id)
+
+    def test_split_cluster_keeps_shared_placement(self, mock_redis):
+        # Control: the same pool with the p/n split deployed (shared_groups
+        # contains g1) keeps the cluster-scoped placement — partial goes to
+        # the least-loaded in-cluster prefiller, KV pulled via RDMA.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload({}, decoder_avgs={}, shared_groups={"g1"})
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=3)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(3, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+        _seed(chooser, holder, _partial_request_body())
+
+        ctx = make_context(_partial_hit_body())
+        selected = chooser.choose([holder, sibling, p1], ctx, set())
+        assert selected.id == sibling.id
+        assert 0.5 < ctx.prefix_cache <= 0.9  # scope ratio, reused via RDMA
+
+
 class TestScopes:
     def test_argmax_cluster_wins(self, mock_redis):
         _, storage = mock_redis
@@ -273,13 +353,13 @@ class TestScopes:
             server_match_ratios={1: 0.6, 2: 0.7},
             cluster_ratios={"g1": 0.6},
         )
-        assert chooser._winning_scope(servers, match) is None  # mixed 0.7 wins
+        assert chooser._winning_scope(servers, match, {"g1"}) is None  # mixed 0.7 wins
 
         match = _PrefixMatch(
             server_match_ratios={1: 0.7, 2: 0.6},
             cluster_ratios={"g1": 0.7},
         )
-        assert chooser._winning_scope(servers, match) == "g1"  # cluster 0.7 wins
+        assert chooser._winning_scope(servers, match, {"g1"}) == "g1"  # cluster 0.7 wins
 
     def test_tied_clusters_win_randomly(self, monkeypatch):
         # Issue #318: two same-scale clusters with the same best ratio must
@@ -303,24 +383,32 @@ class TestScopes:
             "router.route_algorithm.prefix_cache_preble.random.choice", choose
         )
 
-        assert chooser._winning_scope(servers, match) == "g2"
+        assert chooser._winning_scope(servers, match, {"g1", "g2"}) == "g2"
         assert choices == [["g1", "g2"]]
 
     def test_mixed_group_id_is_not_a_cluster_member(self):
         # A mixed server with an accidentally set group_id is standalone.
         chooser = _chooser_with_workload({}, decoder_avgs={})
         mixed = make_server(1, "http://m1", role="mixed", group_id="g1")
-        assert not chooser._is_cluster_prefiller(mixed)
+        assert not chooser._is_cluster_prefiller(mixed, {"g1"})
         match = _PrefixMatch(
             server_match_ratios={1: 0.6, 2: 0.4},
             cluster_ratios={},  # only prefiller roles feed cluster_ratios
         )
-        assert chooser._winning_scope([mixed], match) is None
+        assert chooser._winning_scope([mixed], match, {"g1"}) is None
 
     def test_blank_group_prefiller_is_standalone(self):
         chooser = _chooser_with_workload({}, decoder_avgs={})
         blank = make_server(1, "http://p1", role="prefiller", group_id=None)
-        assert not chooser._is_cluster_prefiller(blank)
+        assert not chooser._is_cluster_prefiller(blank, {"g1"})
+
+    def test_prefiller_without_split_is_standalone(self):
+        # Composition rule: a group with no prefix-prefiller has no shared
+        # KV pool, so its members are standalone scopes even with group_id.
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1")
+        assert chooser._is_cluster_prefiller(n1, {"g1"})
+        assert not chooser._is_cluster_prefiller(n1, set())
 
 
 class TestStandalonePoolUnchanged:

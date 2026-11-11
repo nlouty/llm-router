@@ -322,6 +322,26 @@ class ServerRepository:
         return result
 
     @staticmethod
+    def shared_pool_groups() -> set[str]:
+        """group_ids whose prefillers share one KV pool (RDMA-transferable).
+
+        Composition rule: the p/n split (issue #276) is the deployment signal
+        that a cluster's prefillers transfer KV among themselves, so a group
+        is a shared pool iff it has at least one ``prefix-prefiller``.
+        Soft-deleted servers do not count; online/circuit state is ignored on
+        purpose, so a pool's scope cannot flip while a p-prefiller restarts.
+        An all-``prefiller`` group is NOT a shared pool: without the split
+        there is no intra-cluster KV transfer, and the chooser treats each
+        member as a standalone affinity scope.
+        """
+        return set(
+            Server.objects.filter(deleted_at__isnull=True, role="prefix-prefiller")
+            .exclude(group_id__isnull=True)
+            .exclude(group_id="")
+            .values_list("group_id", flat=True)
+        )
+
+    @staticmethod
     def cluster_decoder_avg_load(servers: list[Server]) -> dict[str, float]:
         """Per-cluster average decoder load.
 
