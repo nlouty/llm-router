@@ -33,7 +33,7 @@ def make_server(server_id, base_url, role="mixed", group_id=None, workload=0, we
     )
 
 
-def make_context(body: bytes, request_id: int = 1):
+def make_context(body: bytes, request_id: int = 1, estimate_tokens: int = 0):
     return ServerSelectionContext(
         request_id=request_id,
         ip_id=None,
@@ -43,6 +43,7 @@ def make_context(body: bytes, request_id: int = 1):
         method="POST",
         is_stream=False,
         body=body,
+        estimate_tokens=estimate_tokens,
     )
 
 
