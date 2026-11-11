@@ -66,12 +66,23 @@ class _PrefixMatch:
     # with it. None when the p-tier was not used.
     origin_server_id: int | None = None
     origin_prefix_len: int | None = None
+    # True when a small partial/cold request took the p-prefiller lane
+    # (PrefixCachePrebleServerChooser.SMALL_REQUEST_TOKEN_LIMIT) instead of
+    # its regular partial/cold placement.
+    small_request: bool = False
 
 
 class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     _redis_client: redis.Redis | None = None
     _client_lock = threading.Lock()
     _cache_key_namespace = "prefix_chars"
+
+    # Requests whose parse-time token estimate (requests.estimate_tokens /
+    # ServerSelectionContext.estimate_tokens) is below this limit share the
+    # prefix-prefiller tier with cached traffic: their prefill is short by
+    # construction, so they neither queue behind long new prefills on
+    # n-prefillers nor block cached traffic for long.
+    SMALL_REQUEST_TOKEN_LIMIT = 16 * 1024
 
     def __init__(
         self,
@@ -149,7 +160,9 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             model_key, prefix_data, request_chars, available_by_id, shared_groups
         )
         self._log_prefix_matches(model_key, available, match)
-        selected = self._choose_from_prefix_match(available, match, shared_groups)
+        selected = self._choose_from_prefix_match(
+            available, match, shared_groups, small=self._is_small_request(context)
+        )
         self._apply_selected_prefix_context(context, selected, match)
 
         if context.request_id:
@@ -170,6 +183,8 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                     reason = "rdma_switch"
                 elif match.delivery == "rdma":
                     reason = "rdma_pull"
+                elif match.small_request:
+                    reason = "small_request"
                 else:
                     reason = "least_loaded"
                 append_request_log(context.request_id, json.dumps({
@@ -347,7 +362,8 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             )
 
     def _choose_from_prefix_match(
-        self, available: Sequence[Any], match: _PrefixMatch, shared_groups: set[str]
+        self, available: Sequence[Any], match: _PrefixMatch, shared_groups: set[str],
+        small: bool = False,
     ):
         """Cluster-scoped selection (issue #276).
 
@@ -369,7 +385,17 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
           partial KV is pulled via RDMA instead of recomputed; #247 escape
           when the cluster is overloaded.
         - cold:                        strict n-prefiller isolation, globally.
+
+        Small partial/cold requests (``small=True``) first take the
+        p-prefiller lane (``_choose_small_p_tier``) so short prompts do not
+        queue behind long new prefills on n-prefillers; cached-class requests
+        keep holder-first placement, which is already the fastest path.
         """
+        if small and not self._is_cached_class(available, match, shared_groups):
+            selected = self._choose_small_p_tier(available)
+            if selected is not None:
+                match.small_request = True
+                return selected
         scope_group = self._winning_scope(available, match, shared_groups)
         if scope_group is not None:
             return self._choose_within_cluster(available, match, scope_group, shared_groups)
@@ -459,6 +485,45 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
             ),
             default=0.0,
         )
+
+    def _is_small_request(self, context: ServerSelectionContext) -> bool:
+        """True when the parse-time estimate is a known, small token count
+        (0 = uncountable/unknown body, never small — same convention as
+        AutoRouteAlgorithm.should_route_small_request)."""
+        estimate = int(getattr(context, "estimate_tokens", 0) or 0)
+        return 0 < estimate < self.SMALL_REQUEST_TOKEN_LIMIT
+
+    def _is_cached_class(
+        self, available: Sequence[Any], match: _PrefixMatch, shared_groups: set[str]
+    ) -> bool:
+        """True when any scope's best ratio exceeds the primary threshold:
+        holder-first placement (local DRAM) beats the small-request lane."""
+        best_cluster = max(match.cluster_ratios.values(), default=0.0)
+        return (
+            best_cluster > self.primary_match_threshold
+            or self._best_standalone_ratio(available, match, shared_groups)
+            > self.primary_match_threshold
+        )
+
+    def _choose_small_p_tier(self, available: Sequence[Any]):
+        """Least-loaded prefix-prefiller for a small partial/cold request.
+
+        Small requests (< SMALL_REQUEST_TOKEN_LIMIT estimated tokens) are
+        treated as cached-class traffic and placed on the p-tier so they do
+        not queue behind long new prefills on n-prefillers. Ranks on the
+        decode-floored effective view (candidates may span clusters) and
+        skips #247-overloaded members. Returns None when the tier is empty,
+        fully overloaded, or already attempted — callers then keep the
+        pre-existing partial/cold placement.
+        """
+        own_loads, effective_loads = self._load_views(available)
+        tier = [s for s in available if self._server_role(s) == "prefix-prefiller"]
+        while tier:
+            candidate = self._pick_least_loaded(tier, effective_loads)
+            if not self._is_overloaded(candidate, own_loads, effective_loads):
+                return candidate
+            tier = [s for s in tier if s is not candidate]
+        return None
 
     def _choose_within_cluster(
         self,
@@ -683,10 +748,12 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
     def _choose_new(self, available: Sequence[Any], load_counts: dict[int, float] | None = None):
         """Cold/new class: p-prefillers are reserved for prefix-cached traffic
         and never take new requests, even when all n-prefillers are busy and
-        the p-prefillers idle (issue #276). Everything else — n-prefillers and
-        mixed servers — competes on plain least-loaded. Also the escape target
-        for unclassifiable and overload paths, so a fresh prefill never lands
-        on a p-prefiller while a live prefiller exists."""
+        the p-prefillers idle (issue #276) — the only exception is the
+        small-request lane (SMALL_REQUEST_TOKEN_LIMIT), which routes short
+        prompts onto the p-tier before this runs. Everything else —
+        n-prefillers and mixed servers — competes on plain least-loaded. Also
+        the escape target for unclassifiable and overload paths, so a fresh
+        prefill never lands on a p-prefiller while a live prefiller exists."""
         if load_counts is None:
             load_counts = self._load_counts(available)
         non_p = [s for s in available if self._server_role(s) != "prefix-prefiller"]

@@ -25,6 +25,10 @@ class ServerSelectionContext:
     # by RequestParser and kept in sync with ``body`` by model resolution, so
     # downstream consumers avoid re-parsing the same bytes.
     body_data: dict | None = None
+    # Fast parse-time token estimate of the full body (ParsedRequest.
+    # estimated_full_body_tokens). 0 = unknown; drives the small-request
+    # p-prefiller lane in the prefix-cache chooser.
+    estimate_tokens: int = 0
     # Per-request cache of (body_bytes, prefix_text, prefix_hashes) computed by
     # the prefix-cache chooser so on_response reuses choose()'s hashing work.
     _prefix_cache_work: tuple | None = None

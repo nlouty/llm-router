@@ -444,6 +444,7 @@ class ProxyService:
             auto_model_selection=auto_model_selection,
             session=getattr(record, "session", None),
             body_data=getattr(parsed, "data", None),
+            estimate_tokens=int(getattr(parsed, "estimated_full_body_tokens", 0) or 0),
         )
 
     def _build_url(self, base_url: str, path: str, query_string: str) -> str:

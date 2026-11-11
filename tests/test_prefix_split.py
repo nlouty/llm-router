@@ -2,8 +2,8 @@
 
 Covers the cluster-scoped chooser: classification (cached / partial / cold),
 the busy-holder switch, role-aware #247 escape, strict p-isolation for new
-traffic, and the standalone (mixed / blank-group) path keeping pre-#276
-behavior.
+traffic (with the small-request lane exception), and the standalone (mixed /
+blank-group) path keeping pre-#276 behavior.
 
 Ratio construction: on_response() writes entries at every block boundary
 (multiples of prefix_block_chars=128) of the cached request's rendered text,
@@ -180,6 +180,125 @@ class TestColdClass:
 
         selected = _choose(chooser, [p1, p2], make_body("brand new request"))
         assert selected.id == p2.id
+
+
+class TestSmallRequestLane:
+    """Small requests (0 < estimate_tokens < SMALL_REQUEST_TOKEN_LIMIT) share
+    the p-prefiller tier with cached traffic: short prompts must not queue
+    behind long new prefills on n-prefillers. Cached-class requests keep
+    holder-first placement, and the lane yields to the pre-existing
+    partial/cold placement whenever no healthy p-prefiller exists."""
+
+    LIMIT = PrefixCachePrebleServerChooser.SMALL_REQUEST_TOKEN_LIMIT
+
+    def _choose_small(self, chooser, candidates, body, estimate, attempted=set()):
+        return chooser.choose(
+            candidates, make_context(body, estimate_tokens=estimate), attempted
+        )
+
+    def test_small_cold_takes_least_loaded_p(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=1)
+        p2 = make_server(3, "http://p2", role="prefix-prefiller", group_id="g2", workload=0)
+
+        selected = self._choose_small(
+            chooser, [n1, p1, p2], make_body("brand new request"), 8000
+        )
+        # Even an idle n-prefiller is bypassed: the lane is p-tier only.
+        assert selected.id == p2.id
+
+    def test_small_partial_takes_p_tier(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        holder = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=3)
+        sibling = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(3, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+        _seed(chooser, holder, _partial_request_body())
+
+        selected = self._choose_small(
+            chooser, [holder, sibling, p1], _partial_hit_body(), 8000
+        )
+        # Same shape as test_partial_targets_n_prefiller_in_argmax_cluster,
+        # but small: the p-tier lane wins over the in-cluster n-prefiller.
+        assert selected.id == p1.id
+
+    def test_small_cached_keeps_holder(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+        _seed(chooser, n1, _cached_request_body())
+
+        selected = self._choose_small(
+            chooser, [n1, p1], _cache_hit_body(), 8000
+        )
+        # Cached class keeps holder-first placement: local DRAM beats the lane.
+        assert selected.id == n1.id
+
+    def test_lane_ranks_p_on_decode_floor(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={"g1": 10.0})
+        p1 = make_server(1, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+        p2 = make_server(2, "http://p2", role="prefix-prefiller", group_id="g2", workload=0)
+
+        selected = self._choose_small(chooser, [p1, p2], make_body("cold"), 8000)
+        # g1's decode floor (10) makes its idle p the busier placement.
+        assert selected.id == p2.id
+
+    def test_overloaded_p_falls_back_to_new(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=5)
+
+        selected = self._choose_small(chooser, [n1, p1], make_body("cold"), 8000)
+        # p at 5x the pool minimum is #247-overloaded: the lane yields and the
+        # request keeps its regular cold placement.
+        assert selected.id == n1.id
+
+    def test_attempted_p_falls_back_to_new(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+
+        selected = self._choose_small(
+            chooser, [n1, p1], make_body("cold"), 8000, attempted={p1.id}
+        )
+        assert selected.id == n1.id
+
+    def test_no_p_tier_falls_back_to_new(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
+        m1 = make_server(2, "http://m1", role="mixed", workload=0)
+
+        selected = self._choose_small(chooser, [n1, m1], make_body("cold"), 8000)
+        assert selected.id == m1.id
+
+    def test_limit_is_exclusive(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+
+        selected = self._choose_small(chooser, [n1, p1], make_body("cold"), self.LIMIT)
+        assert selected.id == n1.id  # exactly at the limit: not small
+
+    def test_unknown_estimate_stays_off_p(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=5)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+
+        selected = self._choose_small(chooser, [n1, p1], make_body("cold"), 0)
+        assert selected.id == n1.id  # 0 = unknown: keep p reserved
+
+    def test_cold_placement_records_truthful_ratio(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0)
+
+        ctx = make_context(make_body("brand new request"), estimate_tokens=8000)
+        selected = chooser.choose([n1, p1], ctx, set())
+        assert selected.id == p1.id
+        # The lane changes placement, not the dispatch-time classification:
+        # prefix_cache stays the truthful match ratio (0 for a cold request).
+        assert ctx.prefix_cache == 0.0
+        assert ctx.last_match is None
 
 
 class TestOverloadEscapeCoversClusterPaths:
