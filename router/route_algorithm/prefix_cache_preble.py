@@ -42,6 +42,10 @@ class _PrefixMatch:
     # group_id -> rid of the member entry that produced cluster_ratios' max
     # (issue #346): the request whose cached prefix the scope ratio refers to.
     cluster_request_ids: dict[str, Any] = field(default_factory=dict)
+    # group_id -> id of the member entry that produced cluster_ratios' max:
+    # the server the last_match request ran on. Under per-pool kv caches its
+    # base_url anchors the p-prefiller tier's pool affinity.
+    cluster_server_ids: dict[str, int] = field(default_factory=dict)
     # Ratio of the winning scope. Set only for cluster paths: the KV the chosen
     # placement can actually reuse, including RDMA pulls. None keeps the
     # selected server's own ratio (standalone/cold paths, pre-#276 semantics,
@@ -56,6 +60,12 @@ class _PrefixMatch:
     # Server id a cached request was steered away from because that
     # n-prefiller had a new prefill in flight (busy-holder switch).
     switched_from: int | None = None
+    # Pool-affinity bookkeeping for a p-prefiller pick: the origin server
+    # (writer of the scope's argmax entry) whose base_url anchored the
+    # pick, and the base_url prefix length the chosen p-prefiller shares
+    # with it. None when the p-tier was not used.
+    origin_server_id: int | None = None
+    origin_prefix_len: int | None = None
 
 
 class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
@@ -171,6 +181,8 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                     "cluster_ratio": round(match.scope_ratio, 4) if match.scope_ratio is not None else None,
                     "delivery": match.delivery,
                     "switched_from": match.switched_from,
+                    "origin_server_id": match.origin_server_id,
+                    "origin_prefix_len": match.origin_prefix_len,
                     "reason": reason,
                     "role": getattr(selected, "role", "mixed") or "mixed",
                 }, ensure_ascii=False))
@@ -289,6 +301,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 if match_ratio > match.cluster_ratios.get(group, 0.0):
                     match.cluster_ratios[group] = match_ratio
                     match.cluster_request_ids[group] = entry.get("rid")
+                    match.cluster_server_ids[group] = server.id
             if match_ratio > self.primary_match_threshold:
                 match.cached_matches.append(server)
         return match
@@ -463,7 +476,8 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         match.scope_ratio = match.cluster_ratios[scope_group]
         match.scope_request_id = match.cluster_request_ids.get(scope_group)
         if match.scope_ratio > self.primary_match_threshold:
-            selected = self._choose_cached(available, match, group_servers)
+            origin = self._scope_origin_server(available, match, scope_group)
+            selected = self._choose_cached(available, match, group_servers, origin)
         else:
             selected = self._choose_partial(available, group_servers)
         if selected is None:
@@ -490,7 +504,11 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         return selected
 
     def _choose_cached(
-        self, available: Sequence[Any], match: _PrefixMatch, group_servers: list[Any]
+        self,
+        available: Sequence[Any],
+        match: _PrefixMatch,
+        group_servers: list[Any],
+        origin: Any | None,
     ):
         """Cached class: least-loaded holder (local DRAM). The busy-holder
         switch steers the request to a same-cluster p-prefiller (RDMA pull)
@@ -531,15 +549,20 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                         chosen.id,
                     )
                     return self._cached_escape(
-                        available, group_servers, own_loads, effective_loads
+                        available, group_servers, own_loads, effective_loads, origin, match
                     )
                 match.switched_from = chosen.id
                 logger.info(
                     "[PrefixCachePreble] holder server_id=%s has a new prefill "
-                    "in flight; switching to a same-cluster prefix-prefiller",
+                    "in flight; switching to a same-cluster prefix-prefiller "
+                    "sharing the longest base_url prefix with origin "
+                    "server_id=%s",
                     chosen.id,
+                    getattr(origin, "id", None),
                 )
-        return self._cached_escape(available, group_servers, own_loads, effective_loads)
+        return self._cached_escape(
+            available, group_servers, own_loads, effective_loads, origin, match
+        )
 
     def _cached_escape(
         self,
@@ -547,19 +570,37 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         group_servers: list[Any],
         own_loads: dict[int, float],
         effective_loads: dict[int, float],
+        origin: Any | None,
+        match: _PrefixMatch,
     ):
         """#247 escape for the cached class, cluster-first: same-cluster
         p-prefillers, then same-cluster n-prefillers, then non-p servers
         globally — a fresh prefill never lands on a p-prefiller while a live
-        prefiller exists (issue #276). Tiers rank on the prefill-side own
-        load view (issue #339): the shared decode floor would flatten them
-        into a tie that can land back on the busy holder."""
+        prefiller exists (issue #276). The p-tier ranks by kv-pool affinity:
+        the longest base_url prefix shared with the origin (the writer of
+        the scope's argmax entry — kv pools can be finer than the cluster,
+        e.g. per-host pools, so only a p-prefiller in the origin's pool can
+        pull its cached blocks), least-loaded among equal-prefix ties.
+        Tiers rank on the prefill-side own load view (issue #339): the
+        shared decode floor would flatten them into a tie that can land
+        back on the busy holder."""
         for role in ("prefix-prefiller", "prefiller"):
             tier = [s for s in group_servers if self._server_role(s) == role]
-            candidate = self._pick_least_loaded(tier, own_loads) if tier else None
+            if not tier:
+                continue
+            if role == "prefix-prefiller":
+                candidate = self._pick_pool_affine(tier, origin, own_loads)
+            else:
+                candidate = self._pick_least_loaded(tier, own_loads)
             if candidate is not None and not self._is_overloaded(
                 candidate, own_loads, effective_loads
             ):
+                if role == "prefix-prefiller" and origin is not None:
+                    match.origin_server_id = origin.id
+                    match.origin_prefix_len = self._common_prefix_len(
+                        getattr(origin, "base_url", "") or "",
+                        getattr(candidate, "base_url", "") or "",
+                    )
                 return candidate
         logger.info(
             "[PrefixCachePreble] cached cluster exhausted; falling back to "
@@ -568,6 +609,56 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         # Global fallback re-ranks on the decode-floored view (#331): a
         # decode-saturated cluster must not look idle against other scopes.
         return self._choose_new(available, effective_loads)
+
+    @staticmethod
+    def _scope_origin_server(
+        available: Sequence[Any], match: _PrefixMatch, scope_group: str
+    ) -> Any | None:
+        """Server that wrote the winning scope's argmax cache entry: the
+        request recorded as last_match ran on it, so when kv pools are
+        finer than the cluster (e.g. per-host pools) its base_url anchors
+        the p-prefiller tier's pool affinity."""
+        origin_id = match.cluster_server_ids.get(scope_group)
+        if origin_id is None:
+            return None
+        return next((server for server in available if server.id == origin_id), None)
+
+    @staticmethod
+    def _common_prefix_len(a: str, b: str) -> int:
+        """Character length of the longest common prefix of two strings."""
+        length = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                break
+            length += 1
+        return length
+
+    def _pick_pool_affine(
+        self,
+        tier: Sequence[Any],
+        origin: Any | None,
+        load_counts: dict[int, float],
+    ) -> Any | None:
+        """Least-loaded member of the p-tier sharing the longest base_url
+        prefix with the origin server. Equal-prefix ties fall back to plain
+        least-loaded, as does a missing origin (or a blank base_url) — the
+        pre-existing cluster-wide behavior."""
+        if not tier or origin is None:
+            return self._pick_least_loaded(tier, load_counts)
+        origin_url = getattr(origin, "base_url", "") or ""
+        if not origin_url:
+            return self._pick_least_loaded(tier, load_counts)
+        prefix_lens = {
+            server.id: self._common_prefix_len(
+                origin_url, getattr(server, "base_url", "") or ""
+            )
+            for server in tier
+        }
+        best_len = max(prefix_lens.values())
+        return self._pick_least_loaded(
+            [server for server in tier if prefix_lens[server.id] == best_len],
+            load_counts,
+        )
 
     def _choose_partial(self, available: Sequence[Any], group_servers: list[Any]):
         """Partial class (secondary < ratio <= primary): new-style placement,

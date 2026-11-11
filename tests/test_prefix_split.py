@@ -541,3 +541,103 @@ class TestRecordedPairCoherence:
         assert selected.id == sibling.id
         assert 0.5 < ctx.prefix_cache <= 0.9
         assert ctx.last_match == 7
+
+
+class TestPPrefillerPoolAffinity:
+    """The p-prefiller tier of the cached-class escape ranks by kv-pool
+    affinity, not plain least-loaded: kv pools can be finer than the
+    group (e.g. one pool per host — ``http://aaa:10x0/v1`` share one,
+    ``http://bbb:10x0/v1`` another), so the switch target must be the
+    p-prefiller sharing the longest base_url prefix with the origin (the
+    writer of the scope's argmax entry), least-loaded among ties.
+
+    Weights: p-prefillers get weight 10 so a nonzero workload stays below
+    the #247 overload gate (the docs' advice for p-prefillers).
+    """
+
+    def test_busy_holder_switches_to_same_pool_p(self, mock_redis):
+        # aaa holder busy; idle bbb p must lose to the loaded aaa p.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://aaa:1030/v1"}
+        )
+        n1 = make_server(1, "http://aaa:1030/v1", role="prefiller", group_id="g1", workload=1)
+        p_aaa = make_server(2, "http://aaa:1010/v1", role="prefix-prefiller", group_id="g1", workload=2, weight=10)
+        p_bbb = make_server(3, "http://bbb:1010/v1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(chooser, n1, _cached_request_body())
+
+        selected = _choose(chooser, [n1, p_aaa, p_bbb], _cache_hit_body())
+        assert selected.id == p_aaa.id  # shares "http://aaa:10"; p_bbb only "http://"
+
+    def test_equal_prefix_tie_breaks_on_load(self, mock_redis):
+        # Both aaa p's share 13 chars with the origin; the lighter one wins,
+        # and the prefix rule still overrides the globally idle bbb p.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://aaa:1030/v1"}
+        )
+        n1 = make_server(1, "http://aaa:1030/v1", role="prefiller", group_id="g1", workload=1, weight=10)
+        p_aaa1 = make_server(2, "http://aaa:1010/v1", role="prefix-prefiller", group_id="g1", workload=3, weight=10)
+        p_aaa2 = make_server(3, "http://aaa:1020/v1", role="prefix-prefiller", group_id="g1", workload=1, weight=10)
+        p_bbb = make_server(4, "http://bbb:1010/v1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(chooser, n1, _cached_request_body())
+
+        selected = _choose(chooser, [n1, p_aaa1, p_aaa2, p_bbb], _cache_hit_body())
+        assert selected.id == p_aaa2.id
+
+    def test_overloaded_same_pool_p_falls_to_n_tier(self, mock_redis):
+        # The affinity pick is still gated by #247: an overloaded aaa p is
+        # skipped and the ladder continues to the same-cluster n-prefillers.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://aaa:1030/v1"}
+        )
+        n1 = make_server(1, "http://aaa:1030/v1", role="prefiller", group_id="g1", workload=5, weight=10)
+        p_aaa = make_server(2, "http://aaa:1010/v1", role="prefix-prefiller", group_id="g1", workload=20)
+        n2 = make_server(3, "http://aaa:1040/v1", role="prefiller", group_id="g1", workload=0)
+        _seed(chooser, n1, _cached_request_body())
+
+        selected = _choose(chooser, [n1, p_aaa, n2], _cache_hit_body())
+        assert selected.id == n2.id
+
+    def test_origin_host_without_p_degrades_to_least_loaded(self, mock_redis):
+        # Confirmed fallback: when no p shares a longer prefix (origin on a
+        # host without p-prefillers), the p-tier keeps its plain
+        # least-loaded cluster behavior.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://ccc:1030/v1"}
+        )
+        n1 = make_server(1, "http://ccc:1030/v1", role="prefiller", group_id="g1", workload=1)
+        p_aaa = make_server(2, "http://aaa:1010/v1", role="prefix-prefiller", group_id="g1", workload=1, weight=10)
+        p_bbb = make_server(3, "http://bbb:1010/v1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(chooser, n1, _cached_request_body())
+
+        selected = _choose(chooser, [n1, p_aaa, p_bbb], _cache_hit_body())
+        # Both p's tie at "http://": least loaded wins.
+        assert selected.id == p_bbb.id
+
+    def test_origin_is_argmax_entry_writer_not_busy_holder(self, mock_redis):
+        # Two holders, both cached-class: aaa holds the longer prefix (the
+        # argmax entry, rid 100), the lighter bbb holder is the one busy
+        # with a new prefill. Affinity must anchor on the argmax writer
+        # (last_match's server), so the switch goes to the aaa p — not to
+        # the busy holder's own pool.
+        _, storage = mock_redis
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://bbb:1030/v1"}
+        )
+        n_aaa = make_server(1, "http://aaa:1030/v1", role="prefiller", group_id="g1", workload=1)
+        n_bbb = make_server(2, "http://bbb:1030/v1", role="prefiller", group_id="g1", workload=0)
+        p_aaa = make_server(3, "http://aaa:1010/v1", role="prefix-prefiller", group_id="g1", workload=2, weight=10)
+        p_bbb = make_server(4, "http://bbb:1010/v1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        # Rendered text is "user: " + content: aaa caches 1408 chars
+        # (1408/1415 ~ 0.995), bbb 1280 (1280/1415 ~ 0.90) — both holders.
+        _seed(chooser, n_aaa, make_body("x" * 1408), request_id=100)
+        _seed(chooser, n_bbb, make_body("x" * 1280), request_id=200)
+
+        ctx = make_context(make_body("x" * 1408 + "y"))
+        selected = chooser.choose([n_aaa, n_bbb, p_aaa, p_bbb], ctx, set())
+        assert selected.id == p_aaa.id
+        assert ctx.prefix_cache > 0.99  # the argmax entry is aaa's
+        assert ctx.last_match == 100
