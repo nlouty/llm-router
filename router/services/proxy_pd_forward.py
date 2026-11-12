@@ -234,9 +234,15 @@ class PDForwardService:
         self.stream_total_timeout = proxy.stream_total_timeout
         pd_config = APP_CONFIG.get("pd", {})
         self.recompute_max = int(pd_config.get("recompute_max", 3))
+        # No prefill read timeout (issue #323): a fixed cap killed requests
+        # that were merely queued long — e.g. a crashed prefiller's whole
+        # intake storming a healthy 0-prefix-cache prefiller. Prefill waits
+        # as long as the prefiller needs; the connect timeout still applies
+        # (connection failures feed the retry policy), and the llm-choosing
+        # deadline still clamps internal routing calls via _deadline_timeout.
         self.prefill_timeout = (
             float(pd_config.get("prefill_connect_timeout_seconds", 5)),
-            float(pd_config.get("prefill_read_timeout_seconds", 300)),
+            None,
         )
 
     # ------------------------------------------------------------------

@@ -58,7 +58,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pd": {
         "recompute_max": 3,
         "prefill_connect_timeout_seconds": 5,
-        "prefill_read_timeout_seconds": 300,
     },
     "opencode": {
         "enabled": True,

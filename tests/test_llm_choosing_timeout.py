@@ -155,7 +155,7 @@ def test_llm_choosing_clamps_pd_prefill_and_decode_timeouts_to_budget(monkeypatc
     assert model == target_model
     assert router_result == "complexity:5"
     # Both PD phases (prefill then decode) are clamped to the remaining
-    # choosing budget instead of prefill (5, 300) / normal (5, 3660).
+    # choosing budget instead of prefill (5, None) / normal (5, 3660).
     assert len(timeouts) == 2
     for connect_timeout, read_timeout in timeouts:
         assert 0 < read_timeout <= 2
