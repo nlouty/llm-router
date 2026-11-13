@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 from django.test import Client
 
 from router.models import Model, RequestRecord, Server
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 
 
 OVERFLOW_BODY = json.dumps({
@@ -108,7 +109,7 @@ def test_pd_prefill_overflow_retries_on_larger_window_prefiller(monkeypatch):
 
     contacted = []
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         contacted.append(url)
         if "p1.example" in url:
             return _overflow_response()
@@ -117,7 +118,7 @@ def test_pd_prefill_overflow_retries_on_larger_window_prefiller(monkeypatch):
         assert "d2.example" in url
         return _decode_ok_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     client = Client()
     response = client.post(
@@ -151,11 +152,11 @@ def test_pd_prefill_overflow_without_larger_prefiller_returns_real_body(monkeypa
 
     contacted = []
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         contacted.append(url)
         return _overflow_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     client = Client()
     response = client.post(
@@ -182,14 +183,14 @@ def test_pd_prefill_non_overflow_400_is_terminal_and_counts_failure(monkeypatch)
         "error": {"message": "unsupported parameter", "type": "invalid_request_error"}
     }).encode("utf-8")
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         resp = MagicMock()
         resp.status_code = 400
         resp.reason = "Bad Request"
         resp.content = body
         return resp
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     client = Client()
     response = client.post(
@@ -220,15 +221,12 @@ def test_pd_prefill_overflow_stream_retries_before_any_client_bytes(monkeypatch)
         b'data: [DONE]\n\n'
     )
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         contacted.append(url)
         if "p1.example" in url:
             return _overflow_response()
-        assert "p2.example" in url
-        return _prefill_ok_response()
-
-    def fake_stream_request(method, url, headers=None, data=None, stream=True, timeout=None):
-        contacted.append(url)
+        if "p2.example" in url:
+            return _prefill_ok_response()
         assert "d2.example" in url
         resp = MagicMock()
         resp.status_code = 200
@@ -237,8 +235,7 @@ def test_pd_prefill_overflow_stream_retries_before_any_client_bytes(monkeypatch)
         resp.close = lambda: None
         return resp
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", fake_stream_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     client = Client()
     response = client.post(

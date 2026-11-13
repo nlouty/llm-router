@@ -11,6 +11,7 @@ from router.models import Model, RequestRecord, Server
 from router.repositories.requests import RequestRepository
 from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.proxy import ProxyService
 
 
@@ -134,13 +135,13 @@ def test_workload_decremented_after_stream_error_response(monkeypatch):
 
     service = ProxyService(chooser=_ChooserOnce(server))
 
-    def fake_request(method, url, **kwargs):
+    def fake_request(self, method, url, **kwargs):
         server.refresh_from_db()
         assert server.workload == 1
         upstream = _make_upstream(400, b'{"error": {"message": "bad"}}')
         return upstream
 
-    monkeypatch.setattr("router.services.proxy.requests.request", fake_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     django_request = MagicMock()
     django_request.method = "POST"
@@ -163,7 +164,7 @@ def test_workload_kept_until_stream_generator_completes(monkeypatch):
 
     chunks = [b"data: hello\n\n", b"data: [DONE]\n\n"]
 
-    def fake_request(method, url, **kwargs):
+    def fake_request(self, method, url, **kwargs):
         upstream = MagicMock()
         upstream.status_code = 200
         upstream.reason = "OK"
@@ -171,7 +172,7 @@ def test_workload_kept_until_stream_generator_completes(monkeypatch):
         upstream.iter_content = lambda chunk_size=8192: iter(chunks)
         return upstream
 
-    monkeypatch.setattr("router.services.proxy.requests.request", fake_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     django_request = MagicMock()
     django_request.method = "POST"

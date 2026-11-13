@@ -3,6 +3,7 @@ from django.utils import timezone
 from router.models import Model, RequestRecord, Server
 from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
+from router.services.disconnect import DisconnectScope
 from router.services.proxy import _RetryState
 
 
@@ -237,7 +238,7 @@ class TestDecoderCircuitRecovery:
 
         monkeypatch.setattr(fake_cb, "record_success", fake_record_success)
 
-        def fake_post_decode(d, url, h, b):
+        def fake_post_decode(d, url, h, b, disconnect_scope):
             fake_response = type("R", (), {"reason": "OK", "headers": {}})()
             content = b'{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}'
             return fake_response, content, 200
@@ -251,7 +252,7 @@ class TestDecoderCircuitRecovery:
                 path="chat/completions", method="POST", is_stream=False, body=b"{}",
             ),
             False, None,
-            _RetryState(), prefiller, {}, 1, 0, "P: x", None,
+            _RetryState(), prefiller, {}, 1, 0, "P: x", None, DisconnectScope(),
         )
 
         assert result.response is not None  # terminal success, not a retry

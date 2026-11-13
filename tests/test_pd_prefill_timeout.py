@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from router.services.cancellable_upstream import CancellableUpstreamRequest
+from router.services.disconnect import DisconnectScope
 from router.services.proxy import ProxyService
 from router.services.proxy_pd_forward import PDForwardService
 
@@ -36,11 +38,11 @@ def _prefill_response():
 def test_prefill_read_timeout_is_unbounded(monkeypatch):
     captured = {}
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         captured["timeout"] = timeout
         return _prefill_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     proxy = MagicMock()
     proxy._deadline_timeout = ProxyService._deadline_timeout
@@ -53,7 +55,8 @@ def test_prefill_read_timeout_is_unbounded(monkeypatch):
         "http://p.example/v1/chat/completions",
         {},
         b"{}",
+        DisconnectScope(),
     )
-    # requests.post received the unbounded (connect, None) read timeout, so a
-    # long-queued prefill can no longer die with a synthetic ReadTimeout.
+    # The prefill send carries the unbounded (connect, None) read timeout, so
+    # a long-queued prefill can no longer die with a synthetic ReadTimeout.
     assert captured["timeout"] == (service.prefill_timeout[0], None)

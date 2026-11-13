@@ -4,7 +4,6 @@ import importlib
 import json
 import logging
 import random
-import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -32,9 +31,8 @@ from router.repositories.requests import (
     RequestRepository,
 )
 from router.repositories.servers import ServerRepository
-from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.circuit_breaker import CircuitBreakerService
-from router.services.disconnect import DisconnectWatcher
+from router.services.disconnect import DisconnectScope
 from router.services.external_route import ExternalRouteService
 from router.services.opencode import OpencodeVersionService
 from router.services.parser import ParsedRequest, RequestParser
@@ -52,14 +50,6 @@ from router.utils.target import server_target
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _DisconnectScope:
-    disconnect_event: threading.Event
-    stop_event: threading.Event
-    upstream_client: CancellableUpstreamRequest | None = None
-    watcher: DisconnectWatcher | None = None
 
 
 @dataclass
@@ -521,7 +511,11 @@ class ProxyService:
         )
 
     def _route_with_retry(self, django_request, path, headers, body, record, user_agent, candidates, context, served_as_vip, model, is_stream):
-        disconnect_scope = self._open_disconnect_scope(django_request, is_stream)
+        disconnect_scope = self._open_disconnect_scope(django_request)
+        # Streaming responses hand the scope to their SSE generator, which
+        # closes it in its finally after the last chunk; eager responses are
+        # closed in this method's finally below.
+        streaming_response = False
         state = _RetryState()
         set_request_id(record.id)
         try:
@@ -553,6 +547,11 @@ class ProxyService:
                 budget = self.stream_total_timeout if is_stream else self.normal_timeout[1]
                 deadline = request_started + budget
             while state.attempts < self.max_attempts_per_request:
+                if disconnect_scope.disconnect_event.is_set():
+                    # The client is gone: nothing this loop can produce will
+                    # be delivered. Finish as 499 instead of burning more
+                    # attempts (issue #323).
+                    return self._client_closed_response(record, served_as_vip, model)
                 if llm_choosing_deadline is not None and time.monotonic() >= deadline:
                     state.last_status = 504
                     state.last_reason = "Gateway Timeout"
@@ -615,6 +614,8 @@ class ProxyService:
                     )
 
                 if result.response is not None:
+                    if isinstance(result.response, StreamingHttpResponse):
+                        streaming_response = True
                     return result.response
                 candidates = result.candidates if result.candidates is not None else candidates
                 model = result.model if result.model is not None else model
@@ -636,35 +637,22 @@ class ProxyService:
 
             return self._retry_failure_response(record, state, served_as_vip, model, user_agent, context)
         finally:
-            self._close_disconnect_scope(disconnect_scope)
+            if not streaming_response:
+                disconnect_scope.close()
             flush_request_log(record.id)
             clear_request_id()
 
-    def _open_disconnect_scope(self, django_request, is_stream: bool) -> _DisconnectScope:
-        scope = _DisconnectScope(threading.Event(), threading.Event())
-        if is_stream:
-            return scope
-
-        scope.upstream_client = CancellableUpstreamRequest()
-        tracker = getattr(django_request, "client_disconnect_tracker", None)
-        if tracker:
-            scope.watcher = DisconnectWatcher(
-                tracker,
-                scope.disconnect_event,
-                scope.stop_event,
-                scope.upstream_client.cancel,
-                self.client_disconnect_check_interval,
-            )
-            scope.watcher.start()
-        return scope
-
-    @staticmethod
-    def _close_disconnect_scope(scope: _DisconnectScope) -> None:
-        scope.stop_event.set()
-        if scope.upstream_client:
-            scope.upstream_client.close()
-        if scope.watcher:
-            scope.watcher.join(timeout=0.1)
+    def _open_disconnect_scope(self, django_request) -> DisconnectScope:
+        # Issue #323: streams get the cancellable client + watcher too — a
+        # client that cancels must abort the in-flight upstream request in
+        # every phase (single-node send, PD prefill, PD decode), including
+        # while the SSE generator blocks on a silent upstream between chunks.
+        # Requests without a tracker (internal llm-choosing calls) get the
+        # client but no watcher.
+        return DisconnectScope(
+            getattr(django_request, "client_disconnect_tracker", None),
+            self.client_disconnect_check_interval,
+        )
 
     def _route_single_attempt(
         self,
@@ -833,6 +821,7 @@ class ProxyService:
             context,
             served_as_vip,
             model,
+            disconnect_scope,
         )
         return _RouteAttemptResult(response=response)
 
@@ -1128,18 +1117,19 @@ class ProxyService:
             timeout=self._deadline_timeout(self.normal_timeout),
         )
 
-    def _handle_stream(self, django_request, server, upstream_url, headers, body):
+    def _handle_stream(self, django_request, server, upstream_url, headers, body, upstream_client):
+        # Issue #323: through the cancellable client so the disconnect
+        # watcher can abort an in-flight stream (e.g. silent long TTFT).
         req_headers = build_upstream_headers(headers, server)
-        return requests.request(
+        return upstream_client.request(
             django_request.method,
             upstream_url,
             headers=req_headers,
             data=body,
-            stream=True,
             timeout=self.stream_timeout,
         )
 
-    def _stream_success(self, django_request, upstream, record, server, model_name, status_code, reason, target_pod_ip, attempts, context, served_as_vip, model):
+    def _stream_success(self, django_request, upstream, record, server, model_name, status_code, reason, target_pod_ip, attempts, context, served_as_vip, model, disconnect_scope):
         request_start = time.monotonic()
 
         def generate():
@@ -1195,6 +1185,13 @@ class ProxyService:
                     ttft,
                 )
             except requests.exceptions.ReadTimeout:
+                if disconnect_scope.disconnect_event.is_set():
+                    # The watcher aborted the upstream after the client
+                    # cancelled — not an upstream failure (issue #323).
+                    proxy_response.finish_stream_client_disconnected(
+                        record, target_pod_ip, attempts,
+                    )
+                    return
                 proxy_logging.log_request_context_for(context)
                 self._mark_unhealthy(server)
                 yield timeout_sse_event()
@@ -1206,6 +1203,11 @@ class ProxyService:
                     context,
                 )
             except requests.RequestException:
+                if disconnect_scope.disconnect_event.is_set():
+                    proxy_response.finish_stream_client_disconnected(
+                        record, target_pod_ip, attempts,
+                    )
+                    return
                 proxy_logging.log_request_context_for(context)
                 message = "502 Bad Gateway"
                 payload = error_payload(message, "server_error")
@@ -1254,6 +1256,10 @@ class ProxyService:
                 except Exception:
                     pass
                 self._after_finish(served_as_vip, model)
+                # The generator owns the disconnect scope for streaming
+                # responses (issue #323): stop the watcher and release the
+                # cancellable client now that streaming has ended.
+                disconnect_scope.close()
                 flush_request_log(record.id)
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")
@@ -1385,5 +1391,5 @@ class ProxyService:
 
     def _perform_request(self, django_request, server, upstream_url, headers, body, is_stream, upstream_client):
         if is_stream:
-            return self._handle_stream(django_request, server, upstream_url, headers, body)
+            return self._handle_stream(django_request, server, upstream_url, headers, body, upstream_client)
         return self._handle_normal(django_request, server, upstream_url, headers, body, upstream_client)

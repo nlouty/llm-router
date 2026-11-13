@@ -25,6 +25,7 @@ from router.models import (
 )
 from router.repositories.external import ExternalRouteRepository
 from router.services.admission import AdmissionService
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.external_route import ExternalRouteService
 
 CLIENT_IP = "127.0.0.1"
@@ -540,14 +541,11 @@ class TestStreaming:
         ]
         calls = []
 
-        def fake_stream_request(method, url, **kwargs):
+        def fake_stream_request(self, method, url, **kwargs):
             calls.append({"method": method, "url": url, "kwargs": kwargs})
             return FakeUpstream(chunks=sse_chunks)
 
-        monkeypatch.setattr(
-            "router.services.external_proxy.requests.request",
-            fake_stream_request,
-        )
+        monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_stream_request)
 
         response = Client().post(
             "/v1/chat/completions",
@@ -588,8 +586,8 @@ class TestStreaming:
         upstream.iter_content = gen
 
         monkeypatch.setattr(
-            "router.services.external_proxy.requests.request",
-            lambda method, url, **kwargs: upstream,
+            CancellableUpstreamRequest, "request",
+            lambda self, method, url, **kwargs: upstream,
         )
 
         response = Client().post(
