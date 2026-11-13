@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import requests
 
 from router.models import Model, Server
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.proxy import ProxyService
 
 
@@ -64,8 +65,8 @@ def test_stream_workload_decrements_even_when_upstream_close_raises(monkeypatch)
         raise RuntimeError("close failed")
     upstream.close = boom
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
     response = service.forward(_django_request(), "chat/completions", parsed, None, None, None)
 
@@ -83,8 +84,8 @@ def test_stream_workload_decrements_when_client_disconnects_mid_stream(monkeypat
     upstream = _streaming_upstream(200)
     upstream.iter_content = gen
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
     response = service.forward(_django_request(), "chat/completions", parsed, None, None, None)
 
@@ -105,8 +106,8 @@ def test_stream_workload_decrements_on_read_timeout(monkeypatch):
     upstream = _streaming_upstream(200)
     upstream.iter_content = gen
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
     response = service.forward(_django_request(), "chat/completions", parsed, None, None, None)
 
@@ -129,8 +130,8 @@ def test_stream_error_path_close_raises_still_decrements(monkeypatch):
         raise RuntimeError("close failed")
     upstream.close = boom
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
     response = service.forward(_django_request(), "chat/completions", parsed, None, None, None)
     assert response.status_code == 500

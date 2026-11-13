@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 from router.models import Model, RequestRecord, Server
 from router.repositories.requests import LLM_CHOOSING_IP_ID
 from router.route_algorithm.base import ServerSelectionContext
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.proxy import ProxyService
 
 
@@ -66,7 +67,7 @@ def test_llm_choosing_via_pd_cluster_uses_two_phase_and_records_pd_target(monkey
         group_id="g1",
     )
 
-    def fake_pd_post(url, headers=None, data=None, timeout=None):
+    def fake_pd_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         body = json.loads(data)
         if "p.example" in url:
             # Phase 1: prefill-only, non-stream, max_tokens=1, remote decode.
@@ -103,9 +104,7 @@ def test_llm_choosing_via_pd_cluster_uses_two_phase_and_records_pd_target(monkey
         )
         return response
 
-    monkeypatch.setattr(
-        "router.services.proxy_pd_forward.requests.post", fake_pd_post
-    )
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_pd_request)
 
     service = ProxyService(_FirstChooser())
     body = b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
@@ -254,7 +253,7 @@ def test_llm_choosing_via_pd_cluster_with_prefix_prefiller(monkeypatch):
         group_id="g1",
     )
 
-    def fake_pd_post(url, headers=None, data=None, timeout=None):
+    def fake_pd_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         response = MagicMock()
         if "pp.example" in url:
             response.status_code = 200
@@ -282,9 +281,7 @@ def test_llm_choosing_via_pd_cluster_with_prefix_prefiller(monkeypatch):
         )
         return response
 
-    monkeypatch.setattr(
-        "router.services.proxy_pd_forward.requests.post", fake_pd_post
-    )
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_pd_request)
 
     service = ProxyService(_FirstChooser())
     body = b'{"model":"auto","messages":[{"role":"user","content":"hello"}]}'

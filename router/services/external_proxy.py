@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import time
 import traceback
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import requests
@@ -18,8 +16,7 @@ from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
 from router.route_algorithm.auto import AutoRouteAlgorithm
 from router.services import proxy_response
-from router.services.cancellable_upstream import CancellableUpstreamRequest
-from router.services.disconnect import DisconnectWatcher
+from router.services.disconnect import DisconnectScope
 from router.services.request_context import clear_request_id, set_request_id
 from router.services.request_logger import (
     append_request_log,
@@ -31,14 +28,6 @@ from router.utils.headers import build_upstream_headers, filter_request_headers
 from router.utils.session import extract_session_id
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _DisconnectScope:
-    disconnect_event: threading.Event
-    stop_event: threading.Event
-    upstream_client: CancellableUpstreamRequest | None = None
-    watcher: DisconnectWatcher | None = None
 
 
 class ExternalProxyService:
@@ -156,7 +145,11 @@ class ExternalProxyService:
         }, ensure_ascii=False))
 
         upstream_url = self._build_url(route.base_url, path, django_request.META.get("QUERY_STRING", ""))
-        disconnect_scope = self._open_disconnect_scope(django_request, bool(parsed.stream))
+        disconnect_scope = self._open_disconnect_scope(django_request)
+        # Streaming responses hand the scope to their SSE generator, which
+        # closes it in its finally after the last chunk; eager responses are
+        # closed in this method's finally below.
+        streaming_response = False
         try:
             upstream = self._perform_request(
                 django_request, route, upstream_url, headers, parsed.body,
@@ -177,7 +170,15 @@ class ExternalProxyService:
                     record, content, None, context, status_code, reason, target_pod_ip, 1
                 )
                 return proxy_response.response_from_upstream(upstream, content, status_code)
-            return self._stream_success(django_request, upstream, record, route, context, status_code, reason, target_pod_ip)
+            response = self._stream_success(
+                django_request, upstream, record, route, context, status_code, reason,
+                target_pod_ip, disconnect_scope,
+            )
+            # The generator owns the scope from here on; only mark ownership
+            # once it exists, so a raise in _stream_success still closes the
+            # scope in the finally below.
+            streaming_response = True
+            return response
         except requests.exceptions.ReadTimeout:
             if disconnect_scope.disconnect_event.is_set():
                 proxy_response.finish_client_closed(record)
@@ -203,7 +204,8 @@ class ExternalProxyService:
             proxy_response.finish_retry_failure(record, 502, fail_reason, target_pod_ip, 1, context)
             return error_response(502, "502 Bad Gateway", "server_error")
         finally:
-            self._close_disconnect_scope(disconnect_scope)
+            if not streaming_response:
+                disconnect_scope.close()
 
     def _upstream_error(self, upstream, record, route, context, status_code, reason, target_pod_ip, is_stream: bool):
         if is_stream:
@@ -235,7 +237,7 @@ class ExternalProxyService:
         }, ensure_ascii=False))
         return proxy_response.response_from_upstream(upstream, content, status_code)
 
-    def _stream_success(self, django_request, upstream, record, route, context, status_code, reason, target_pod_ip):
+    def _stream_success(self, django_request, upstream, record, route, context, status_code, reason, target_pod_ip, disconnect_scope):
         request_start = time.monotonic()
 
         def generate():
@@ -278,10 +280,18 @@ class ExternalProxyService:
                     record, status_code, reason, chunks, target_pod_ip, None, 1, context, ttft
                 )
             except requests.exceptions.ReadTimeout:
+                if disconnect_scope.disconnect_event.is_set():
+                    # The watcher aborted the upstream after the client
+                    # cancelled — not a provider failure (issue #323).
+                    proxy_response.finish_stream_client_disconnected(record, target_pod_ip, 1)
+                    return
                 self._record_failure(route)
                 yield timeout_sse_event()
                 proxy_response.finish_stream_read_timeout(record, target_pod_ip, 1, None, context)
             except requests.RequestException:
+                if disconnect_scope.disconnect_event.is_set():
+                    proxy_response.finish_stream_client_disconnected(record, target_pod_ip, 1)
+                    return
                 payload = error_payload("502 Bad Gateway", "server_error")
                 yield f"data: {json.dumps(payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                 self._record_failure(route)
@@ -305,6 +315,10 @@ class ExternalProxyService:
                     upstream.close()
                 except Exception:
                     pass
+                # The generator owns the disconnect scope for streaming
+                # responses (issue #323): stop the watcher and release the
+                # cancellable client now that streaming has ended.
+                disconnect_scope.close()
                 flush_request_log(record.id)
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")
@@ -316,47 +330,21 @@ class ExternalProxyService:
         # No csb_token on external routes; build_upstream_headers reads it via
         # getattr, so its absence simply means no injection.
         req_headers = build_upstream_headers(headers, SimpleNamespace(api_key=route.api_key))
-        if is_stream:
-            return requests.request(
-                django_request.method,
-                upstream_url,
-                headers=req_headers,
-                data=body,
-                stream=True,
-                timeout=self.stream_timeout,
-            )
+        # Issue #323: both phases through the cancellable client so a client
+        # cancel aborts the in-flight provider request, streams included.
         return upstream_client.request(
             django_request.method,
             upstream_url,
             headers=req_headers,
-            data=body if django_request.method.upper() not in {"GET", "HEAD"} else None,
-            timeout=self.normal_timeout,
+            data=body if is_stream or django_request.method.upper() not in {"GET", "HEAD"} else None,
+            timeout=self.stream_timeout if is_stream else self.normal_timeout,
         )
 
-    def _open_disconnect_scope(self, django_request, is_stream: bool) -> _DisconnectScope:
-        scope = _DisconnectScope(threading.Event(), threading.Event())
-        if is_stream:
-            return scope
-        scope.upstream_client = CancellableUpstreamRequest()
-        tracker = getattr(django_request, "client_disconnect_tracker", None)
-        if tracker:
-            scope.watcher = DisconnectWatcher(
-                tracker,
-                scope.disconnect_event,
-                scope.stop_event,
-                scope.upstream_client.cancel,
-                self.client_disconnect_check_interval,
-            )
-            scope.watcher.start()
-        return scope
-
-    @staticmethod
-    def _close_disconnect_scope(scope: _DisconnectScope) -> None:
-        scope.stop_event.set()
-        if scope.upstream_client:
-            scope.upstream_client.close()
-        if scope.watcher:
-            scope.watcher.join(timeout=0.1)
+    def _open_disconnect_scope(self, django_request) -> DisconnectScope:
+        return DisconnectScope(
+            getattr(django_request, "client_disconnect_tracker", None),
+            self.client_disconnect_check_interval,
+        )
 
     @staticmethod
     def _build_url(base_url: str, path: str, query_string: str) -> str:

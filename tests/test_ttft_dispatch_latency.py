@@ -23,6 +23,7 @@ import requests
 from django.test import Client
 
 from router.models import Model, RequestRecord, Server
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 
 
 def _disable_cmdb(monkeypatch):
@@ -168,14 +169,14 @@ def test_single_node_non_stream_records_dispatch_latency_without_ttft(monkeypatc
 def test_pd_non_stream_records_ttft_at_prefill_completion(monkeypatch):
     model = _seed_pd_cluster(monkeypatch)
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         if "ttft-p.example" in url:
             time.sleep(0.05)  # prefill work before the probe response
             return _prefill_ok_response()
         assert "ttft-d.example" in url
         return _decode_ok_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
@@ -204,12 +205,10 @@ def test_pd_stream_ttft_includes_prefill_phase(monkeypatch):
         b'data: [DONE]\n\n'
     )
 
-    def fake_post(url, headers=None, data=None, timeout=None):
-        assert "ttft-p.example" in url
-        time.sleep(0.05)  # prefill runs before any decode chunk exists
-        return _prefill_ok_response()
-
-    def fake_stream_request(method, url, headers=None, data=None, stream=True, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
+        if "ttft-p.example" in url:
+            time.sleep(0.05)  # prefill runs before any decode chunk exists
+            return _prefill_ok_response()
         assert "ttft-d.example" in url
         resp = MagicMock()
         resp.status_code = 200
@@ -218,8 +217,7 @@ def test_pd_stream_ttft_includes_prefill_phase(monkeypatch):
         resp.close = lambda: None
         return resp
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", fake_stream_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
@@ -321,12 +319,10 @@ def test_pd_stream_ttft_survives_mid_stream_failure(monkeypatch):
         b'"prompt_tokens_details":{"cached_tokens":0}}}\n\n'
     )
 
-    def fake_post(url, headers=None, data=None, timeout=None):
-        assert "ttft-p.example" in url
-        time.sleep(0.05)  # prefill runs before any decode chunk exists
-        return _prefill_ok_response()
-
-    def fake_stream_request(method, url, headers=None, data=None, stream=True, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
+        if "ttft-p.example" in url:
+            time.sleep(0.05)  # prefill runs before any decode chunk exists
+            return _prefill_ok_response()
         assert "ttft-d.example" in url
         resp = MagicMock()
         resp.status_code = 200
@@ -340,8 +336,7 @@ def test_pd_stream_ttft_survives_mid_stream_failure(monkeypatch):
         resp.close = lambda: None
         return resp
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", fake_stream_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
@@ -367,14 +362,14 @@ def test_pd_stream_ttft_survives_mid_stream_failure(monkeypatch):
 def test_pd_non_stream_ttft_survives_decode_failure(monkeypatch):
     model = _seed_pd_cluster(monkeypatch)
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         if "ttft-p.example" in url:
             time.sleep(0.05)  # prefill work before the probe response
             return _prefill_ok_response()
         assert "ttft-d.example" in url
         return _decode_error_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
