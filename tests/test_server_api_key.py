@@ -97,11 +97,11 @@ def test_stream_sends_server_api_key(monkeypatch):
 
     captured = {}
 
-    def fake_request(method, url, **kwargs):
+    def fake_request(self, method, url, **kwargs):
         captured["headers"] = kwargs.get("headers")
         return _streaming_upstream()
 
-    monkeypatch.setattr("router.services.proxy.requests.request", fake_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     service = ProxyService(chooser=_ChooserOnce(server))
     parsed = MagicMock(stream=True, body=b'{"model":"m","messages":[],"stream":true}', model_name="m", estimated_full_body_tokens=0)
@@ -113,6 +113,7 @@ def test_stream_sends_server_api_key(monkeypatch):
 
 def test_pd_sends_each_phase_its_own_server_api_key(monkeypatch):
     """Prefill and decode must each authenticate with their own server's key."""
+    from router.services.disconnect import DisconnectScope
     from router.services.proxy_pd_forward import PDForwardService
 
     prefiller = Server.objects.create(
@@ -124,7 +125,7 @@ def test_pd_sends_each_phase_its_own_server_api_key(monkeypatch):
 
     seen = {}
 
-    def fake_pd_post(url, headers=None, data=None, timeout=None):
+    def fake_pd_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         seen[url] = headers.get("Authorization")
         response = MagicMock()
         response.status_code = 200
@@ -133,13 +134,13 @@ def test_pd_sends_each_phase_its_own_server_api_key(monkeypatch):
         response.content = b"{}"
         return response
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_pd_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_pd_request)
 
     service = PDForwardService(MagicMock())
     client_headers = {"Authorization": "Bearer sk-user-key", "Content-Type": "application/json"}
     body = b'{"model":"m","messages":[{"role":"user","content":"hello"}]}'
-    service._do_prefill(prefiller, "http://p.example/chat/completions", client_headers, body)
-    service._post_decode(decoder, "http://d.example/chat/completions", client_headers, body)
+    service._do_prefill(prefiller, "http://p.example/chat/completions", client_headers, body, DisconnectScope())
+    service._post_decode(decoder, "http://d.example/chat/completions", client_headers, body, DisconnectScope())
 
     assert seen == {
         "http://p.example/chat/completions": "Bearer sk-prefill-secret",

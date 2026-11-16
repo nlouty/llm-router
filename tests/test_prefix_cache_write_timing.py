@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from router.models import Model, Server
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.proxy import ProxyService
 
 
@@ -88,7 +89,7 @@ def test_stream_prefix_cache_write_waits_for_response_close(monkeypatch):
     upstream.reason = "OK"
     upstream.headers = {}
     upstream.iter_content.return_value = iter([b"data: {}\n\n", b"data: [DONE]\n\n"])
-    monkeypatch.setattr("router.services.proxy.requests.request", lambda *a, **k: upstream)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", lambda *a, **k: upstream)
 
     service = ProxyService(chooser=spy)
 

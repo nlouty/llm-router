@@ -5,6 +5,8 @@ import socket
 import threading
 import time
 
+from router.services.cancellable_upstream import CancellableUpstreamRequest
+
 
 def _socket_readable(sock) -> bool:
     # select.select() raises "filedescriptor out of range in select()" once an
@@ -72,3 +74,42 @@ class DisconnectWatcher(threading.Thread):
                         pass
                 return
             time.sleep(self.interval)
+
+class DisconnectScope:
+    """Per-request disconnect detection + upstream cancellation (issue #323).
+
+    Bundles the client-disconnect event with a cancellable upstream client so
+    that a client cancelling mid-request (e.g. an opencode interrupt) aborts
+    the in-flight upstream request in EVERY phase — single-node send, PD
+    prefill, PD decode, and streaming, where the SSE generator can block for
+    minutes on a silent upstream with no chunk to run a per-chunk check on.
+
+    Eager (non-streaming) paths close the scope as soon as the response is
+    complete; streaming responses hand ownership to the SSE generator, which
+    closes it in its finally. close() is idempotent.
+    """
+
+    def __init__(self, tracker: ClientDisconnectTracker | None = None, check_interval: float = 0.5):
+        self.disconnect_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.upstream_client = CancellableUpstreamRequest()
+        self.watcher: DisconnectWatcher | None = None
+        if tracker is not None:
+            self.watcher = DisconnectWatcher(
+                tracker,
+                self.disconnect_event,
+                self.stop_event,
+                self.upstream_client.cancel,
+                check_interval,
+            )
+            self.watcher.start()
+
+    @property
+    def client_disconnected(self) -> bool:
+        return self.disconnect_event.is_set()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.upstream_client.close()
+        if self.watcher is not None:
+            self.watcher.join(timeout=0.1)

@@ -289,9 +289,13 @@ class PDForwardService:
             )
         try:
             prefill_json, prompt_tokens, cached_tokens = self._do_prefill(
-                prefiller, prefiller_url, headers, body
+                prefiller, prefiller_url, headers, body, disconnect_scope
             )
         except requests.exceptions.ReadTimeout:
+            if disconnect_scope.disconnect_event.is_set():
+                return _RouteAttemptResult(
+                    response=self._prefill_client_closed(record, prefiller, served_as_vip, model)
+                )
             logger.warning("PD prefill read timeout on %s", prefiller.base_url)
             record.task_status = "processing"
             record.save(update_fields=["task_status"])
@@ -307,6 +311,10 @@ class PDForwardService:
             state.last_reason = "Gateway Timeout"
             return _RouteAttemptResult()
         except requests.RequestException as exc:
+            if disconnect_scope.disconnect_event.is_set():
+                return _RouteAttemptResult(
+                    response=self._prefill_client_closed(record, prefiller, served_as_vip, model)
+                )
             is_connection = self.proxy._is_connection_failure(exc)
             logger.warning("PD prefill %s on %s: %s",
                            "connection error" if is_connection else "request error",
@@ -419,6 +427,14 @@ class PDForwardService:
         record.save(update_fields=update_fields)
         self._release_prefiller(prefiller)
 
+        # The client cancelled while the prefiller was working: no decode
+        # dispatch, finish as 499 (issue #323). The prefiller workload was
+        # released just above.
+        if disconnect_scope.disconnect_event.is_set():
+            return _RouteAttemptResult(
+                response=self.proxy._client_closed_response(record, served_as_vip, model)
+            )
+
         if is_stream:
             from router.services.proxy import _RouteAttemptResult
 
@@ -426,6 +442,7 @@ class PDForwardService:
                 response=self._stream_decode(
                     django_request, path, headers, body, record, context, served_as_vip, model,
                     state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
+                    disconnect_scope,
                 )
             )
         decode_start = time.monotonic()
@@ -433,6 +450,7 @@ class PDForwardService:
             return self._normal_decode(
                 path, headers, body, record, context, served_as_vip, model,
                 state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip, prefill_ttft,
+                disconnect_scope,
             )
         finally:
             # Decode phase ended (success, error, or retry handoff): the wall
@@ -445,10 +463,28 @@ class PDForwardService:
     # Phase 1: prefill
     # ------------------------------------------------------------------
 
-    def _do_prefill(self, prefiller, prefiller_url, headers, body) -> tuple[dict, int, int]:
+    def _prefill_client_closed(self, record, prefiller, served_as_vip, model):
+        """The client cancelled while the prefill was in flight (issue #323).
+
+        The watcher already aborted the prefiller socket. Release the reserved
+        prefiller workload, log the cancellation, and finish the record as 499
+        agent_disconnected. This is not an upstream failure: no
+        circuit-breaker record, no retry."""
+        append_request_log(record.id, json.dumps({
+            "event": "pd_prefill_cancelled",
+            "prefiller_url": prefiller.base_url,
+        }, ensure_ascii=False))
+        self._release_prefiller(prefiller)
+        return self.proxy._client_closed_response(record, served_as_vip, model)
+
+    def _do_prefill(self, prefiller, prefiller_url, headers, body, disconnect_scope) -> tuple[dict, int, int]:
         prefill_body = build_prefill_body(body)
         req_headers = build_upstream_headers(headers, prefiller)
-        response = requests.post(
+        # Issue #323: through the disconnect scope's cancellable client so a
+        # client cancelling mid-prefill aborts the prefiller's socket instead
+        # of leaving the prefill running to completion.
+        response = disconnect_scope.upstream_client.request(
+            "POST",
             prefiller_url,
             headers=req_headers,
             data=prefill_body,
@@ -470,6 +506,7 @@ class PDForwardService:
     def _normal_decode(
         self, path, headers, body, record, context, served_as_vip, model,
         state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip, prefill_ttft,
+        disconnect_scope,
     ):
         from router.services.proxy import _RouteAttemptResult
 
@@ -481,6 +518,11 @@ class PDForwardService:
         origin_max_tokens = _origin_max_tokens(body)
 
         while True:
+            if disconnect_scope.disconnect_event.is_set():
+                # Client gone: no further decoder dispatch (issue #323).
+                return _RouteAttemptResult(
+                    response=self.proxy._client_closed_response(record, served_as_vip, model)
+                )
             decoder = ServerRepository.pick_least_tokens_decoder(prefiller.group_id, attempted_decoder_ids)
             if decoder is None:
                 logger.error("No routable decoder in cluster %s for PD request", prefiller.group_id)
@@ -517,8 +559,13 @@ class PDForwardService:
             decoder_url = self.proxy._build_url(decoder.base_url, path, "")
 
             try:
-                response, content, status_code = self._post_decode(decoder, decoder_url, headers, decode_body)
+                response, content, status_code = self._post_decode(decoder, decoder_url, headers, decode_body, disconnect_scope)
             except requests.exceptions.ReadTimeout:
+                if disconnect_scope.disconnect_event.is_set():
+                    self._release_decoder(decoder, prompt_tokens)
+                    return _RouteAttemptResult(
+                        response=self.proxy._client_closed_response(record, served_as_vip, model)
+                    )
                 append_request_log(record.id, json.dumps({
                     "event": "pd_decode_error",
                     "error_type": "read_timeout",
@@ -531,6 +578,11 @@ class PDForwardService:
                 state.last_reason = "Gateway Timeout"
                 return _RouteAttemptResult()
             except requests.RequestException as exc:
+                if disconnect_scope.disconnect_event.is_set():
+                    self._release_decoder(decoder, prompt_tokens)
+                    return _RouteAttemptResult(
+                        response=self.proxy._client_closed_response(record, served_as_vip, model)
+                    )
                 is_connection = self.proxy._is_connection_failure(exc)
                 logger.warning("PD decode %s on %s: %s",
                                "connection error" if is_connection else "request error",
@@ -639,10 +691,12 @@ class PDForwardService:
             )
             return _RouteAttemptResult(response=final_response)
 
-    def _post_decode(self, decoder, decoder_url, headers, decode_body):
+    def _post_decode(self, decoder, decoder_url, headers, decode_body, disconnect_scope):
+        # Issue #323: through the cancellable client so a client cancel aborts
+        # the in-flight decode POST.
         req_headers = build_upstream_headers(headers, decoder)
-        response = requests.post(
-            decoder_url, headers=req_headers, data=decode_body,
+        response = disconnect_scope.upstream_client.request(
+            "POST", decoder_url, headers=req_headers, data=decode_body,
             timeout=self.proxy._deadline_timeout(self.normal_timeout),
         )
         return response, response.content, response.status_code
@@ -654,6 +708,7 @@ class PDForwardService:
     def _stream_decode(
         self, django_request, path, headers, body, record, context, served_as_vip, model,
         state, prefiller, kv_params, prompt_tokens, cached_tokens, target_pod_ip,
+        disconnect_scope,
     ):
         decode_body = build_decode_body(body, kv_params)
         origin_max_tokens = _origin_max_tokens(body)
@@ -679,6 +734,15 @@ class PDForwardService:
 
             try:
                 while True:
+                    if disconnect_scope.disconnect_event.is_set():
+                        # Client gone (issue #323): stop dispatching decoders
+                        # and end the stream — nothing further is delivered.
+                        proxy_response.finish_stream_client_disconnected(
+                            record, current_target, state.attempts
+                        )
+                        release_current_decoder()
+                        self.proxy._after_finish(served_as_vip, model)
+                        return
                     decoder = ServerRepository.pick_least_tokens_decoder(
                         prefiller.group_id, attempted_decoder_ids
                     )
@@ -725,11 +789,22 @@ class PDForwardService:
 
                     req_headers = build_upstream_headers(headers, decoder)
                     try:
-                        upstream = requests.request(
+                        # Issue #323: through the disconnect scope's
+                        # cancellable client so a client cancel aborts the
+                        # in-flight decode stream, even while iter_content
+                        # blocks on a silent decoder.
+                        upstream = disconnect_scope.upstream_client.request(
                             "POST", decoder_url, headers=req_headers, data=decode_body,
-                            stream=True, timeout=self.stream_timeout,
+                            timeout=self.stream_timeout,
                         )
                     except requests.RequestException as exc:
+                        if disconnect_scope.disconnect_event.is_set():
+                            proxy_response.finish_stream_client_disconnected(
+                                record, current_target, state.attempts
+                            )
+                            release_current_decoder()
+                            self.proxy._after_finish(served_as_vip, model)
+                            return
                         logger.warning("PD decode connection error on %s: %s", decoder.base_url, exc)
                         append_request_log(record.id, json.dumps({
                             "event": "pd_decode_error",
@@ -808,6 +883,13 @@ class PDForwardService:
                             if recomputed:
                                 break
                     except requests.exceptions.ReadTimeout:
+                        if disconnect_scope.disconnect_event.is_set():
+                            proxy_response.finish_stream_client_disconnected(
+                                record, current_target, state.attempts
+                            )
+                            release_current_decoder()
+                            self.proxy._after_finish(served_as_vip, model)
+                            return
                         upstream.close()
                         release_current_decoder()
                         self.circuit_breaker.record_failure(decoder)
@@ -819,6 +901,15 @@ class PDForwardService:
                         self.proxy._after_finish(served_as_vip, model)
                         return
                     except requests.RequestException:
+                        if disconnect_scope.disconnect_event.is_set():
+                            # The watcher aborted the decoder socket after the
+                            # client cancelled — not a decoder failure (#323).
+                            proxy_response.finish_stream_client_disconnected(
+                                record, current_target, state.attempts
+                            )
+                            release_current_decoder()
+                            self.proxy._after_finish(served_as_vip, model)
+                            return
                         upstream.close()
                         release_current_decoder()
                         self.circuit_breaker.record_failure(decoder)
@@ -927,6 +1018,10 @@ class PDForwardService:
                     record.save(update_fields=["decode_latency"])
                 except Exception:
                     logger.exception("failed to persist decode_latency for request %s", record.id)
+                # The generator owns the disconnect scope for streaming
+                # responses (issue #323): stop the watcher and release the
+                # cancellable client now that streaming has ended.
+                disconnect_scope.close()
                 flush_request_log(record.id)
 
         response = StreamingHttpResponse(generate(), status=200, content_type="text/event-stream")

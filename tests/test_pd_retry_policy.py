@@ -18,6 +18,8 @@ from django.utils import timezone
 from router.models import RequestRecord, Server
 from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
+from router.services.cancellable_upstream import CancellableUpstreamRequest
+from router.services.disconnect import DisconnectScope
 from router.services.proxy import ProxyService, _RetryState
 from router.services.proxy_pd_forward import PDForwardService
 
@@ -104,7 +106,7 @@ class TestPrefillRetryPolicy:
         state = _RetryState()
         result = svc.forward(
             _django_request(), "chat/completions", {}, b'{"messages":[]}',
-            record, None, _context(record), False, None, False, None, state, prefiller,
+            record, None, _context(record), False, None, False, DisconnectScope(), state, prefiller,
         )
         return result, state
 
@@ -151,7 +153,7 @@ class TestDecodeRetryPolicy:
         state = _RetryState()
         result = svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, prefiller, {}, 1, 0, "P: x", None,
+            False, None, state, prefiller, {}, 1, 0, "P: x", None, DisconnectScope(),
         )
         return result, state
 
@@ -192,7 +194,7 @@ class TestDecodeRetryPolicy:
         state = _RetryState()
         result = svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, prefiller, {}, 1, 0, "P: x", None,
+            False, None, state, prefiller, {}, 1, 0, "P: x", None, DisconnectScope(),
         )
         assert result.should_retry is False
         assert result.response is None
@@ -230,7 +232,7 @@ class TestDecodeRetryPolicy:
         state = _RetryState()
         result = svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, prefiller, {}, 1, 0, "P: x", None,
+            False, None, state, prefiller, {}, 1, 0, "P: x", None, DisconnectScope(),
         )
         assert result.should_retry is False
         assert result.response is None
@@ -283,7 +285,7 @@ class TestDecodeRecordsPrefixContext:
         svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record,
             self._context_with_last_match(record, 76543),
-            False, None, state, prefiller, {}, 1, 0, "P: x", None,
+            False, None, state, prefiller, {}, 1, 0, "P: x", None, DisconnectScope(),
         )
 
         assert len(captured) == 1
@@ -297,7 +299,7 @@ class TestDecodeRecordsPrefixContext:
 
         def boom(*args, **kwargs):
             raise requests.ConnectionError("refused")
-        monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", boom)
+        monkeypatch.setattr(CancellableUpstreamRequest, "request", boom)
 
         prefiller = Server.objects.create(
             base_url="http://p.example", role="prefiller", group_id="g1"
@@ -307,7 +309,7 @@ class TestDecodeRecordsPrefixContext:
         response = svc._stream_decode(
             _django_request(), "chat/completions", {}, b'{"messages":[]}', record,
             self._context_with_last_match(record, 76543),
-            False, None, state, prefiller, {}, 1, 0, "P: x",
+            False, None, state, prefiller, {}, 1, 0, "P: x", DisconnectScope(),
         )
         gen = response.streaming_content
         try:
@@ -371,7 +373,7 @@ class TestDecodeErrorLogsBodyAndDetailedReason:
                 pass
 
         monkeypatch.setattr(
-            "router.services.proxy_pd_forward.requests.request",
+            CancellableUpstreamRequest, "request",
             lambda *a, **k: _FakeUpstream(),
         )
 
@@ -380,6 +382,7 @@ class TestDecodeErrorLogsBodyAndDetailedReason:
         response = svc._stream_decode(
             _django_request(), "chat/completions", {}, b'{"messages":[]}', record,
             _context(record), False, None, state, self._prefiller(), {}, 1, 0, "P: x",
+            DisconnectScope(),
         )
         gen = response.streaming_content
         try:
@@ -414,7 +417,7 @@ class TestDecodeErrorLogsBodyAndDetailedReason:
         state = _RetryState()
         svc._normal_decode(
             "chat/completions", {}, b'{"messages":[]}', record, _context(record),
-            False, None, state, self._prefiller(), {}, 1, 0, "P: x", None,
+            False, None, state, self._prefiller(), {}, 1, 0, "P: x", None, DisconnectScope(),
         )
 
         resp_events = [e for e in events if e.get("event") == "pd_decode_response"]

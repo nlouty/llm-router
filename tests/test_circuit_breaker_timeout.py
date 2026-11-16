@@ -104,8 +104,8 @@ def test_stream_read_timeout_records_failure_and_opens_circuit(monkeypatch):
     upstream = _streaming_upstream(200)
     upstream.iter_content = gen
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
 
     for _ in range(3):
@@ -125,8 +125,8 @@ def test_stream_total_timeout_records_failure(monkeypatch):
 
     upstream = _streaming_upstream(200, chunks=[b"data: partial\n\n"])
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
 
     response = service.forward(_django_request(), "chat/completions", parsed, None, None, None)
@@ -151,8 +151,8 @@ def test_successful_stream_resets_failure_counter(monkeypatch):
 
     upstream = _streaming_upstream(200, chunks=[b"data: x\n\n", b"data: [DONE]\n\n"])
     monkeypatch.setattr(
-        "router.services.proxy.requests.request",
-        lambda method, url, **kw: upstream,
+        CancellableUpstreamRequest, "request",
+        lambda self, method, url, **kw: upstream,
     )
 
     response = service.forward(_django_request(), "chat/completions", parsed, None, None, None)

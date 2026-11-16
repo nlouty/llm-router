@@ -19,7 +19,7 @@ A Django + Gunicorn based reverse-proxy / API gateway that sits in front of one 
   - Streaming (SSE) and non-streaming forwarding with independent connect / read / total timeouts
   - Request body parsing: extracts `model` / `stream` / `max_tokens`, injects `stream_options.include_usage=true`, defaults missing `max_tokens`
   - Hop-by-hop / `Host` / `Content-Length` / `Content-Encoding` header stripping; per-server `csb-token` injection
-  - Client-disconnect tracking via `gunicorn.socket` + `MSG_PEEK`; cancels upstream request and records HTTP 499 / `agent_disconnected`
+  - Client-disconnect tracking via `gunicorn.socket` + `MSG_PEEK`; a background watcher cancels the in-flight upstream request in every phase — single-node, PD prefill, PD decode, streaming (even while blocked on a silent upstream), and external providers — and records HTTP 499 / `agent_disconnected` (issue #323)
   - Cancellable upstream HTTP client (custom urllib3 `PoolManager`/`Connection` that force-closes sockets on cancel)
   - `413 Request Entity Too Large` handling for oversize bodies
   - Special routing: `GET /v1/models` is dispatched to a random online server

@@ -18,6 +18,7 @@ from router.models import Model, RequestRecord, Server
 from router.repositories.requests import LLM_CHOOSING_IP_ID
 from router.repositories.servers import ServerRepository
 from router.route_algorithm.base import ServerSelectionContext
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 from router.services.proxy import ProxyService
 
 
@@ -117,7 +118,7 @@ def test_llm_choosing_clamps_pd_prefill_and_decode_timeouts_to_budget(monkeypatc
 
     timeouts = []
 
-    def fake_pd_post(url, headers=None, data=None, timeout=None):
+    def fake_pd_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         timeouts.append(timeout)
         response = MagicMock()
         if "p.example" in url:
@@ -145,7 +146,7 @@ def test_llm_choosing_clamps_pd_prefill_and_decode_timeouts_to_budget(monkeypatc
         )
         return response
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_pd_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_pd_request)
 
     service = ProxyService(_FirstChooser())
     service.llm_choosing_timeout = 2

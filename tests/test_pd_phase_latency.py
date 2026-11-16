@@ -18,6 +18,7 @@ import pytest
 from django.test import Client
 
 from router.models import Model, RequestRecord, Server
+from router.services.cancellable_upstream import CancellableUpstreamRequest
 
 
 def _disable_cmdb(monkeypatch):
@@ -91,14 +92,14 @@ def _decode_error_response():
 def test_pd_non_stream_records_both_phase_latencies(monkeypatch):
     model = _seed_pd_cluster(monkeypatch)
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         if "phase-p.example" in url:
             time.sleep(0.05)  # prefill work before the probe response
             return _prefill_ok_response()
         assert "phase-d.example" in url
         return _decode_ok_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
@@ -127,12 +128,10 @@ def test_pd_stream_records_both_phase_latencies(monkeypatch):
         b"data: [DONE]\n\n"
     )
 
-    def fake_post(url, headers=None, data=None, timeout=None):
-        assert "phase-p.example" in url
-        time.sleep(0.05)  # prefill runs before any decode chunk exists
-        return _prefill_ok_response()
-
-    def fake_stream_request(method, url, headers=None, data=None, stream=True, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
+        if "phase-p.example" in url:
+            time.sleep(0.05)  # prefill runs before any decode chunk exists
+            return _prefill_ok_response()
         assert "phase-d.example" in url
         resp = MagicMock()
         resp.status_code = 200
@@ -141,8 +140,7 @@ def test_pd_stream_records_both_phase_latencies(monkeypatch):
         resp.close = lambda: None
         return resp
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.request", fake_stream_request)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
@@ -169,13 +167,13 @@ def test_pd_stream_records_both_phase_latencies(monkeypatch):
 def test_pd_decode_failure_keeps_prefill_latency(monkeypatch):
     model = _seed_pd_cluster(monkeypatch)
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_request(self, method, url, headers=None, data=None, timeout=None, **kwargs):
         if "phase-p.example" in url:
             return _prefill_ok_response()
         assert "phase-d.example" in url
         return _decode_error_response()
 
-    monkeypatch.setattr("router.services.proxy_pd_forward.requests.post", fake_post)
+    monkeypatch.setattr(CancellableUpstreamRequest, "request", fake_request)
 
     response = Client().post(
         "/v1/chat/completions",
