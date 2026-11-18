@@ -660,7 +660,22 @@ class PDForwardService:
                 continue
 
             # Terminal success: completion_tokens from the decode usage.
-            self.circuit_breaker.record_success(decoder)
+            # Issue #353: zero accumulated output tokens on a chat completion
+            # is a fake success — count a decoder failure instead of the
+            # success that would reset the breaker, so repeated offenders
+            # open their circuit.
+            if completion_tokens == 0 and proxy_response.is_fake_success(
+                path, data.get("usage") if isinstance(data, dict) else None
+            ):
+                self.circuit_breaker.record_failure(decoder)
+                append_request_log(record.id, json.dumps({
+                    "event": "fake_success",
+                    "decoder_url": decoder.base_url,
+                    "status_code": status_code,
+                    "stream": False,
+                }, ensure_ascii=False))
+            else:
+                self.circuit_breaker.record_success(decoder)
             self.proxy._notify_chooser_response(prefiller, context, status_code)
             append_request_log(record.id, json.dumps({
                 "event": "pd_decode_success",
@@ -959,7 +974,19 @@ class PDForwardService:
                         continue
 
                     # Terminal success: final_prefix_cache from the prefiller.
-                    self.circuit_breaker.record_success(decoder)
+                    # Issue #353: a chat stream that never produced a content
+                    # chunk is a fake success — count a decoder failure
+                    # instead of the success that would reset the breaker.
+                    if proxy_response.is_chat_completions(path) and completion_tokens == 0:
+                        self.circuit_breaker.record_failure(decoder)
+                        append_request_log(record.id, json.dumps({
+                            "event": "fake_success",
+                            "decoder_url": decoder.base_url,
+                            "status_code": 200,
+                            "stream": True,
+                        }, ensure_ascii=False))
+                    else:
+                        self.circuit_breaker.record_success(decoder)
                     self.proxy._notify_chooser_response(prefiller, context, 200)
                     append_request_log(record.id, json.dumps({
                         "event": "pd_decode_success",

@@ -7,7 +7,11 @@ from django.http import HttpResponse
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
 from router.utils.headers import filter_response_headers
-from router.utils.sse import parse_sse_usage
+from router.utils.sse import find_sse_usage, parse_sse_usage
+
+
+def is_chat_completions(path: str) -> bool:
+    return path.rstrip("/").lower() == "chat/completions"
 
 
 def router_result(context) -> str | None:
@@ -41,19 +45,52 @@ def response_from_upstream(upstream, content: bytes, status_code: int):
     return response
 
 
-def parse_json_usage(content: bytes) -> tuple[int, int, int]:
+def find_json_usage(content: bytes) -> dict | None:
+    """The ``usage`` object of a JSON response body, or None when the body is
+    not JSON or carries no usage (issue #353: absent is not the same as 0)."""
     try:
         data = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return 0, 0, 0
+        return None
     usage = data.get("usage") if isinstance(data, dict) else None
-    if not isinstance(usage, dict):
+    return usage if isinstance(usage, dict) else None
+
+
+def find_stream_usage(chunks: list[bytes]) -> dict | None:
+    return find_sse_usage(chunks)
+
+
+def _usage_counts(usage: dict | None) -> tuple[int, int, int]:
+    if not usage:
         return 0, 0, 0
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
     details = usage.get("prompt_tokens_details")
     cached_tokens = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
     return prompt_tokens, completion_tokens, cached_tokens
+
+
+def parse_json_usage(content: bytes) -> tuple[int, int, int]:
+    return _usage_counts(find_json_usage(content))
+
+
+def is_fake_success(path: str, usage: dict | None) -> bool:
+    """Issue #353: a 2xx chat completion whose usage reports zero output
+    tokens. The server produced nothing, so the attempt counts as a failure
+    toward the circuit breaker; repeated offenders open their circuit.
+
+    Only an explicitly reported 0 counts: responses without a usage object
+    and usages without a ``completion_tokens`` key (embeddings, /v1/models,
+    streams whose server ignored include_usage) are not evaluable and stay
+    successes."""
+    if not is_chat_completions(path) or not isinstance(usage, dict):
+        return False
+    if "completion_tokens" not in usage:
+        return False
+    try:
+        return int(usage.get("completion_tokens") or 0) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_stream_usage(chunks: list[bytes]) -> tuple[int, int, int]:
