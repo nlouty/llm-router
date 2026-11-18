@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 
 
-def parse_sse_usage(chunks: bytes | list[bytes] | str) -> tuple[int, int, int]:
+def find_sse_usage(chunks: bytes | list[bytes] | str) -> dict | None:
+    """The last ``usage`` object carried by an SSE stream, or None when no
+    data frame contained one. Issue #353 needs "reported zero output tokens"
+    distinguishable from "no usage frame at all" (the latter is not
+    evaluable, e.g. a server that ignores stream_options.include_usage)."""
     if isinstance(chunks, list):
         raw = b"".join(chunks).decode("utf-8", errors="ignore")
     elif isinstance(chunks, bytes):
@@ -11,7 +15,6 @@ def parse_sse_usage(chunks: bytes | list[bytes] | str) -> tuple[int, int, int]:
     else:
         raw = chunks
 
-    usage: dict | None = None
     for line in reversed(raw.splitlines()):
         line = line.strip()
         if not line.startswith("data:"):
@@ -24,8 +27,12 @@ def parse_sse_usage(chunks: bytes | list[bytes] | str) -> tuple[int, int, int]:
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
-            usage = obj["usage"]
-            break
+            return obj["usage"]
+    return None
+
+
+def parse_sse_usage(chunks: bytes | list[bytes] | str) -> tuple[int, int, int]:
+    usage = find_sse_usage(chunks)
     if not usage:
         return 0, 0, 0
     prompt_tokens = int(usage.get("prompt_tokens") or 0)

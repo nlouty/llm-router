@@ -24,6 +24,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_context_overflow.py` | Context-overflow retry to a same-model larger-window server; no model switch; real error surfaces when exhausted |
 | `test_disconnect.py` | `DisconnectWatcher` event/callback semantics |
 | `test_errors.py` | Error payload shape and SSE timeout event format |
+| `test_fake_success.py` | Fake-success detection (issue #353): zero-output-token chat completions count as circuit-breaker failures on mixed and PD paths without changing the client response |
 | `test_external_routing.py` | External-provider routing (issue #287): mapping resolution, body/API-key rewrite, provider-only names, auto-entrance divert, apikey-identity diversion, VIP gating, provider circuit breaker, streaming, concurrency invisibility, and `/v1/models` merge |
 | `test_headers.py` | Request-header filtering (hop-by-hop + bodyless `Content-Type`) |
 | `test_identity.py` | Identity resolution: apikey-first employee_no precedence and empty-key-row fallback, IP fallback for unknown Bearer keys, invalid-key refusal, admission bypass, whitelist-bypass key revocation when the whitelist entry stops rescuing (issue #337), CMDB provisioning |
