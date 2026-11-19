@@ -2,15 +2,15 @@ from router.services.opencode import OpencodeVersionService
 
 
 def test_opencode_blocks_old_versions():
-    blocked, version = OpencodeVersionService.should_block("foo opencode/1.2.26 bar")
+    blocked, version = OpencodeVersionService.should_block("foo opencode/1.19.6 bar")
     assert blocked is True
-    assert version == "1.2.26"
+    assert version == "1.19.6"
 
 
 def test_opencode_allows_newer_versions():
-    blocked, version = OpencodeVersionService.should_block("opencode/1.2.27")
+    blocked, version = OpencodeVersionService.should_block("opencode/1.19.7")
     assert blocked is False
-    assert version == "1.2.27"
+    assert version == "1.19.7"
 
 
 def test_opencode_delays_any_failure_for_opencode_clients():

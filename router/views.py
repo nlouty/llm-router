@@ -135,7 +135,7 @@ def proxy(request, path: str):
 
         blocked, version = OpencodeVersionService.should_block(user_agent)
         if blocked:
-            message = f"Your opencode version ({version}) is no longer supported. Please upgrade opencode to latest version."
+            message = f"Your CodeAgent 2.x or opencode version ({version}) is no longer supported. Please upgrade CodeAgent to 3.x or upgrade opencode to latest version."
             RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
             return error_response(403, message, "version_too_old")
 

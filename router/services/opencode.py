@@ -20,7 +20,7 @@ class OpencodeVersionService:
 
     @classmethod
     def _block_max_version(cls) -> Version:
-        return Version(str(cls._config().get("block_max_version", "1.2.26")))
+        return Version(str(cls._config().get("block_max_version", "1.19.6")))
 
     @staticmethod
     def is_opencode(user_agent: str | None) -> bool:
