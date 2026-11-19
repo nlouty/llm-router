@@ -56,7 +56,7 @@ prefix_cache:
 
 opencode:
   enabled: true
-  block_max_version: "1.2.26"
+  block_max_version: "1.19.6"
 
 admission:
   allow_when_user_info_missing: true
