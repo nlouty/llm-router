@@ -133,11 +133,17 @@ def proxy(request, path: str):
                 RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
                 return error_response(permission.status_code, message, permission.error_type or "permission_denied")
 
-        blocked, version = OpencodeVersionService.should_block(user_agent)
-        if blocked:
-            message = f"Your CodeAgent 2.x or opencode version ({version}) is no longer supported. Please upgrade CodeAgent to 3.x or upgrade opencode to latest version."
-            RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
-            return error_response(403, message, "version_too_old")
+        # The VIP port admits any client agent: like the deprecation and
+        # concurrency checks below, the version block is normal-port only, so
+        # legacy opencode / CodeAgent clients stay usable there. Everyone who
+        # reaches this point on the VIP port already passed the ips.vip gate
+        # above (or holds a valid apikey).
+        if not is_vip_channel:
+            blocked, version = OpencodeVersionService.should_block(user_agent)
+            if blocked:
+                message = f"Your CodeAgent 2.x or opencode version ({version}) is no longer supported. Please upgrade CodeAgent to 3.x or upgrade opencode to latest version."
+                RequestRepository.create_blocked(ip.id, 0, None, user_agent, 403, message, user_ip_id=identity.user_ip_id)
+                return error_response(403, message, "version_too_old")
 
         # GET /v1/models is answered locally with the per-user, per-port model
         # capability payload instead of being proxied to a random upstream
