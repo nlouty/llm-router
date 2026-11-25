@@ -61,7 +61,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "opencode": {
         "enabled": True,
-        "block_max_version": "1.2.26",
+        "block_max_version": "1.19.6",
     },
     "admission": {
         "allow_when_user_info_missing": True,

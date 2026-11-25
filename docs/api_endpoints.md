@@ -20,7 +20,7 @@ Request handling includes:
 
 - client IP creation from `X-Forwarded-For` or `REMOTE_ADDR`
 - permission checks through `user_ips`, `departments`, and `whitelist`
-- opencode version blocking
+- opencode version blocking (normal port only; the VIP port admits any client version)
 - JSON body parsing, `max_tokens` defaulting, and streaming `include_usage` injection
 - exact `model: auto` and concrete-model auto routing
 - normal-port small-request routing

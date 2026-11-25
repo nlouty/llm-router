@@ -465,6 +465,19 @@ class TestVIPChannelDetection:
 # -------- VIP-port IP admission --------
 
 
+def _set_ports(monkeypatch, http_port=8001, vip_port=8008):
+    server_config = APP_CONFIG.setdefault("server", {})
+    monkeypatch.setitem(server_config, "vip_port", vip_port)
+    monkeypatch.setitem(server_config, "bind", f"0.0.0.0:{http_port}")
+
+
+def _pin_opencode_block(monkeypatch, block_max_version="1.19.6"):
+    # Pin the policy so the test does not depend on the deployed config.yaml value.
+    opencode_config = APP_CONFIG.setdefault("opencode", {})
+    monkeypatch.setitem(opencode_config, "enabled", True)
+    monkeypatch.setitem(opencode_config, "block_max_version", block_max_version)
+
+
 class TestVIPPortIPGate:
     def test_non_vip_ip_gets_503_on_vip_port(self, monkeypatch):
         server_config = APP_CONFIG.setdefault("server", {})
@@ -504,6 +517,46 @@ class TestVIPPortIPGate:
 
         assert response.status_code == 400
         assert response.json()["error"]["message"] == "Model unknown-model is not supported."
+
+    def test_vip_port_admits_blocked_opencode_agent(self, monkeypatch):
+        """The opencode version block is normal-port only: a client the normal
+        port refuses as too old gets through the gate on the VIP port."""
+        _pin_opencode_block(monkeypatch)
+        _set_ports(monkeypatch)
+        Ips.objects.create(ip="10.10.10.12", concurrent_multiplier=1.0, vip=True)
+
+        response = Client().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "unknown-model"}),
+            content_type="application/json",
+            SERVER_PORT="8008",
+            REMOTE_ADDR="10.10.10.12",
+            HTTP_USER_AGENT="opencode/1.19.6",
+        )
+
+        # Past the version gate, stopped only by the unknown-model check.
+        assert response.status_code == 400
+        assert response.json()["error"]["message"] == "Model unknown-model is not supported."
+        assert not RequestRecord.objects.filter(fail_reason__contains="no longer supported").exists()
+
+    def test_normal_port_still_blocks_old_opencode_agent(self, monkeypatch):
+        """The same client from the same VIP IP is still refused on the normal port."""
+        _pin_opencode_block(monkeypatch)
+        _set_ports(monkeypatch)
+        Ips.objects.create(ip="10.10.10.12", concurrent_multiplier=1.0, vip=True)
+
+        response = Client().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "unknown-model"}),
+            content_type="application/json",
+            SERVER_PORT="8001",
+            REMOTE_ADDR="10.10.10.12",
+            HTTP_USER_AGENT="opencode/1.19.6",
+        )
+
+        assert response.status_code == 403
+        assert response.json()["error"]["type"] == "version_too_old"
+        assert "opencode version (1.19.6)" in response.json()["error"]["message"]
 
 
 # -------- release_vip_cooldowns command --------
