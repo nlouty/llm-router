@@ -768,7 +768,22 @@ class ProxyService:
         reason = upstream.reason or ""
         state.last_status = status_code
         state.last_reason = reason
-        self._record_upstream_status(record, state, server, user_agent, context, status_code, is_stream)
+        # Issue #353: a 2xx chat completion reporting zero output tokens is a
+        # fake success. The whole body is already in hand, so evaluate it
+        # before _record_upstream_status can record a circuit success — that
+        # would reset consecutive_failures and the circuit could never open
+        # no matter how many fake successes pile up.
+        fake_success = (
+            not is_stream
+            and 200 <= status_code < 300
+            and proxy_response.is_fake_success(context.path, proxy_response.find_json_usage(content))
+        )
+        self._record_upstream_status(
+            record, state, server, user_agent, context, status_code, is_stream,
+            record_circuit=not fake_success,
+        )
+        if fake_success:
+            self._mark_fake_success(server, record, status_code, is_stream)
 
         if status_code >= 400:
             return self._handle_upstream_error(
@@ -825,7 +840,7 @@ class ProxyService:
         )
         return _RouteAttemptResult(response=response)
 
-    def _record_upstream_status(self, record, state: _RetryState, server, user_agent, context, status_code: int, is_stream: bool) -> None:
+    def _record_upstream_status(self, record, state: _RetryState, server, user_agent, context, status_code: int, is_stream: bool, record_circuit: bool = True) -> None:
         proxy_logging.log_attempt(
             record.id,
             state.attempts,
@@ -848,7 +863,23 @@ class ProxyService:
         # failure) can be counted, so a chronically slow server never trips the
         # circuit. The chooser on_response hook still runs (prefix cache etc.);
         # the success record is deferred to _stream_success on full completion.
-        self._notify_chooser_response(server, context, status_code, record_circuit=not is_stream)
+        # record_circuit=False additionally suppresses it for a fake success
+        # (issue #353) already detected in the non-stream body.
+        self._notify_chooser_response(server, context, status_code, record_circuit=record_circuit and not is_stream)
+
+    def _mark_fake_success(self, server, record, status_code: int, is_stream: bool) -> None:
+        # Issue #353: the server returned 2xx but produced no output tokens.
+        # The response itself is passed through unchanged; the only action is
+        # breaker accounting — count it exactly like an upstream failure so
+        # repeated fake successes open the circuit and drop the server.
+        append_request_log(record.id, json.dumps({
+            "event": "fake_success",
+            "server_id": server.id,
+            "base_url": server.base_url,
+            "status_code": status_code,
+            "stream": is_stream,
+        }, ensure_ascii=False))
+        self._mark_unhealthy(server)
 
     def _handle_upstream_error(
         self,
@@ -1167,7 +1198,16 @@ class ProxyService:
                             )
                         chunks.append(chunk)
                         yield chunk
-                self._notify_chooser_response(server, context, status_code)
+                # Issue #353: a stream that completed 2xx but reported zero
+                # output tokens is a fake success. The chunks are already
+                # delivered, so no retry: count the failure toward the circuit
+                # instead of recording the success that would reset it.
+                if proxy_response.is_fake_success(
+                    context.path, proxy_response.find_stream_usage(chunks)
+                ):
+                    self._mark_fake_success(server, record, status_code, True)
+                else:
+                    self._notify_chooser_response(server, context, status_code)
                 ttft = (
                     int((first_chunk_at - record.send_time).total_seconds() * 1000)
                     if first_chunk_at is not None
