@@ -166,7 +166,7 @@ ALTER TABLE models ADD COLUMN model_path VARCHAR(500) NULL;
 
 `deprecation` is admin-managed. If it is not `NULL`, the router returns HTTP 400 with this value as the error message. This block applies to the normal port only; VIP-port requests for a concrete model are still served from that model's own servers. Deprecation does not affect auto-routing target eligibility: a deprecated model with `complexity_min`/`complexity_max` set can still serve `auto` requests.
 
-`is_routing_model` marks models that can receive internal complexity-classification requests and normal-port small-request routing (which applies to auto requests only).
+`is_routing_model` marks models that can receive internal complexity-classification requests, normal-port small-request routing (which applies to auto requests only), and normal-port requests from the sessions listed in `router.forced_routing_sessions` whatever model they name (issue #357).
 
 `auto` controls auto-routing entry, not target eligibility. Exact `model: auto` requests enter auto routing case-insensitively. On the normal port, requests for a concrete model with `auto = TRUE` also enter auto routing. On the VIP port, concrete model requests keep the requested model.
 

@@ -2,10 +2,11 @@
 
 `auto` routing lets the router choose a concrete target model at request time. It is implemented in `router/route_algorithm/auto.py` and runs before normal server selection.
 
-There are two related behaviors:
+There are three related behaviors:
 
 - True auto model selection: requests whose input model is `auto`, or normal-port requests for a concrete model whose `models.auto = TRUE`, can be rewritten to another model.
 - Small-request routing: normal-port auto requests whose fast token estimate is below `3000` — and that contain no image parts, since multimodal detection runs first (issue #324) — can be sent to a configured routing model before true auto selection runs. The estimate is a cheap char/byte heuristic (`fast_estimate_tokens`) that needs no model, so it is available before one is selected.
+- Forced-session routing (issue #357): normal-port chat requests whose session id is listed in `router.forced_routing_sessions` (default `dsh-pet`, `chrys-judge`, `chrys-pet`) are sent to a routing model whatever model they name — including a concrete model, which no other step rewrites.
 
 ## Database Setup
 
@@ -36,12 +37,14 @@ router:
   system_prompt_path: router/assets/router_system_prompt.md
   auto_concurrent_limit: 8
   availability_probe_enabled: true
+  forced_routing_sessions: [dsh-pet, chrys-judge, chrys-pet]
 ```
 
 - `fallback_model` is used when the routing LLM cannot produce a unique complexity target.
 - `system_prompt_path` points to the classifier prompt. If it cannot be read, a built-in compact JSON classifier prompt is used.
 - `auto_concurrent_limit` is the admission-control limit base for requests whose input model is exactly `auto`.
-- `availability_probe_enabled` (default `true`) controls the in-band recovery probe for unavailable complexity targets (see step 8).
+- `availability_probe_enabled` (default `true`) controls the in-band recovery probe for unavailable complexity targets (see step 9).
+- `forced_routing_sessions` (default `[dsh-pet, chrys-judge, chrys-pet]`) lists the session ids whose normal-port chat requests are always served by a routing model, even when they name a concrete model (step 3). A session id is matched exactly against the value of the request's session header; the list is replaced wholesale when configured.
 
 ## Entry Conditions
 
@@ -53,6 +56,8 @@ Auto selection starts when either condition is true:
 - The request uses the normal port and the concrete requested model has `models.auto = TRUE`.
 
 Auto selection does not start for concrete model requests on the VIP port. Unknown concrete model names are rejected before auto routing, even if a routing model exists.
+
+Independently of auto selection, a normal-port chat request whose session id is in `router.forced_routing_sessions` is rewritten to the routing model whatever model it names (issue #357; step 3). The view-level gates that run before routing — unknown model names, `models.deprecation`, `max_tokens`, concurrency — still apply to the requested model, but the issue #287 external-route divert is skipped for these sessions so the rewrite can happen.
 
 ## Selection Sequence
 
@@ -66,11 +71,19 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    This step runs before small-request routing (issue #324): an image-bearing request must reach the vision model, never the text-only routing classifier. For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port, the router checks the JSON `messages` list. If any message content is a list containing a part with `type: "image_url"` and a truthy `image_url`, the router selects the first model with `multimodal = TRUE`, ordered by `id`. `models.deprecation` is ignored here, as with text targets: a deprecated vision model still serves auto image requests, because the model name written by `multimodal_bypass` never passes the view-level name block.
 
-   This bypasses small-request routing and the text complexity classifier. If no multimodal model exists, the request continues through small-request routing and text auto selection.
+   This bypasses forced-session routing, small-request routing and the text complexity classifier. If no multimodal model exists, the request continues through forced-session routing (for configured sessions), small-request routing and text auto selection.
 
-3. Try small-request routing.
+3. Force configured sessions onto the routing model.
 
-   For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port that were not claimed by multimodal detection, whose fast token estimate is between `1` and `3000`. The estimate is `fast_estimate_tokens` (a char/byte heuristic that needs no model), so it works before any model is selected. Explicit (non-auto) model requests are never rewritten to the routing model.
+   A normal-port chat request whose session id — the value of the request's session header, as stored in `requests.session` — is listed in `router.forced_routing_sessions` (default `dsh-pet`, `chrys-judge`, `chrys-pet`) is rewritten to the routing model whatever model it names: `model: auto`, or a concrete model whether or not it is flagged `auto`. Those agents only issue trivial requests, so the model their client was configured with is overridden; unlike small-request routing this step is neither auto- nor size-gated (issue #357).
+
+   The step runs after multimodal detection, and an image-bearing request is never forced onto the text-only routing model: it keeps the behaviour it would have had otherwise (the vision model for auto requests, the requested model otherwise). Like every auto-routing rewrite it is skipped on the VIP port. The routing model is the one small-request routing would pick: the first `is_routing_model = TRUE` model (ascending `id`) with a routable non-VIP pool; when there is none, the request falls through unchanged. The rewrite disables thinking, updates the processing row's `model_id`, and records `router_result = <origin>:forced_session_routing`, which is not a session-sticky anchor.
+
+   Because this rewrite has to win over the model the client named, the view skips the issue #287 external-route divert for these sessions, so no provider mapping for the requested name is consulted. A mapping for the routing model itself still applies afterwards, like for any other resolved model.
+
+4. Try small-request routing.
+
+   For auto requests — `model: auto` or a model flagged `auto = TRUE` — on the normal port that were not claimed by multimodal detection, whose fast token estimate is between `1` and `3000`. The estimate is `fast_estimate_tokens` (a char/byte heuristic that needs no model), so it works before any model is selected. Explicit (non-auto) model requests are never rewritten to the routing model by this step; only the forced sessions of step 3 override a concrete model.
 
    The router scans `models.is_routing_model = TRUE` rows by ascending `id` and asks for non-VIP servers for each routing model. Candidate servers must be online, routable by circuit-breaker state, not soft-deleted, and have `context_window IS NULL OR context_window >= estimate_tokens`.
 
@@ -78,7 +91,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    If no routing-model server exists, the router continues. A non-auto request keeps its requested model; an auto request proceeds to true auto selection.
 
-4. Build the text target set.
+5. Build the text target set.
 
    Text targets are models with:
 
@@ -94,9 +107,9 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    If there are no text targets, `router_result` records `routing_failed:missing_target_model:no auto-routing target model for auto request`. No fallback model is applied at this step.
 
-5. Check session-sticky selection, then prefix-cache model hits.
+6. Check session-sticky selection, then prefix-cache model hits.
 
-   A request that carries a session id first resolves session-sticky selection: the newest committed choice for that session wins — up to 10 rows are scanned, and `small_request_routing` / `multimodal_bypass` rows are not anchors. There is no time bound (issue #313): the session keeps its model, deprecated or not, as long as that model still has a **healthy** serving pool (at least one closed-circuit routable server); a hit records `session-sticky`. Half-open-only anchors no longer pin the session: when the anchor model has no closed-circuit server, older anchors are tried and the request falls through to the steps below, where the probe/divert logic of step 8 decides what happens to that model.
+   A request that carries a session id first resolves session-sticky selection: the newest committed choice for that session wins — up to 10 rows are scanned, and `small_request_routing` / `multimodal_bypass` / `forced_session_routing` rows are not anchors. There is no time bound (issue #313): the session keeps its model, deprecated or not, as long as that model still has a **healthy** serving pool (at least one closed-circuit routable server); a hit records `session-sticky`. Half-open-only anchors no longer pin the session: when the anchor model has no closed-circuit server, older anchors are tried and the request falls through to the steps below, where the probe/divert logic of step 9 decides what happens to that model.
 
    When the active chooser supports `get_all_model_prefix_ratios`, the router checks Redis prefix-cache ratios for every **healthy** text target model (offline or circuit-broken targets are excluded from the query, so a cached prefix cannot pin a request to a dead model). This pre-check is skipped for requests with exactly one user message, and for requests that carry a session id whose session-sticky lookup missed (issue #299): the Redis cache is keyed by prompt prefix, not session, so a different task sharing the same agent prefix must be routed by complexity estimation instead of inheriting the previous task's model.
 
@@ -104,7 +117,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    Zero hits or multiple hits fall through to the routing LLM.
 
-6. Query the routing LLM.
+7. Query the routing LLM.
 
    The routing model is the model with `is_routing_model = TRUE` whose PD-aware candidate pool is the least loaded. The pool is built like any request's: `list_pd_holders` returns only `role = 'mixed'` servers and prefiller servers whose cluster still has a routable decoder; decoders are never candidates. Within each model the pool's load is its minimum `servers.workload / weight`, with random tie breaking across models. The original request's context-window estimate is not applied to this classifier lookup because the classifier payload is bounded to a small prompt.
 
@@ -122,11 +135,11 @@ For each accepted proxy request, the router creates a `requests` row in `process
 
    The routing call is logged as its own `requests` row with `ip_id = 0`, `user_agent = "llm-choosing"`, and `is_stream = FALSE`. `target_pod_ip` follows the normal convention: the mixed server's base URL, or `P: <prefiller> -- D: <decoder>` when the choosing request was served by a PD cluster.
 
-7. Parse complexity.
+8. Parse complexity.
 
    The router accepts compact JSON, fenced JSON, a bare integer, or the first standalone integer from `1` to `10`. Invalid, missing, out-of-range, or boolean values are treated as routing failures.
 
-8. Match complexity to a target model, filtered by availability.
+9. Match complexity to a target model, filtered by availability.
 
    Before matching, targets are split by availability. A target is **healthy** when it has at least one routable server with a closed circuit (online, not soft-deleted, non-VIP, PD-routable). A pool that is non-empty but has no closed circuit is the **probe tier** — half-open servers with spare probe capacity, which may still be down and are never trusted for selection. When no target is healthy anywhere, the full target set is kept, so behavior degrades to the pre-filter one.
 
@@ -140,7 +153,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
    - No target covers the complexity at all (a range gap, not an outage): use `router.fallback_model` and record `routing_failed:no_model_for_complexity:...`.
    - Routing LLM unavailable, non-200, exception, or invalid output: use `router.fallback_model` and record a `routing_failed` or `routing_error` result — classifier failures keep the classic blind fallback and never trigger the availability ladder.
 
-9. Rewrite the original request.
+10. Rewrite the original request.
 
    When a concrete model is selected, the router updates:
 
@@ -149,7 +162,7 @@ For each accepted proxy request, the router creates a `requests` row in `process
    - the request JSON `model`
    - `ServerSelectionContext.model_id`, `model_name`, and `body`
 
-10. Choose an upstream server for the selected model.
+11. Choose an upstream server for the selected model.
 
     Normal server selection then runs with the configured chooser. The default `PrefixCachePrebleServerChooser` chooses among candidate servers for the selected model, records `prefix_cache` and `last_match`, and caches successful responses.
 
@@ -168,7 +181,7 @@ The router never switches to a different model on a context overflow (issue #224
 The original client request row records:
 
 - `model_id`: updated to the selected concrete model when one is chosen.
-- `router_result`: original model prefix plus the route decision, capped at 300 characters. This is persisted during processing (together with `model_id`) as soon as a model is resolved, not only at request finish. `AdmissionService.check_concurrency` reads the prefix (everything before the first `:`) to bucket in-flight requests by their entrance model, so the origin prefix must not be removed or reordered. Availability decisions keep this shape (`auto:complexity:7:availability_fallback:...`, `auto:complexity:7:availability_probe`); both count as session-sticky anchors, so a session diverted to a survivor model keeps it until that model stops serving — diverted traffic therefore does not revisit the recovered model on its own, and circuit recovery relies on the step-8 probes, non-auto traffic, and the health probing command.
+- `router_result`: original model prefix plus the route decision, capped at 300 characters. This is persisted during processing (together with `model_id`) as soon as a model is resolved, not only at request finish. `AdmissionService.check_concurrency` reads the prefix (everything before the first `:`) to bucket in-flight requests by their entrance model, so the origin prefix must not be removed or reordered. Availability decisions keep this shape (`auto:complexity:7:availability_fallback:...`, `auto:complexity:7:availability_probe`); both count as session-sticky anchors, so a session diverted to a survivor model keeps it until that model stops serving — diverted traffic therefore does not revisit the recovered model on its own, and circuit recovery relies on the step-9 probes, non-auto traffic, and the health probing command. A forced-session rewrite (`<name>:forced_session_routing`, step 3) keeps the requested model as prefix and is never a sticky anchor.
 - `estimate_tokens`: fast heuristic estimate (`fast_estimate_tokens`) before model selection, replaced by a real tokenizer count after model selection when `tokenizer.enabled` is on.
 - `model_choosing_latency`: elapsed milliseconds from request receipt to the first upstream send, recorded for every dispatched request (not only auto ones); auto-selection and small-request-routing time is included in that window.
 - `prefix_cache` and `last_match`: server-selection prefix-cache data for the final upstream attempt.
@@ -181,7 +194,7 @@ Routing LLM calls are separate internal request rows. Statistics APIs exclude ro
 
 - A literal `auto` request counts under the `auto` bucket (limit `router.auto_concurrent_limit`), both while unresolved (`model_id = 0`) and after resolution (prefix `auto`).
 - A request for a concrete model by name counts under that model's bucket (limit `models.concurrent_limit`), whether or not the model is also `auto = TRUE`. While unresolved the record has a `NULL` `router_result` and its own `model_id`; after resolution it carries a `<name>:` prefix.
-- Because the bucket follows the entrance, an `auto -> B` request never counts against `B`'s concurrency, and a `source-model -> B` request never counts against the resolved target. Each entrance model enforces its own limit independently.
+- Because the bucket follows the entrance, an `auto -> B` request never counts against `B`'s concurrency, and a `source-model -> B` request never counts against the resolved target. Each entrance model enforces its own limit independently. The same holds for a forced-session rewrite (`<name>:forced_session_routing`): the request counts under the model it named, not under the routing model that serves it.
 
 VIP-channel requests are excluded from these counts (their records carry `vip = TRUE` and are filtered out), since VIP capacity is managed by VIP scaling. Occasional over-limit under concurrent arrivals is tolerated; the check intentionally uses no locking.
 

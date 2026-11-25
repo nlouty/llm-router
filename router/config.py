@@ -67,6 +67,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_when_user_info_missing": True,
         "user_info_missing_message": "Access denied, you do not have permission",
     },
+    "router": {
+        # Session ids (the value of the request's session header, see
+        # router.utils.session.extract_session_id) whose chat requests are
+        # always served by the routing model (models.is_routing_model = TRUE),
+        # even when they name a concrete model (issue #357).
+        "forced_routing_sessions": ["dsh-pet", "chrys-judge", "chrys-pet"],
+    },
     "encryption": {"emp_token_secret_key": ""},
     "tokenizer": {"enabled": False},
     "cmdb": {"enabled": False, "dummy": True, "refresh_interval_between_ips_seconds": 1},

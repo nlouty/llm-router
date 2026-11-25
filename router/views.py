@@ -14,6 +14,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from router.config import APP_CONFIG
+from router.route_algorithm.auto import AutoRouteAlgorithm
 from router.repositories.ips import IPRepository
 from router.repositories.models import ModelRepository
 from router.repositories.requests import RequestRepository
@@ -32,6 +33,7 @@ from router.services.request_context import clear_request_id, set_request_id
 from router.services.request_log_handler import install_pd_handler
 from router.services.request_logger import flush_request_log
 from router.utils.errors import error_response
+from router.utils.session import extract_session_id
 
 logger = logging.getLogger(__name__)
 install_pd_handler(logger)
@@ -158,8 +160,15 @@ def proxy(request, path: str):
         # model names work, and returning here skips deprecation / max_tokens /
         # concurrency, which are internal-capacity controls. VIP-port requests
         # never go external.
+        # Issue #357: a forced-routing session is served by the routing model
+        # whatever model it names, so the mapping for the requested name must
+        # not divert it before the auto router can rewrite it.
+        forced_session = AutoRouteAlgorithm.is_forced_routing_session(
+            extract_session_id(dict(request.headers))
+        )
         if (identity.has_employee and not input_is_auto and not is_vip_channel
-                and normalized_path == "chat/completions" and request.method == "POST"):
+                and normalized_path == "chat/completions" and request.method == "POST"
+                and not forced_session):
             external = ExternalRouteService().resolve(identity.employee_no, input_model_name)
             if external is not None:
                 route, mapping = external

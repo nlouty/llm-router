@@ -62,6 +62,15 @@ class AutoRouteAlgorithm:
             origin_model_name,
         )
         if router_result is None:
+            model, router_result = self._resolve_forced_session_routing_model(
+                parsed,
+                record,
+                context,
+                model,
+                is_vip_channel,
+                origin_model_name,
+            )
+        if router_result is None:
             model, router_result = self._resolve_small_request_routing_model(
                 parsed,
                 record,
@@ -156,7 +165,8 @@ class AutoRouteAlgorithm:
         origin_model_name: str | None,
     ):
         # Small-request routing only applies to auto requests (issue #227);
-        # explicit model requests are never rewritten to the routing model.
+        # explicit model requests are never rewritten to the routing model,
+        # except for the configured forced sessions handled above (issue #357).
         if (
             is_vip_channel
             or not context.auto_model_selection
@@ -179,6 +189,48 @@ class AutoRouteAlgorithm:
         )
         return routing_model, prefixed
 
+    def _resolve_forced_session_routing_model(
+        self,
+        parsed,
+        record,
+        context: ServerSelectionContext,
+        model,
+        is_vip_channel: bool,
+        origin_model_name: str | None,
+    ):
+        # Issue #357: a configured session always gets the routing model, even
+        # when it names a concrete model. Those agents only issue trivial
+        # requests, so the model their client was configured with is
+        # overridden. Unlike small-request routing this is neither auto- nor
+        # size-gated. It still runs after multimodal detection, and an
+        # image-bearing request is never forced onto the text-only routing
+        # model (same rationale as issue #324). VIP-port requests keep their
+        # model, like every other auto-routing rewrite. With no routing model
+        # that has a routable pool, the request falls through unchanged.
+        if is_vip_channel or not self.is_forced_routing_session(
+            getattr(context, "session", None)
+        ):
+            return model, None
+        if self._is_multimodal(parsed.body, getattr(context, "body_data", None)):
+            return model, None
+
+        routing_model = self._get_small_request_routing_model()
+        if routing_model is None:
+            return model, None
+
+        prefixed = self._router_result_with_origin(
+            origin_model_name, "forced_session_routing"
+        )
+        self._apply_resolved_model(
+            parsed,
+            record,
+            context,
+            routing_model,
+            prefixed,
+            disable_thinking=True,
+        )
+        return routing_model, prefixed
+
     def should_route_small_request(self, parsed) -> bool:
         estimated = int(parsed.estimated_full_body_tokens or 0)
         # 0 means no countable body: never send those requests to the
@@ -191,6 +243,17 @@ class AutoRouteAlgorithm:
             if ServerRepository.list_pd_holders(routing_model.id, vip=False):
                 return routing_model
         return None
+
+    @staticmethod
+    def is_forced_routing_session(session: str | None) -> bool:
+        """True when ``session`` — the raw session-header value returned by
+        ``extract_session_id`` — is listed in ``router.forced_routing_sessions``
+        (issue #357). Exact match after stripping, like the session-sticky
+        lookup; an unset or non-string session never matches."""
+        if not isinstance(session, str) or not session.strip():
+            return False
+        configured = APP_CONFIG.get("router", {}).get("forced_routing_sessions") or []
+        return session.strip() in {str(name).strip() for name in configured}
 
     def _apply_resolved_model(
         self,
@@ -360,11 +423,14 @@ class AutoRouteAlgorithm:
     def is_sticky_anchor_result(router_result: str | None) -> bool:
         # router_result is "{origin_model}:{decision}..." so the decision token
         # is never at the start; use substring membership, not a prefix check.
+        # forced_session_routing (issue #357) is a policy rewrite rather than a
+        # per-session model choice, so it must not pin the session either.
         if not router_result:
             return False
         return (
             "small_request_routing" not in router_result
             and "multimodal_bypass" not in router_result
+            and "forced_session_routing" not in router_result
         )
 
     @staticmethod
