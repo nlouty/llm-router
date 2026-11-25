@@ -760,3 +760,176 @@ class TestPPrefillerPoolAffinity:
         assert selected.id == p_aaa.id
         assert ctx.prefix_cache > 0.99  # the argmax entry is aaa's
         assert ctx.last_match == 100
+
+
+class TestLatestHolderAffinity:
+    """Issue #358: when several servers hold the prefix, the server that
+    processed the conversation's latest turn keeps it. Switching holders
+    makes the new one pull the KV it lacks from the latest one (RDMA), which
+    for long contexts costs far more than queueing on the latest holder, so
+    load only separates holders with equal affinity. Holders sit at workload
+    3 with weight 4 so the #247 gate cannot explain a choice."""
+
+    def test_latest_holder_wins_over_lighter_older_holder(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        older = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0, weight=4)
+        latest = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=3, weight=4)
+        _seed(chooser, older, _cached_request_body(), request_id=7)
+        _seed(chooser, latest, _cached_request_body(), request_id=9)
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([older, latest], ctx, set())
+        assert selected.id == latest.id
+        assert ctx.prefix_cache > 0.9
+        assert ctx.last_match == 9
+
+    def test_longer_holder_beats_more_recent_shorter_holder(self, mock_redis):
+        # aaa holds the whole conversation (1408 chars, rid 100); bbb a more
+        # recent request that only shared the document part (1280 chars,
+        # rid 200) and is idle. Rendered text is "user: " + content, so the
+        # ratios are 1408/1415 (~0.995) vs 1280/1415 (~0.90) — both holders.
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n_aaa = make_server(1, "http://aaa", role="prefiller", group_id="g1", workload=3, weight=4)
+        n_bbb = make_server(2, "http://bbb", role="prefiller", group_id="g1", workload=0, weight=4)
+        _seed(chooser, n_aaa, make_body("x" * 1408), request_id=100)
+        _seed(chooser, n_bbb, make_body("x" * 1280), request_id=200)
+
+        ctx = make_context(make_body("x" * 1408 + "y"))
+        selected = chooser.choose([n_aaa, n_bbb], ctx, set())
+        assert selected.id == n_aaa.id
+        assert ctx.last_match == 100
+
+    def test_indistinguishable_holders_fall_back_to_least_loaded(self, mock_redis):
+        # Same prefix, same originating rid on both (affinity cannot tell
+        # them apart): the lighter holder wins, as before #358.
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        busy = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=3, weight=4)
+        idle = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0, weight=4)
+        _seed(chooser, busy, _cached_request_body(), request_id=7)
+        _seed(chooser, idle, _cached_request_body(), request_id=7)
+
+        selected = _choose(chooser, [busy, idle], _cache_hit_body())
+        assert selected.id == idle.id
+
+    def test_busy_latest_holder_yields_to_next_holder_before_p_tier(self, mock_redis):
+        # The latest holder runs a new prefill; the older holder is idle and
+        # holds the same prefix in its own DRAM. The request moves to that
+        # holder locally instead of paying the p-tier RDMA pull of the whole
+        # prefix (the #276 switch only runs once no holder can take it).
+        chooser = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://n2"}
+        )
+        older = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0, weight=4)
+        latest = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0, weight=4)
+        p1 = make_server(3, "http://p1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(chooser, older, _cached_request_body(), request_id=7)
+        _seed(chooser, latest, _cached_request_body(), request_id=9)
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([older, latest, p1], ctx, set())
+        assert selected.id == older.id
+        assert ctx.prefix_cache > 0.9
+
+    def test_overloaded_latest_holder_yields_to_next_holder(self, mock_redis):
+        # #247 still outranks affinity: the latest holder at 10x the pool
+        # minimum sheds to the next holder (local DRAM), not to the p-tier.
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        latest = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=10)
+        older = make_server(2, "http://n2", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(3, "http://p1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(chooser, latest, _cached_request_body(), request_id=9)
+        _seed(chooser, older, _cached_request_body(), request_id=7)
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([latest, older, p1], ctx, set())
+        assert selected.id == older.id
+        assert ctx.prefix_cache > 0.9
+
+
+class TestCrossRoleStickiness:
+    """Issue #358: holder affinity is role-agnostic. Once a conversation's
+    latest turn ran on a prefix-prefiller, the p-prefiller keeps the
+    conversation even when an idle n-prefiller also holds the prefix. The
+    n-to-p move stays the #276 busy-holder switch — the only way a
+    conversation reaches the p-tier — and a p sheds it only when
+    #247-overloaded. A partial (50-90%) match held by a p is not sticky: it
+    goes back to the in-cluster n-prefiller like any partial (#276;
+    maintainer decision on #358)."""
+
+    def test_p_holder_keeps_request_over_idle_n_holder(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=1, weight=10)
+        _seed(chooser, n1, _cached_request_body(), request_id=7)
+        _seed(chooser, p1, _cached_request_body(), request_id=9)
+
+        ctx = make_context(_cache_hit_body())
+        selected = chooser.choose([n1, p1], ctx, set())
+        assert selected.id == p1.id
+        assert ctx.prefix_cache > 0.9
+        assert ctx.last_match == 9
+
+    def test_p_holder_wins_on_longer_prefix_over_idle_n_holder(self, mock_redis):
+        # The n-prefiller holds the more recent but shorter entry (the shared
+        # document part only); the p-prefiller holds the whole conversation.
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=2, weight=10)
+        _seed(chooser, n1, make_body("x" * 1280), request_id=200)
+        _seed(chooser, p1, make_body("x" * 1408), request_id=100)
+
+        ctx = make_context(make_body("x" * 1408 + "y"))
+        selected = chooser.choose([n1, p1], ctx, set())
+        assert selected.id == p1.id
+        assert ctx.last_match == 100
+
+    def test_flip_then_stick(self, mock_redis):
+        # Turn 1 on n1. Turn 2 arrives while n1 runs a new prefill: the #276
+        # switch moves it to p1 (RDMA pull), and p1 writes its own entry.
+        # Turn 3 then sticks to p1 although n1 is idle again and also holds
+        # the prefix.
+        busy = _chooser_with_workload(
+            {}, decoder_avgs={}, new_prefill_targets={"http://n1"}
+        )
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=1)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(busy, n1, make_body("x" * 1280), request_id=7)  # turn 1 on n1
+
+        turn2 = make_body("x" * 1408)
+        selected = busy.choose([n1, p1], make_context(turn2), set())
+        assert selected.id == p1.id  # n1 busy -> switch to p1
+        busy.on_response(p1, make_context(turn2, request_id=9), 200)  # turn 2 served by p1
+
+        # Turn 3: n1 is idle again and p1 carries some load — least-loaded
+        # would move the conversation back to n1 (and an RDMA pull).
+        idle = _chooser_with_workload({}, decoder_avgs={})
+        n1_idle = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1_loaded = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=1, weight=10)
+        ctx = make_context(make_body("x" * 1408 + "y"))  # turn 3
+        selected = idle.choose([n1_idle, p1_loaded], ctx, set())
+        assert selected.id == p1.id
+        assert ctx.prefix_cache > 0.99
+        assert ctx.last_match == 9
+
+    def test_overloaded_p_holder_sheds_to_next_holder(self, mock_redis):
+        # p1 at its weight (10): #247 fires and the idle n holder takes the
+        # request locally rather than a same-pool p pull.
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=10, weight=10)
+        _seed(chooser, n1, _cached_request_body(), request_id=7)
+        _seed(chooser, p1, _cached_request_body(), request_id=9)
+
+        selected = _choose(chooser, [n1, p1], _cache_hit_body())
+        assert selected.id == n1.id
+
+    def test_partial_on_p_still_goes_to_n(self, mock_redis):
+        chooser = _chooser_with_workload({}, decoder_avgs={})
+        n1 = make_server(1, "http://n1", role="prefiller", group_id="g1", workload=0)
+        p1 = make_server(2, "http://p1", role="prefix-prefiller", group_id="g1", workload=0, weight=10)
+        _seed(chooser, p1, _partial_request_body(), request_id=9)
+
+        ctx = make_context(_partial_hit_body())
+        selected = chooser.choose([n1, p1], ctx, set())
+        assert selected.id == n1.id
+        assert 0.5 < ctx.prefix_cache <= 0.9
