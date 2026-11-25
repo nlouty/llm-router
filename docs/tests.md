@@ -41,6 +41,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_opencode.py` | Opencode UA blocking and 400-delay version comparisons |
 | `test_parser.py` | JSON body rewriting, stream options, default max tokens, non-JSON passthrough |
 | `test_pd_context_overflow.py` | PD prefill context-overflow retry to a larger-window prefiller (sync and streaming); real error and breaker behavior when no candidate exists |
+| `test_prefix_split.py` | p/n prefiller split selection matrix (issue #276): cached/partial/cold classes, busy-holder p-switch, role-aware #247 escape, p-tier pool affinity, standalone clusters; latest-holder affinity and cross-role stickiness (issue #358) — the server that processed the conversation's latest turn keeps it over a lighter holder, n- or p-prefiller alike |
 | `test_proxy.py` | Proxy flow, auto routing, routing LLM calls, router results, retries, and `/v1/models` routing |
 | `test_proxy_unhandled_exception.py` | View catch-all: 502 + self-describing `fail_reason`, one-line main log, full traceback in per-request log file |
 | `test_proxy_usage.py` | JSON usage parsing, including cached token counts |
@@ -48,7 +49,7 @@ Tests use SQLite when `USE_SQLITE_FOR_TESTS=1` (see `tests/conftest.py`).
 | `test_refresh_user_info_command.py` | CMDB refresh command dry-run, single-IP behavior, and `--ip`/`--apikey` pass selection |
 | `test_request_logger.py` | Per-request log file append, timestamp prefix, and relative-path resolution |
 | `test_requests_repository.py` | Request attempt metadata, model choosing latency, cleanup, and repository counts |
-| `test_server_chooser.py` | Least-connection and prefix-cache-Preble chooser selection logic |
+| `test_server_chooser.py` | Least-connection and prefix-cache-Preble chooser selection logic: thresholds, #247 overload escape, entry merging/expiry, latest-holder affinity on the standalone path (issue #358) |
 | `test_server_operations.py` | `/api/add_server` success, duplicate, partial failure, and operation logging |
 | `test_server_target.py` | Target-string qualification for shared base_urls (issue #310): format/parse, duplication detection, per-row workload decrement, stale-decode token release, per-row workload reconciliation |
 | `test_sse.py` | `parse_sse_usage` extracts the last `usage` block from SSE |

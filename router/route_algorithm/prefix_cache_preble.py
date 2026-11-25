@@ -70,6 +70,11 @@ class _PrefixMatch:
     # (PrefixCachePrebleServerChooser.SMALL_REQUEST_TOKEN_LIMIT) instead of
     # its regular partial/cold placement.
     small_request: bool = False
+    # Position of the selected holder in the affinity order (issue #358):
+    # 0 = the server that processed the conversation's latest turn. None when
+    # no holder path placed the request (cold, small-request lane, escapes
+    # that left every holder behind).
+    holder_rank: int | None = None
 
 
 class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
@@ -198,6 +203,7 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                     "switched_from": match.switched_from,
                     "origin_server_id": match.origin_server_id,
                     "origin_prefix_len": match.origin_prefix_len,
+                    "holder_rank": match.holder_rank,
                     "reason": reason,
                     "role": getattr(selected, "role", "mixed") or "mixed",
                 }, ensure_ascii=False))
@@ -313,7 +319,17 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
                 and server.group_id in shared_groups
             ):
                 group = server.group_id
-                if match_ratio > match.cluster_ratios.get(group, 0.0):
+                best_ratio = match.cluster_ratios.get(group, 0.0)
+                # An exact tie goes to the more recent entry (issue #358):
+                # the origin is also the holder the cached-class walk ranks
+                # first, so the p-tier pool affinity and the recorded pair
+                # (issue #346) name the server that processed the last
+                # request.
+                if match_ratio > best_ratio or (
+                    match_ratio == best_ratio
+                    and self._rid_order(entry.get("rid"))
+                    > self._rid_order(match.cluster_request_ids.get(group))
+                ):
                     match.cluster_ratios[group] = match_ratio
                     match.cluster_request_ids[group] = entry.get("rid")
                     match.cluster_server_ids[group] = server.id
@@ -377,10 +393,12 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         higher scope wins. Within a winning cluster the request class decides
         placement:
 
-        - cached  (ratio > primary):   holders first, busy-holder switch to a
-          same-cluster p-prefiller, cluster-first #247 escape. A busy holder
-          with no same-cluster p-prefiller keeps the request only while below
-          its #247 overload threshold.
+        - cached  (ratio > primary):   holders first — the one that processed
+          the latest turn, n- or p-prefiller (issue #358) — then the
+          busy-holder switch to a same-cluster p-prefiller and the
+          cluster-first #247 escape. A busy holder with no same-cluster
+          p-prefiller keeps the request only while below its #247 overload
+          threshold.
         - partial (ratio > secondary): n-prefillers inside the cluster so the
           partial KV is pulled via RDMA instead of recomputed; #247 escape
           when the cluster is overloaded.
@@ -575,56 +593,78 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         group_servers: list[Any],
         origin: Any | None,
     ):
-        """Cached class: least-loaded holder (local DRAM). The busy-holder
-        switch steers the request to a same-cluster p-prefiller (RDMA pull)
-        when the holder is an n-prefiller already running a new prefill —
-        issue #276's head-of-line blocking. Overload escape stays inside the
-        cluster first: p-prefillers, then n-prefillers, then global. A busy
-        holder with no same-cluster p-prefiller keeps the request only while
-        below its #247 overload threshold. Within-cluster comparisons rank on
-        the prefill-side own load view (issue #339): the #331 decode floor is
+        """Cached class: the holder that processed the conversation's latest
+        turn keeps the request, served from its local DRAM (issue #358).
+
+        Holders — n- and p-prefillers alike — are tried in affinity order
+        (``_ordered_holders``) and the first one neither running a new
+        prefill nor #247-overloaded takes the request. The order is
+        role-agnostic: once a conversation's latest turn ran on a
+        prefix-prefiller, that p-prefiller keeps the conversation over an
+        idle n-prefiller holder; a p never counts as busy (it runs no new
+        prefills) and sheds a conversation only when #247-overloaded. The
+        n-to-p move stays where it was (issue #276): a busy n-prefiller
+        holder switches the request to a same-cluster p-prefiller.
+
+        Only when every holder is busy with a new prefill or overloaded does
+        the #276 ladder run, anchored on the highest-affinity busy holder: it
+        keeps the request while below its #247 threshold when the cluster has
+        no p-prefiller, otherwise it is marked as switched away from and the
+        cluster-first #247 escape takes over (p-prefillers, then
+        n-prefillers, then global). Within-cluster comparisons rank on the
+        prefill-side own load view (issue #339): the #331 decode floor is
         identical for every same-cluster prefiller, so it cancels here and
         only flattens the ranking.
         """
         own_loads, effective_loads = self._load_views(available)
-        holders = [
-            server
-            for server in group_servers
-            if match.server_match_ratios.get(server.id, 0.0) > self.primary_match_threshold
-        ]
-        chosen = self._pick_least_loaded(holders, own_loads) if holders else None
-        if chosen is not None:
-            busy_with_new = (
-                self._server_role(chosen) == "prefiller"
-                and self._has_new_prefill(chosen)
-            )
-            if not busy_with_new and not self._is_overloaded(
-                chosen, own_loads, effective_loads
-            ):
-                return chosen
-            if busy_with_new:
-                has_p = any(self._server_role(s) == "prefix-prefiller" for s in group_servers)
-                if not has_p:
-                    if not self._is_overloaded(chosen, own_loads, effective_loads):
-                        # Split disabled for this cluster: stay on the holder.
-                        return chosen
-                    logger.info(
-                        "[PrefixCachePreble] holder server_id=%s overloaded with "
-                        "no same-cluster p-prefiller; escaping globally",
-                        chosen.id,
-                    )
-                    return self._cached_escape(
-                        available, group_servers, own_loads, effective_loads, origin, match
-                    )
-                match.switched_from = chosen.id
+        holders = self._ordered_holders(
+            [
+                server
+                for server in group_servers
+                if match.server_match_ratios.get(server.id, 0.0) > self.primary_match_threshold
+            ],
+            match,
+            own_loads,
+        )
+        busy_ids = self._busy_new_prefill_ids(holders)
+        busy_fallback: tuple[int, Any, bool] | None = None
+        for index, holder in enumerate(holders):
+            overloaded = self._is_overloaded(holder, own_loads, effective_loads)
+            if holder.id not in busy_ids:
+                if not overloaded:
+                    match.holder_rank = index
+                    return holder
+                continue
+            if busy_fallback is None:
+                busy_fallback = (index, holder, overloaded)
+        if busy_fallback is not None:
+            index, holder, overloaded = busy_fallback
+            if not any(self._server_role(s) == "prefix-prefiller" for s in group_servers):
+                if not overloaded:
+                    # Split disabled for this cluster: stay on the holder.
+                    match.holder_rank = index
+                    return holder
+                logger.info(
+                    "[PrefixCachePreble] holder server_id=%s overloaded with "
+                    "no same-cluster p-prefiller; escaping globally",
+                    holder.id,
+                )
+            else:
+                match.switched_from = holder.id
                 logger.info(
                     "[PrefixCachePreble] holder server_id=%s has a new prefill "
                     "in flight; switching to a same-cluster prefix-prefiller "
                     "sharing the longest base_url prefix with origin "
                     "server_id=%s",
-                    chosen.id,
+                    holder.id,
                     getattr(origin, "id", None),
                 )
+        elif holders:
+            logger.info(
+                "[PrefixCachePreble] cached holder server_id=%s overloaded; "
+                "escaping",
+                holders[0].id,
+            )
         return self._cached_escape(
             available, group_servers, own_loads, effective_loads, origin, match
         )
@@ -765,39 +805,99 @@ class PrefixCachePrebleServerChooser(LeastConnectionServerChooser):
         """Server-based selection for scopes without the cluster split (mixed
         servers, blank-group prefillers, and prefillers of groups without the
         p/n split — no intra-cluster KV transfer, so only the holder's own
-        DRAM can serve a cached/partial request): unchanged pre-#276
-        behavior."""
-        cached_matches = match.cached_matches or [
+        DRAM can serve a cached/partial request). Holders are tried in
+        affinity order (issue #358, ``_ordered_holders``) — the one that
+        processed the latest request first, whatever its load — and the #247
+        escape fires only once every holder is overloaded."""
+        holders = match.cached_matches or [
             server for server in available
             if match.server_match_ratios.get(server.id, 0.0) > self.secondary_match_threshold
         ]
-        if not cached_matches:
+        if not holders:
             return self._choose_new(available)
         load_counts = self._load_counts(available)
-        cached = self._pick_least_loaded(cached_matches, load_counts)
-        if self._is_overloaded(cached, load_counts, load_counts):
-            logger.info(
-                "[PrefixCachePreble] cached server_id=%s overloaded; "
-                "falling back to least loaded server",
-                cached.id,
-            )
-            # Escape over non-p servers only: p-prefillers hold none of this
-            # standalone's KV, so landing there would be a full new prefill
-            # on a reserved p-prefiller (issue #276).
-            return self._choose_new(available, load_counts)
-        return cached
+        ordered = self._ordered_holders(holders, match, load_counts)
+        for index, holder in enumerate(ordered):
+            if not self._is_overloaded(holder, load_counts, load_counts):
+                match.holder_rank = index
+                return holder
+        logger.info(
+            "[PrefixCachePreble] cached server_id=%s overloaded; "
+            "falling back to least loaded server",
+            ordered[0].id,
+        )
+        # Escape over non-p servers only: p-prefillers hold none of this
+        # standalone's KV, so landing there would be a full new prefill
+        # on a reserved p-prefiller (issue #276).
+        return self._choose_new(available, load_counts)
 
-    def _has_new_prefill(self, server: Any) -> bool:
-        """True when the n-prefiller has >= 1 new (non-cached) prefill in
-        flight: processing rows still in their prefill phase on this server
-        with a dispatch-time classification <= the primary threshold."""
-        # Both target formats (issue #310): plain while the base_url is
-        # unique, #s<id>-qualified once several active rows share it. Asking
-        # for both keeps this DB-free for the provider path and tolerant of
-        # the duplication-set TTL window.
-        targets = [f"P: {plain_target(server)}", f"P: {qualified_target(server)}"]
+    @staticmethod
+    def _rid_order(rid: Any) -> float:
+        """Recency key of a cache entry's request id. ``requests.id`` is an
+        auto-increment primary key, so a larger id is a later request; an
+        entry without a numeric id sorts as the oldest."""
+        if isinstance(rid, bool) or not isinstance(rid, (int, float)):
+            return -1.0
+        return float(rid)
+
+    def _ordered_holders(
+        self,
+        holders: Sequence[Any],
+        match: _PrefixMatch,
+        load_counts: dict[int, float],
+    ) -> list[Any]:
+        """Holders sorted by conversation affinity, not by load (issue #358).
+
+        Switching a conversation to another server that holds the same
+        prefix makes that server pull the KV it lacks from the one that
+        served the latest turn (RDMA) — for long contexts that transfer
+        costs far more than queueing on the latest holder. Order:
+
+        1. longest matched prefix — the server that processed the
+           conversation's latest turn;
+        2. most recent entry (highest requests.id) — the server that
+           processed the last request among equal-length holders;
+        3. least loaded — only for holders indistinguishable by affinity.
+
+        Role-agnostic on purpose: a prefix-prefiller that served the latest
+        turn outranks an idle prefiller holder. Callers skip holders that
+        cannot take the request, so this order is a preference, not a pin.
+        """
+        return sorted(
+            holders,
+            key=lambda server: (
+                -match.server_match_ratios.get(server.id, 0.0),
+                -self._rid_order(match.server_match_request_ids.get(server.id)),
+                self._normalized_load(server, load_counts),
+            ),
+        )
+
+    def _busy_new_prefill_ids(self, servers: Sequence[Any]) -> set[int]:
+        """Ids of the n-prefillers among ``servers`` that already run a new
+        (non-cached) prefill in flight — processing rows still in their
+        prefill phase on the server with a dispatch-time classification <=
+        the primary threshold — in one count query for the whole set.
+        p-prefillers never qualify: they take no new requests."""
+        targets: list[str] = []
+        own_targets: dict[int, list[str]] = {}
+        for server in servers:
+            if self._server_role(server) != "prefiller":
+                continue
+            # Both target formats (issue #310): plain while the base_url is
+            # unique, #s<id>-qualified once several active rows share it.
+            # Asking for both keeps this DB-free for the provider path and
+            # tolerant of the duplication-set TTL window.
+            own = [f"P: {plain_target(server)}", f"P: {qualified_target(server)}"]
+            own_targets[server.id] = own
+            targets.extend(own)
+        if not targets:
+            return set()
         counts = self._new_prefill_counts(targets)
-        return any(counts.get(target, 0) > 0 for target in targets)
+        return {
+            server_id
+            for server_id, own in own_targets.items()
+            if any(counts.get(target, 0) > 0 for target in own)
+        }
 
     def _new_prefill_counts(self, targets: list[str]) -> dict[str, int]:
         if self.new_prefill_provider is not None:

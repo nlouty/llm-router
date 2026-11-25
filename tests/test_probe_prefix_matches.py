@@ -152,6 +152,34 @@ def test_probe_read_respects_expired_tail_blocks():
     assert client.hgetall_calls <= 7
 
 
+def test_cluster_argmax_tie_prefers_most_recent_entry():
+    # Issue #358: members of one shared-pool cluster hold the same prefix
+    # length. The cluster origin (cluster_server_ids) and its rid follow the
+    # most recent entry — the holder the cached-class walk ranks first — not
+    # whichever member happened to be probed first (or last).
+    chooser = _chooser()
+    client = PrefixCachePrebleServerChooser._redis_client
+    body = _prompt_body("x" * 400)
+    _seed(client, chooser, body, 1, 0, 50, rid=77)  # probed first
+    _seed(client, chooser, body, 2, 0, 50, rid=99)
+    _seed(client, chooser, body, 3, 0, 50, rid=55)  # probed last, oldest
+    older = FakeServer(1, "http://s1", role="prefiller")
+    newer = FakeServer(2, "http://s2", role="prefiller")
+    oldest = FakeServer(3, "http://s3", role="prefiller")
+    for server in (older, newer, oldest):
+        server.group_id = "g1"
+
+    request_chars, prefix_data = chooser._prefix_work_for_context(_context(body))
+    match = chooser._probe_prefix_matches(
+        "test-model", prefix_data, request_chars,
+        {1: older, 2: newer, 3: oldest}, {"g1"},
+    )
+
+    assert match.cluster_ratios == {"g1": 0.5}
+    assert match.cluster_server_ids == {"g1": 2}
+    assert match.cluster_request_ids == {"g1": 99}
+
+
 def test_probe_read_no_match_stays_least_loaded():
     chooser = _chooser(**{"http://s2": 2})
     body = _prompt_body("hello world")

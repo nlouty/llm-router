@@ -180,26 +180,82 @@ def test_least_connection_chooser_ties_on_normalized_load(monkeypatch):
     assert [[server.id for server in options] for options in choices] == [[1, 2]]
 
 
-def test_prefix_cache_high_match_chooses_least_loaded_cached_server():
+def test_prefix_cache_high_match_prefers_last_request_server_over_least_loaded():
+    # Issue #358: both servers hold the same prefix. Server 1 processed the
+    # last request (rid 102) but is busier (workload 3 vs 0, weight 4).
+    # Affinity wins over least-loaded: the idle server 2 would have to pull
+    # the KV it lacks from server 1 before it can prefill.
     chooser = PrefixCachePrebleServerChooser(
-        lambda targets: {"http://10.0.0.1:8000": 2, "http://10.0.0.2:8000": 0, "http://10.0.0.3:8000": 0},
+        lambda targets: {"http://10.0.0.1:8000": 3, "http://10.0.0.2:8000": 0, "http://10.0.0.3:8000": 1},
         prefix_block_chars=1,
     )
     candidates = [
-        make_server(1, "http://10.0.0.1:8000"),
-        make_server(2, "http://10.0.0.2:8000"),
-        make_server(3, "http://10.0.0.3:8000"),
+        make_server(1, "http://10.0.0.1:8000", weight=4),
+        make_server(2, "http://10.0.0.2:8000", weight=4),
+        make_server(3, "http://10.0.0.3:8000", weight=4),
+    ]
+    cached_body = make_body([str(i) for i in range(100)])
+    chooser.on_response(candidates[0], make_context(cached_body, request_id=102), 200)
+    chooser.on_response(candidates[1], make_context(cached_body, request_id=101), 200)
+
+    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
+    selected = chooser.choose(candidates, context, set())
+
+    assert selected.id == 1
+    assert context.prefix_cache > 0.9
+    assert context.last_match == 102
+
+
+def test_prefix_cache_longer_holder_beats_more_recent_shorter_holder():
+    # Two conversations share a document: server 1 ran the older request
+    # (rid 201) with the whole conversation (100 words); server 2 ran a newer
+    # request (rid 202) that only shared the first 95 words. The next turn of
+    # the first conversation returns to server 1 — the longer holder — even
+    # though server 2 holds the more recent entry and is idle.
+    chooser = PrefixCachePrebleServerChooser(
+        lambda targets: {"http://10.0.0.1:8000": 3, "http://10.0.0.2:8000": 0},
+        prefix_block_chars=1,
+    )
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000", weight=4),
+        make_server(2, "http://10.0.0.2:8000", weight=4),
+    ]
+    chooser.on_response(
+        candidates[0], make_context(make_body([str(i) for i in range(100)]), request_id=201), 200
+    )
+    chooser.on_response(
+        candidates[1], make_context(make_body([str(i) for i in range(95)]), request_id=202), 200
+    )
+
+    context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
+    selected = chooser.choose(candidates, context, set())
+
+    assert selected.id == 1
+    assert context.prefix_cache > 0.9
+    assert context.last_match == 201
+
+
+def test_prefix_cache_indistinguishable_holders_fall_back_to_least_loaded():
+    # Same prefix and same originating request id on both servers (a
+    # degenerate tie — affinity cannot tell them apart): least load decides,
+    # the pre-#358 tie-break.
+    chooser = PrefixCachePrebleServerChooser(
+        lambda targets: {"http://10.0.0.1:8000": 3, "http://10.0.0.2:8000": 0},
+        prefix_block_chars=1,
+    )
+    candidates = [
+        make_server(1, "http://10.0.0.1:8000", weight=4),
+        make_server(2, "http://10.0.0.2:8000", weight=4),
     ]
     cached_body = make_body([str(i) for i in range(100)])
     chooser.on_response(candidates[0], make_context(cached_body, request_id=101), 200)
-    chooser.on_response(candidates[1], make_context(cached_body, request_id=102), 200)
+    chooser.on_response(candidates[1], make_context(cached_body, request_id=101), 200)
 
     context = make_context(make_body([str(i) for i in range(99)] + ["new"]))
     selected = chooser.choose(candidates, context, set())
 
     assert selected.id == 2
-    assert context.prefix_cache > 0.9
-    assert context.last_match == 102
+    assert context.last_match == 101
 
 
 def test_prefix_cache_overloaded_cached_server_falls_back_to_least_loaded():
