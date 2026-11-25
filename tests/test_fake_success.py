@@ -217,17 +217,22 @@ def test_embeddings_without_completion_tokens_not_flagged(monkeypatch):
     assert server.consecutive_failures == 0
 
 
-@pytest.mark.django_db
-def test_pd_fake_decode_counts_decoder_failure_not_prefiller(monkeypatch):
-    model = Model.objects.create(model_name="pd-model", max_tokens=131072)
+def _pd_cluster(model_name="pd-model", prefiller_failures=0):
+    model = Model.objects.create(model_name=model_name, max_tokens=131072)
     prefiller = Server.objects.create(
         model_id=model.id, base_url="http://p.example", is_online=True,
-        role="prefiller", group_id="g1", consecutive_failures=2,
+        role="prefiller", group_id="g1", consecutive_failures=prefiller_failures,
     )
     decoder = Server.objects.create(
         model_id=model.id, base_url="http://d.example", is_online=True,
         role="decoder", group_id="g1",
     )
+    return model, prefiller, decoder
+
+
+def _pd_request_handler(decode_upstream):
+    """Upstream stub: p.example answers a healthy prefill, d.example returns
+    *decode_upstream* (a callable taking no args)."""
 
     def fake_request(self, method, url, **kwargs):
         if "p.example" in url:
@@ -244,9 +249,16 @@ def test_pd_fake_decode_counts_decoder_failure_not_prefiller(monkeypatch):
             }
             return resp
         assert "d.example" in url
-        return _upstream(FAKE_BODY)
+        return decode_upstream()
 
-    _patch_upstream(monkeypatch, fake_request)
+    return fake_request
+
+
+@pytest.mark.django_db
+def test_pd_fake_decode_counts_decoder_failure_not_prefiller(monkeypatch):
+    model, prefiller, decoder = _pd_cluster(prefiller_failures=2)
+
+    _patch_upstream(monkeypatch, _pd_request_handler(lambda: _upstream(FAKE_BODY)))
 
     response = _post({"model": "pd-model", "messages": [{"role": "user", "content": "hi"}]})
 
@@ -260,40 +272,63 @@ def test_pd_fake_decode_counts_decoder_failure_not_prefiller(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_pd_stream_without_content_counts_decoder_failure(monkeypatch):
-    model = Model.objects.create(model_name="pd-model", max_tokens=131072)
-    prefiller = Server.objects.create(
-        model_id=model.id, base_url="http://p.example", is_online=True,
-        role="prefiller", group_id="g1",
-    )
-    decoder = Server.objects.create(
-        model_id=model.id, base_url="http://d.example", is_online=True,
-        role="decoder", group_id="g1",
-    )
+def test_pd_stream_usage_reporting_zero_counts_decoder_failure(monkeypatch):
+    _, prefiller, decoder = _pd_cluster()
 
-    def fake_request(self, method, url, **kwargs):
-        if "p.example" in url:
-            resp = MagicMock()
-            resp.status_code = 200
-            resp.reason = "OK"
-            resp.json.return_value = {
-                "usage": {"prompt_tokens": 11, "completion_tokens": 1},
-                "kv_transfer_params": {
-                    "remote_engine_id": "e1",
-                    "remote_host": "h",
-                    "remote_port": 1,
-                },
-            }
-            return resp
-        assert "d.example" in url
-        return _stream_upstream(FAKE_STREAM)
-
-    _patch_upstream(monkeypatch, fake_request)
+    _patch_upstream(monkeypatch, _pd_request_handler(lambda: _stream_upstream(FAKE_STREAM)))
 
     response = _post({"model": "pd-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
     b"".join(response.streaming_content)
 
     decoder.refresh_from_db()
     assert decoder.consecutive_failures == 1
+    prefiller.refresh_from_db()
+    assert prefiller.consecutive_failures == 0
+
+
+@pytest.mark.django_db
+def test_pd_stream_reasoning_content_with_usage_not_flagged(monkeypatch):
+    """The production false-positive (issue #353 comment): the decode stream
+    carried reasoning_content deltas (no delta.content frames for _scan_chunk
+    to count), while the trailing usage frame reported the real, nonzero
+    output tokens. The usage frame is authoritative; the frame counter is
+    not."""
+    _, prefiller, decoder = _pd_cluster()
+    sse = (
+        b'data: {"choices":[{"delta":{"reasoning_content":"let me think"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning_content":"some more"}}]}\n\n'
+        b'data: {"choices":[],"usage":{"prompt_tokens":500,"completion_tokens":87}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    _patch_upstream(monkeypatch, _pd_request_handler(lambda: _stream_upstream(sse)))
+
+    response = _post({"model": "pd-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    b"".join(response.streaming_content)
+
+    assert response.status_code == 200
+    decoder.refresh_from_db()
+    assert decoder.consecutive_failures == 0
+    prefiller.refresh_from_db()
+    assert prefiller.consecutive_failures == 0
+
+
+@pytest.mark.django_db
+def test_pd_stream_without_usage_frame_not_flagged(monkeypatch):
+    """A decode stream that never sent a usage frame is not evaluable: no
+    fake-success failure is counted (same rule as the mixed-server path)."""
+    _, prefiller, decoder = _pd_cluster()
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    _patch_upstream(monkeypatch, _pd_request_handler(lambda: _stream_upstream(sse)))
+
+    response = _post({"model": "pd-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    b"".join(response.streaming_content)
+
+    decoder.refresh_from_db()
+    assert decoder.consecutive_failures == 0
     prefiller.refresh_from_db()
     assert prefiller.consecutive_failures == 0

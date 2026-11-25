@@ -974,10 +974,19 @@ class PDForwardService:
                         continue
 
                     # Terminal success: final_prefix_cache from the prefiller.
-                    # Issue #353: a chat stream that never produced a content
-                    # chunk is a fake success — count a decoder failure
-                    # instead of the success that would reset the breaker.
-                    if proxy_response.is_chat_completions(path) and completion_tokens == 0:
+                    # Issue #353: a stream whose usage frame reports zero
+                    # output tokens is a fake success — count a decoder
+                    # failure instead of the success that would reset the
+                    # breaker. The trailing usage frame is the authoritative
+                    # count (the same one finish_stream_success records as
+                    # output_token_cnt). Do NOT use the _scan_chunk content
+                    # counter: it counts delta.content frames only, so it
+                    # reads 0 on healthy reasoning_content streams and on
+                    # frames split across iter_content boundaries — which
+                    # false-flagged every decoder in production.
+                    if proxy_response.is_fake_success(
+                        path, proxy_response.find_stream_usage(chunks)
+                    ):
                         self.circuit_breaker.record_failure(decoder)
                         append_request_log(record.id, json.dumps({
                             "event": "fake_success",
